@@ -33,7 +33,7 @@ fn main():
 
 **Setup:**
 ```
-git clone https://github.com/YOUR_USERNAME/vexel
+git clone https://github.com/Justme-Cliff/vexel
 cd vexel
 ```
 

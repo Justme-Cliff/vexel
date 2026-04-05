@@ -29,6 +29,9 @@ test_vexel.txt
 stdlib/sdl2/lib/
 stdlib/sdl2/bin/
 
+# Internal planning docs
+ROADMAP.md
+
 # OS
 .DS_Store
 Thumbs.db
