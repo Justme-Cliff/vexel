@@ -1,0 +1,40 @@
+# Vexel SDL2 Demo — bouncing square
+# Requires SDL2: python setup_sdl2.py
+# Compile:       python main.py compile examples/window.vx --sdl2
+
+fn main():
+    let ok: int = sdl2_init("Vexel Window", 800, 600)
+    if ok == 0:
+        return
+
+    let x: int = 100
+    let y: int = 100
+    let vx: int = 4
+    let vy: int = 3
+    let running: int = 1
+
+    while running == 1:
+        running = sdl2_poll()
+
+        sdl2_clear(20, 20, 40)
+
+        sdl2_set_color(255, 80, 80, 255)
+        sdl2_draw_rect(x, y, 40, 40)
+
+        sdl2_present()
+
+        x = x + vx
+        y = y + vy
+
+        if x > 760:
+            vx = -vx
+        if x < 0:
+            vx = -vx
+        if y > 560:
+            vy = -vy
+        if y < 0:
+            vy = -vy
+
+        sdl2_delay(16)
+
+    sdl2_quit()

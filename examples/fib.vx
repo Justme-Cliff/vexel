@@ -1,0 +1,15 @@
+fn fib(n: int) -> int:
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+fn main():
+    for i in 0..10:
+        let f: int = fib(i)
+        print(f)
+
+    let x: int = 1
+    let limit: int = 1000
+    while x < limit:
+        x = x * 2
+    print(x)

@@ -1,0 +1,34 @@
+struct Vec2:
+    x: float
+    y: float
+
+struct Entity:
+    x: float
+    y: float
+    speed: float
+
+fn vec2_length_sq(v: Vec2) -> float:
+    return v.x * v.x + v.y * v.y
+
+fn entity_move(e: Entity, dx: float, dy: float) -> Entity:
+    let moved: Entity = new Entity(e.x + dx, e.y + dy, e.speed)
+    return moved
+
+fn main():
+    let player: Entity = new Entity(0.0, 0.0, 5.0)
+    print(player.x)
+    print(player.y)
+    print(player.speed)
+
+    let moved: Entity = entity_move(player, 10.0, 3.0)
+    print(moved.x)
+    print(moved.y)
+
+    let dir: Vec2 = new Vec2(3.0, 4.0)
+    let len_sq: float = vec2_length_sq(dir)
+    print(len_sq)
+
+    let count: int = 0
+    for i in 0..5:
+        count = count + 1
+    print(count)

@@ -1,0 +1,19 @@
+fn add(a: int, b: int) -> int:
+    return a + b
+
+fn multiply(a: int, b: int) -> int:
+    return a * b
+
+fn main():
+    let x: int = 10
+    let y: int = 25
+    let result: int = add(x, y)
+    print(result)
+
+    let product: int = multiply(x, y)
+    print(product)
+
+    let pi: float = 3.14159
+    let radius: float = 5.0
+    let area: float = pi * radius * radius
+    print(area)

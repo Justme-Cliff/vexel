@@ -1,0 +1,35 @@
+# Claude Code session data
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+
+# Compiled outputs — binaries built from .vx files
+*.exe
+*.obj
+*.o
+
+# Runtime artifacts
+test_vexel.txt
+*.tmp
+
+# SDL2 bundled libraries (large binary files)
+stdlib/sdl2/lib/
+stdlib/sdl2/bin/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
