@@ -18,11 +18,11 @@ fn main():
 
 ## Features
 
-- **Clean, readable syntax** — indentation-based blocks, no braces or semicolons
-- **Static types** — `int`, `float`, `bool`, `str`, arrays, structs, enums
-- **Compiles to native binaries** — via LLVM + MinGW gcc
-- **Fast JIT mode** — `vexel run` executes instantly without a separate compile step
-- **Cross-platform** — Windows, Linux, macOS
+- **Clean, readable syntax** - indentation-based blocks, no braces or semicolons
+- **Static types** - `int`, `float`, `bool`, `str`, arrays, structs, enums
+- **Compiles to native binaries** - via LLVM + MinGW gcc
+- **Fast JIT mode** - `vexel run` executes instantly without a separate compile step
+- **Cross-platform** - Windows, Linux, macOS
 
 ## Installation
 
@@ -39,7 +39,7 @@ cd vexel
 
 Add the `vexel` folder to your PATH, or run directly with `python main.py`.
 
-On Windows a `vexel.bat` is included — add the project folder to PATH and you can run `vexel` from anywhere.
+On Windows a `vexel.bat` is included - add the project folder to PATH and you can run `vexel` from anywhere.
 
 ## Usage
 
@@ -152,15 +152,15 @@ let dir: int = Direction.North
 
 ```vexel
 let nums: int[] = [10, 20, 30]
-nums.push(40)           # append
+nums.push(40)                # append
 let last: int = nums.pop()   # remove and return last
-print(nums.len())       # length
+print(nums.len())            # length
 print(nums.contains(20))     # bool
-nums.reverse()          # in-place reverse
-print(nums[0])          # index access
-nums[0] = 99            # index assignment
+nums.reverse()               # in-place reverse
+print(nums[0])               # index access
+nums[0] = 99                 # index assignment
 
-for n in nums:          # for-each
+for n in nums:
     print(n)
 ```
 
@@ -168,15 +168,15 @@ for n in nums:          # for-each
 
 ```vexel
 let s: str = "Hello, World"
-print(s.upper())            # "HELLO, WORLD"
-print(s.lower())            # "hello, world"
-print(s.len())              # 12
-print(s.contains("World"))  # true
-print(s.starts_with("Hello"))  # true
-print(s.ends_with("World"))    # true
-print(s.replace("World", "Vexel"))  # "Hello, Vexel"
-print(s.trim())             # strips whitespace
-print(s[0])                 # "H"
+print(s.upper())                    # "HELLO, WORLD"
+print(s.lower())                    # "hello, world"
+print(s.len())                      # 12
+print(s.contains("World"))          # true
+print(s.starts_with("Hello"))       # true
+print(s.ends_with("World"))         # true
+print(s.replace("World", "Vexel")) # "Hello, Vexel"
+print(s.trim())                     # strips whitespace
+print(s[0])                         # "H"
 
 let parts: str[] = s.split(", ")
 for p in parts:
@@ -287,18 +287,18 @@ fn main():
 ```
 compiler/
 ├── compiler/
-│   ├── lexer.py        — tokenizer
-│   ├── parser.py       — recursive descent parser
-│   ├── ast_nodes.py    — AST node types
-│   ├── analyzer.py     — type checking and semantic analysis
-│   └── codegen.py      — LLVM IR code generation
+│   ├── lexer.py       - tokenizer
+│   ├── parser.py      - recursive descent parser
+│   ├── ast_nodes.py   - AST node types
+│   ├── analyzer.py    - type checking and semantic analysis
+│   └── codegen.py     - LLVM IR code generation
 ├── stdlib/
-│   ├── runtime.c       — C runtime (GC, string/array/file helpers)
-│   └── vx_sdl2.c       — SDL2 graphics wrapper
-├── examples/           — example Vexel programs
-├── tests/              — test suite
-├── main.py             — CLI
-└── vexel.bat           — Windows launcher
+│   ├── runtime.c      - C runtime (GC, string/array/file helpers)
+│   └── vx_sdl2.c      - SDL2 graphics wrapper
+├── examples/          - example Vexel programs
+├── tests/             - test suite
+├── main.py            - CLI
+└── vexel.bat          - Windows launcher
 ```
 
 ## Contributing
