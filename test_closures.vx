@@ -1,0 +1,23 @@
+fn apply(arr: int[], f: fn(int)->int) -> int[]:
+    let result: int[] = []
+    for x in arr:
+        result.push(f(x))
+    return result
+
+fn sum(...nums: int[]) -> int:
+    let total: int = 0
+    for n in nums:
+        total += n
+    return total
+
+fn main():
+    let double: fn(int)->int = fn(x: int) -> int:
+        return x * 2
+
+    let nums: int[] = [1, 2, 3, 4, 5]
+    let doubled: int[] = apply(nums, double)
+    for n in doubled:
+        print(n)
+
+    print(sum(1, 2, 3, 4, 5))
+    print(sum(10, 20))

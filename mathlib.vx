@@ -1,0 +1,8 @@
+fn square(n: int) -> int:
+    return n * n
+
+fn cube(n: int) -> int:
+    return n * n * n
+
+fn average(a: float, b: float) -> float:
+    return (a + b) / 2.0

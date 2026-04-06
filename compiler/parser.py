@@ -1,5 +1,5 @@
 """
-Vexel Parser  (v3)
+Vexel Parser  (v5)
 ------------------
 Recursive descent parser.
 
@@ -21,6 +21,17 @@ New in v3:
   - assert statement
   - ternary expression  (cond ? then : else)
   - method call syntax  (obj.method(args))
+
+New in v5:
+  - import "x.vx" as ns   (namespace imports)
+  - fn[T, U](...)          (generic functions)
+  - ...param: T[]          (variadic params)
+  - fn(int)->int           (function types in annotations)
+  - (T1, T2)               (tuple types)
+  - T?                     (nullable types)
+  - fn(x: int): ...        (lambda expressions)
+  - (a, b) = expr          (tuple destructuring in let)
+  - 0 < x < 10             (chained comparisons)
 """
 
 from compiler.lexer import Token, TT
@@ -42,6 +53,10 @@ class Parser:
 
     def _cur(self) -> Token:
         return self.tokens[self.pos]
+
+    def _peek(self, offset: int = 1) -> Token:
+        idx = min(self.pos + offset, len(self.tokens) - 1)
+        return self.tokens[idx]
 
     def _advance(self) -> Token:
         t = self.tokens[self.pos]
@@ -104,9 +119,25 @@ class Parser:
     def _parse_fn(self) -> FnDecl:
         self._expect(TT.FN)
         name = self._expect(TT.IDENT).value
+
+        # Generic type params: fn name[T, U](...)
+        type_params = []
+        if self._match(TT.LBRACKET):
+            self._advance()
+            while not self._match(TT.RBRACKET):
+                type_params.append(self._expect(TT.IDENT).value)
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RBRACKET)
+
         self._expect(TT.LPAREN)
         params = []
         while not self._match(TT.RPAREN):
+            # Variadic: ...nums: int[]
+            variadic = False
+            if self._match(TT.ELLIPSIS):
+                self._advance()
+                variadic = True
             pname = self._expect(TT.IDENT).value
             self._expect(TT.COLON)
             ptype = self._parse_type()
@@ -114,7 +145,7 @@ class Parser:
             if self._match(TT.ASSIGN):
                 self._advance()
                 default = self._parse_expr()
-            params.append(Param(pname, ptype, default))
+            params.append(Param(pname, ptype, default, variadic))
             if self._match(TT.COMMA):
                 self._advance()
         self._expect(TT.RPAREN)
@@ -125,7 +156,7 @@ class Parser:
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         body = self._parse_block()
-        return FnDecl(name, params, ret, body)
+        return FnDecl(name, params, ret, body, type_params)
 
     def _parse_type_alias(self) -> TypeAlias:
         self._expect(TT.TYPE)
@@ -136,12 +167,89 @@ class Parser:
         return TypeAlias(name, target)
 
     def _parse_type(self) -> str:
-        """Parse a type annotation: int, float, str, bool, int[], Vec2, etc."""
+        """Parse a type annotation.
+
+        Supports:
+          int, float, str, bool, void
+          int[], str[]           (arrays)
+          dict[K, V]             (dict)
+          (int, float)           (tuple)
+          fn(int, float)->str    (function type)
+          T?                     (nullable)
+          Vec2, MyStruct         (user-defined)
+          ns.TypeName            (namespaced struct - stored as ns__TypeName)
+        """
+        # Tuple type: (int, float, ...)
+        if self._match(TT.LPAREN):
+            self._advance()
+            types = []
+            while not self._match(TT.RPAREN):
+                types.append(self._parse_type())
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RPAREN)
+            base = "(" + ",".join(types) + ")"
+            if self._match(TT.QUESTION):
+                self._advance()
+                return base + "?"
+            return base
+
+        # Function type: fn(int, float) -> str
+        if self._match(TT.FN):
+            self._advance()
+            self._expect(TT.LPAREN)
+            param_types = []
+            while not self._match(TT.RPAREN):
+                param_types.append(self._parse_type())
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RPAREN)
+            ret = "void"
+            if self._match(TT.ARROW):
+                self._advance()
+                ret = self._parse_type()
+            base = "fn(" + ",".join(param_types) + ")->" + ret
+            if self._match(TT.QUESTION):
+                self._advance()
+                return base + "?"
+            return base
+
         name = self._expect(TT.IDENT).value
+
+        # Namespaced type: ns.TypeName → ns__TypeName
+        if self._match(TT.DOT):
+            self._advance()
+            tname = self._expect(TT.IDENT).value
+            name = f"{name}__{tname}"
+
+        # dict[K, V]
+        if name == "dict" and self._match(TT.LBRACKET):
+            self._advance()
+            key_type = self._parse_type()
+            self._expect(TT.COMMA)
+            val_type = self._parse_type()
+            self._expect(TT.RBRACKET)
+            base = f"dict[{key_type},{val_type}]"
+            if self._match(TT.QUESTION):
+                self._advance()
+                return base + "?"
+            return base
+
+        # Array: int[]
         if self._match(TT.LBRACKET):
             self._advance()
             self._expect(TT.RBRACKET)
-            return name + "[]"
+            base = name + "[]"
+            if self._match(TT.QUESTION):
+                self._advance()
+                return base + "?"
+            return base
+
+        # Nullable: int?
+        if self._match(TT.QUESTION):
+            self._advance()
+            return name + "?"
+
         return name
 
     def _parse_struct(self) -> StructDecl:
@@ -190,8 +298,12 @@ class Parser:
     def _parse_import(self) -> ImportStmt:
         self._expect(TT.IMPORT)
         path_tok = self._expect(TT.STRING)
+        alias = None
+        if self._match(TT.AS):
+            self._advance()
+            alias = self._expect(TT.IDENT).value
         self._eat_newline()
-        return ImportStmt(path_tok.value)
+        return ImportStmt(path_tok.value, alias)
 
     def _parse_enum(self) -> EnumDecl:
         self._expect(TT.ENUM)
@@ -279,8 +391,33 @@ class Parser:
         self._eat_newline()
         return ExprStmt(expr)
 
-    def _parse_let(self) -> LetStmt:
+    def _parse_let(self) -> Node:
         self._expect(TT.LET)
+
+        # Tuple unpack: let (a, b): (int, float) = expr
+        if self._match(TT.LPAREN):
+            self._advance()
+            names = []
+            while not self._match(TT.RPAREN):
+                names.append(self._expect(TT.IDENT).value)
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RPAREN)
+            annotations = [None] * len(names)
+            if self._match(TT.COLON):
+                self._advance()
+                ann_type = self._parse_type()  # e.g. "(int,float)"
+                # Parse individual annotations from tuple type string
+                if ann_type.startswith("(") and ann_type.endswith(")"):
+                    inner = ann_type[1:-1]
+                    # Simple split on commas (doesn't handle nested types with commas)
+                    parts = self._split_type_list(inner)
+                    annotations = parts + [None] * (len(names) - len(parts))
+            self._expect(TT.ASSIGN)
+            value = self._parse_expr()
+            self._eat_newline()
+            return TupleUnpack(names, annotations, value)
+
         name = self._expect(TT.IDENT).value
         ann  = None
         if self._match(TT.COLON):
@@ -290,6 +427,25 @@ class Parser:
         value = self._parse_expr()
         self._eat_newline()
         return LetStmt(name, ann, value)
+
+    def _split_type_list(self, s: str) -> list[str]:
+        """Split 'int,float,str' respecting nested parens/brackets."""
+        parts = []
+        depth = 0
+        cur = []
+        for c in s:
+            if c in ('(', '[', '<'):
+                depth += 1
+            elif c in (')', ']', '>'):
+                depth -= 1
+            if c == ',' and depth == 0:
+                parts.append(''.join(cur).strip())
+                cur = []
+            else:
+                cur.append(c)
+        if cur:
+            parts.append(''.join(cur).strip())
+        return parts
 
     def _parse_return(self) -> ReturnStmt:
         self._expect(TT.RETURN)
@@ -473,10 +629,21 @@ class Parser:
 
     def _parse_comparison(self) -> Node:
         left = self._parse_addition()
-        while self._match(TT.EQ, TT.NEQ, TT.LT, TT.GT, TT.LTE, TT.GTE, TT.IN):
+        _CMP = (TT.EQ, TT.NEQ, TT.LT, TT.GT, TT.LTE, TT.GTE, TT.IN)
+        while self._match(*_CMP):
             tok  = self._advance()
             op   = "in" if tok.type == TT.IN else tok.value
-            left = BinOp(op, left, self._parse_addition())
+            right = self._parse_addition()
+            cmp1  = BinOp(op, left, right)
+            # Chained comparison: 0 < x < 10  →  (0 < x) and (x < 10)
+            if self._match(*_CMP):
+                tok2 = self._advance()
+                op2  = "in" if tok2.type == TT.IN else tok2.value
+                right2 = self._parse_addition()
+                cmp2   = BinOp(op2, right, right2)
+                left   = BinOp("and", cmp1, cmp2)
+            else:
+                left = cmp1
         return left
 
     def _parse_addition(self) -> Node:
@@ -506,7 +673,7 @@ class Parser:
                 self._advance()
                 field = self._expect(TT.IDENT).value
                 if self._match(TT.LPAREN):
-                    # method call
+                    # method call  (or namespace call: ns.func(...))
                     self._advance()
                     args = []
                     while not self._match(TT.RPAREN):
@@ -563,6 +730,7 @@ class Parser:
                     self._advance()
             self._expect(TT.RPAREN)
             return NewExpr(type_name, args)
+
         if t.type == TT.LBRACKET:
             self._advance()
             elems = []
@@ -572,12 +740,66 @@ class Parser:
                     self._advance()
             self._expect(TT.RBRACKET)
             return ArrayLiteral(elems)
+
         if t.type == TT.LPAREN:
             self._advance()
-            expr = self._parse_expr()
+            first = self._parse_expr()
+            if self._match(TT.COMMA):
+                # Tuple literal: (a, b, ...)
+                elems = [first]
+                while self._match(TT.COMMA):
+                    self._advance()
+                    if self._match(TT.RPAREN):
+                        break
+                    elems.append(self._parse_expr())
+                self._expect(TT.RPAREN)
+                return TupleLiteral(elems)
             self._expect(TT.RPAREN)
-            return expr
+            return first
+
+        if t.type == TT.LBRACE:
+            self._advance()
+            pairs = []
+            while not self._match(TT.RBRACE):
+                key = self._parse_expr()
+                self._expect(TT.COLON)
+                val = self._parse_expr()
+                pairs.append((key, val))
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RBRACE)
+            return DictLiteral(pairs)
+
+        # Lambda expression: fn(x: int) -> int: return x * 2
+        if t.type == TT.FN:
+            return self._parse_lambda()
 
         raise ParseError(
             f"Line {t.line}: unexpected token {t.type.name} ({t.value!r})"
         )
+
+    def _parse_lambda(self) -> LambdaExpr:
+        """Parse an anonymous function expression.
+        fn(x: int, y: int) -> int:
+            return x + y
+        Or single-line (body on same line after colon when used as expression context)
+        """
+        self._expect(TT.FN)
+        self._expect(TT.LPAREN)
+        params = []
+        while not self._match(TT.RPAREN):
+            pname = self._expect(TT.IDENT).value
+            self._expect(TT.COLON)
+            ptype = self._parse_type()
+            params.append(Param(pname, ptype))
+            if self._match(TT.COMMA):
+                self._advance()
+        self._expect(TT.RPAREN)
+        ret = None
+        if self._match(TT.ARROW):
+            self._advance()
+            ret = self._parse_type()
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        body = self._parse_block()
+        return LambdaExpr(params, ret, body)

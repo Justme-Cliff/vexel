@@ -1,5 +1,5 @@
 """
-Vexel AST Node Definitions  (v4)
+Vexel AST Node Definitions  (v5)
 ---------------------------------
 All node types the parser can produce.
 New in v2: ArrayLiteral, ForEach, BreakStmt, ContinueStmt,
@@ -8,6 +8,10 @@ New in v3: MethodCall, EnumDecl, MatchCase, MatchStmt, AssertStmt,
            ImportStmt, TernaryExpr.
 New in v4: TryCatch, ForEnumerate, TypeAlias.
            Param gains optional default value.
+New in v5: LambdaExpr, TupleLiteral, TupleUnpack, NamespaceHint.
+           ImportStmt gains optional alias.
+           Param gains variadic flag.
+           FnDecl gains type_params for generics.
 """
 
 from __future__ import annotations
@@ -45,6 +49,14 @@ class NullLiteral(Node):
 
 @dataclass
 class ArrayLiteral(Node):
+    elements: List[Node]
+
+@dataclass
+class DictLiteral(Node):
+    pairs: List[tuple]   # list of (key_node, val_node)
+
+@dataclass
+class TupleLiteral(Node):
     elements: List[Node]
 
 
@@ -99,6 +111,13 @@ class TernaryExpr(Node):
     then_val: Node
     else_val: Node
 
+@dataclass
+class LambdaExpr(Node):
+    """Anonymous function: fn(x: int) -> int: return x * 2"""
+    params: List['Param']
+    ret_type: Optional[str]
+    body: List[Node]
+
 
 # ============================================================
 # Statements
@@ -108,6 +127,13 @@ class TernaryExpr(Node):
 class LetStmt(Node):
     name: str
     type_annotation: Optional[str]
+    value: Node
+
+@dataclass
+class TupleUnpack(Node):
+    """let (a, b): (int, float) = expr"""
+    names: List[str]
+    annotations: List[Optional[str]]
     value: Node
 
 @dataclass
@@ -177,16 +203,18 @@ class AssertStmt(Node):
 
 @dataclass
 class Param(Node):
-    name:     str
+    name:      str
     type_name: str
     default:   Optional[Node] = None
+    variadic:  bool = False          # ...param: T[]
 
 @dataclass
 class FnDecl(Node):
-    name: str
-    params: List[Param]
+    name:        str
+    params:      List[Param]
     return_type: Optional[str]
-    body: List[Node]
+    body:        List[Node]
+    type_params: List[str] = field(default_factory=list)  # [T, U, ...]
 
 @dataclass
 class StructField(Node):
@@ -228,7 +256,13 @@ class MatchStmt(Node):
 
 @dataclass
 class ImportStmt(Node):
-    path: str
+    path:  str
+    alias: Optional[str] = None   # import "math.vx" as math
+
+@dataclass
+class NamespaceHint(Node):
+    """Injected by resolve_imports() to tell the compiler about namespace aliases."""
+    alias: str
 
 @dataclass
 class TryCatch(Node):

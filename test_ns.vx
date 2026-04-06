@@ -1,0 +1,6 @@
+import "mathlib.vx" as math
+
+fn main():
+    print(math.square(5))
+    print(math.cube(3))
+    print(math.average(10.0, 20.0))

@@ -28,19 +28,40 @@ def resolve_imports(program, base_dir: str):
     Walk program declarations, load any ImportStmt files, recursively resolve
     their imports, and return a new Program with all declarations merged.
     Imported 'main' functions are dropped.
+
+    If an import has an alias (import "foo.vx" as foo), all declarations from
+    that file are renamed with the alias prefix (foo__name) and a NamespaceHint
+    is inserted so the analyzer/codegen know 'foo' is a namespace.
     """
     import os as _os
+    import copy as _copy
     from compiler.lexer import Lexer, LexError
     from compiler.parser import Parser, ParseError
-    from compiler.ast_nodes import ImportStmt, FnDecl, Program
+    from compiler.ast_nodes import (ImportStmt, FnDecl, StructDecl,
+                                     GlobalLet, GlobalConst, EnumDecl,
+                                     NamespaceHint, Program)
 
     merged = []
-    visited = set()
+    visited = set()   # (abs_path, alias) pairs already processed
+    inserted_ns = set()  # namespace aliases already inserted
 
     # Normalise base_dir to an absolute path for comparison
     base_dir = _os.path.abspath(base_dir)
 
-    def process(prog, cur_dir: str):
+    def _prefix_decl(decl, prefix: str):
+        """Return a copy of decl with its name prefixed."""
+        d = _copy.deepcopy(decl)
+        if isinstance(d, FnDecl):
+            d.name = f"{prefix}__{d.name}"
+        elif isinstance(d, StructDecl):
+            d.name = f"{prefix}__{d.name}"
+        elif isinstance(d, (GlobalLet, GlobalConst)):
+            d.name = f"{prefix}__{d.name}"
+        elif isinstance(d, EnumDecl):
+            d.name = f"{prefix}__{d.name}"
+        return d
+
+    def process(prog, cur_dir: str, alias: str | None = None):
         cur_dir = _os.path.abspath(cur_dir)
         for decl in prog.declarations:
             if isinstance(decl, ImportStmt):
@@ -48,9 +69,11 @@ def resolve_imports(program, base_dir: str):
                 if not path.endswith(".vx"):
                     path = path + ".vx"
                 abs_path = _os.path.normpath(_os.path.join(cur_dir, path))
-                if abs_path in visited:
+                sub_alias = decl.alias  # alias from this import statement
+                key = (abs_path, sub_alias)
+                if key in visited:
                     continue
-                visited.add(abs_path)
+                visited.add(key)
                 try:
                     with open(abs_path, encoding="utf-8") as f:
                         src = f.read()
@@ -64,13 +87,20 @@ def resolve_imports(program, base_dir: str):
                     sub_prog = Parser(tokens).parse()
                 except ParseError as e:
                     die(f"Parse error in '{abs_path}': {e}")
-                process(sub_prog, _os.path.dirname(abs_path))
+                # Insert NamespaceHint if this import has an alias
+                if sub_alias and sub_alias not in inserted_ns:
+                    inserted_ns.add(sub_alias)
+                    merged.append(NamespaceHint(sub_alias))
+                process(sub_prog, _os.path.dirname(abs_path), sub_alias)
             else:
-                # Drop 'main' functions that come from imported files
+                # Drop 'main' functions from imported files
                 if isinstance(decl, FnDecl) and decl.name == "main" \
                         and cur_dir != base_dir:
                     continue
-                merged.append(decl)
+                if alias:
+                    merged.append(_prefix_decl(decl, alias))
+                else:
+                    merged.append(decl)
 
     process(program, base_dir)
     from compiler.ast_nodes import Program

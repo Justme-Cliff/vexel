@@ -1,0 +1,14 @@
+fn first[T](arr: T[]) -> T:
+    return arr[0]
+
+fn last[T](arr: T[]) -> T:
+    return arr[arr.len() - 1]
+
+fn main():
+    let nums: int[] = [10, 20, 30]
+    let words: str[] = ["hello", "world", "vexel"]
+
+    print(first(nums))
+    print(last(nums))
+    print(first(words))
+    print(last(words))

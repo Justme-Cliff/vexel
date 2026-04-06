@@ -1,41 +1,23 @@
 """
-Vexel Semantic Analyzer  (v3)
+Vexel Semantic Analyzer  (v5)
 ------------------------------
 Two-pass analysis:
   Pass 1 — register all function / struct / global / enum signatures.
   Pass 2 — walk bodies, check undefined names, infer types.
 
-New in v2:
-  - Array type support ("int[]", "float[]", …)
-  - Break / continue validation (must be inside a loop)
-  - Built-in functions: len, sqrt, abs, min, max, pow, floor, ceil,
-                        int, float, str
-  - Global let / const
-  - ForEach
-  - Multi-arg print
-
-New in v3:
-  - Enum declarations
-  - Match statement
-  - Assert statement
-  - Import statement (no-op; handled before analysis)
-  - MethodCall type inference
-  - TernaryExpr type inference
-  - PI / E constants
-  - New builtins: exit, read_file, write_file, append_file, file_exists,
-                  rand, rand_int, sin, cos, tan, log, log2
-
-New in v4:
-  - TryCatch statement
-  - ForEnumerate statement
-  - TypeAlias declaration
-  - `in` operator support
-  - New builtins: round, clamp, lerp, atan2, throw,
-                  os_cwd, os_mkdir, os_delete
+New in v5:
+  - NamespaceHint: track namespace aliases
+  - LambdaExpr: anonymous functions with type fn(T,...)->R
+  - TupleUnpack: let (a, b) = expr
+  - TupleLiteral: (a, b, ...) inferred as (T1,T2,...) type
+  - Variadic params: ...nums: int[]
+  - Generic functions: fn first[T](arr: T[]) -> T
+  - Nullable types: int?, str?
+  - New builtins: os_list_dir, parse_int, parse_float, time_now, time_format, input
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from compiler.ast_nodes import *
 
@@ -49,41 +31,48 @@ VX_NULL  = "null"
 
 # Built-in functions that the codegen handles without a FnDecl.
 BUILTINS: dict[str, tuple[list[str], str]] = {
-    # name → ([param_types...], return_type)   (types are just hints, not enforced)
-    "len":         (["any"],                    VX_INT),
-    "sqrt":        (["float"],                  VX_FLOAT),
-    "abs":         (["any"],                    VX_INT),    # overloaded
-    "min":         (["any", "any"],             VX_INT),    # overloaded
-    "max":         (["any", "any"],             VX_INT),    # overloaded
-    "pow":         (["float", "float"],         VX_FLOAT),
-    "floor":       (["float"],                  VX_FLOAT),
-    "ceil":        (["float"],                  VX_FLOAT),
-    "int":         (["any"],                    VX_INT),
-    "float":       (["any"],                    VX_FLOAT),
-    "str":         (["any"],                    VX_STR),
-    "bool":        (["any"],                    VX_BOOL),
+    # name → ([param_types...], return_type)
+    "len":          (["any"],                     VX_INT),
+    "sqrt":         (["float"],                   VX_FLOAT),
+    "abs":          (["any"],                     VX_INT),     # overloaded
+    "min":          (["any", "any"],              VX_INT),     # overloaded
+    "max":          (["any", "any"],              VX_INT),     # overloaded
+    "pow":          (["float", "float"],          VX_FLOAT),
+    "floor":        (["float"],                   VX_FLOAT),
+    "ceil":         (["float"],                   VX_FLOAT),
+    "int":          (["any"],                     VX_INT),
+    "float":        (["any"],                     VX_FLOAT),
+    "str":          (["any"],                     VX_STR),
+    "bool":         (["any"],                     VX_BOOL),
     # v3 additions
-    "exit":        (["int"],                    VX_VOID),
-    "read_file":   (["str"],                    VX_STR),
-    "write_file":  (["str", "str"],             VX_VOID),
-    "append_file": (["str", "str"],             VX_VOID),
-    "file_exists": (["str"],                    VX_BOOL),
-    "rand":        ([],                         VX_FLOAT),
-    "rand_int":    (["int", "int"],             VX_INT),
-    "sin":         (["float"],                  VX_FLOAT),
-    "cos":         (["float"],                  VX_FLOAT),
-    "tan":         (["float"],                  VX_FLOAT),
-    "log":         (["float"],                  VX_FLOAT),
-    "log2":        (["float"],                  VX_FLOAT),
+    "exit":         (["int"],                     VX_VOID),
+    "read_file":    (["str"],                     VX_STR),
+    "write_file":   (["str", "str"],              VX_VOID),
+    "append_file":  (["str", "str"],              VX_VOID),
+    "file_exists":  (["str"],                     VX_BOOL),
+    "rand":         ([],                          VX_FLOAT),
+    "rand_int":     (["int", "int"],              VX_INT),
+    "sin":          (["float"],                   VX_FLOAT),
+    "cos":          (["float"],                   VX_FLOAT),
+    "tan":          (["float"],                   VX_FLOAT),
+    "log":          (["float"],                   VX_FLOAT),
+    "log2":         (["float"],                   VX_FLOAT),
     # v4 additions
-    "round":       (["float"],                  VX_INT),
-    "clamp":       (["any", "any", "any"],      VX_INT),    # overloaded
-    "lerp":        (["float", "float", "float"], VX_FLOAT),
-    "atan2":       (["float", "float"],         VX_FLOAT),
-    "throw":       (["str"],                    VX_VOID),
-    "os_cwd":      ([],                         VX_STR),
-    "os_mkdir":    (["str"],                    VX_BOOL),
-    "os_delete":   (["str"],                    VX_BOOL),
+    "round":        (["float"],                   VX_INT),
+    "clamp":        (["any", "any", "any"],       VX_INT),     # overloaded
+    "lerp":         (["float", "float", "float"], VX_FLOAT),
+    "atan2":        (["float", "float"],          VX_FLOAT),
+    "throw":        (["str"],                     VX_VOID),
+    "os_cwd":       ([],                          VX_STR),
+    "os_mkdir":     (["str"],                     VX_BOOL),
+    "os_delete":    (["str"],                     VX_BOOL),
+    # v5 additions
+    "os_list_dir":  (["str"],                     "str[]"),
+    "parse_int":    (["str"],                     VX_INT),
+    "parse_float":  (["str"],                     VX_FLOAT),
+    "time_now":     ([],                          VX_INT),
+    "time_format":  (["int"],                     VX_STR),
+    "input":        (["str"],                     VX_STR),
 }
 
 
@@ -91,6 +80,8 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
 class FnSig:
     params:      list[tuple[str, str]]
     return_type: str
+    variadic:    bool = False          # last param is variadic
+    type_params: list[str] = field(default_factory=list)  # generic type params
 
 
 @dataclass
@@ -99,22 +90,28 @@ class AnalysisResult:
     fn_sigs:       dict[str, FnSig]
     struct_fields: dict[str, list[tuple[str, str]]]
     global_types:  dict[str, str]
-    type_aliases:  dict[str, str] = None  # name → canonical type
+    type_aliases:  dict[str, str] = None   # name → canonical type
+    namespaces:    "set[str]" = None       # set of namespace alias names
+    generic_fns:   dict = None             # name → FnDecl (unevaluated generics)
 
     def __post_init__(self):
-        if self.type_aliases is None:
-            self.type_aliases = {}
+        if self.type_aliases is None:  self.type_aliases = {}
+        if self.namespaces is None:    self.namespaces   = set()
+        if self.generic_fns is None:   self.generic_fns  = {}
 
 
 class Analyzer:
     def __init__(self):
-        self._errors:        list[str]                   = []
-        self._fn_sigs:       dict[str, FnSig]            = {}
+        self._errors:        list[str]                        = []
+        self._fn_sigs:       dict[str, FnSig]                 = {}
         self._struct_fields: dict[str, list[tuple[str, str]]] = {}
-        self._global_types:  dict[str, str]              = {}
-        self._type_aliases:  dict[str, str]              = {}
-        self._scopes:        list[dict[str, str]]        = [{}]
-        self._loop_depth:    int                         = 0
+        self._global_types:  dict[str, str]                   = {}
+        self._type_aliases:  dict[str, str]                   = {}
+        self._namespaces:    set[str]                         = set()
+        self._generic_fns:   dict[str, "FnDecl"]              = {}
+        self._scopes:        list[dict[str, str]]             = [{}]
+        self._loop_depth:    int                              = 0
+        self._lambda_count:  int                              = 0
 
     # ------------------------------------------------------------------ #
 
@@ -123,10 +120,22 @@ class Analyzer:
         for name, (params, ret) in BUILTINS.items():
             self._fn_sigs[name] = FnSig([(f"a{i}", t) for i, t in enumerate(params)], ret)
 
-        # Pass 1
+        # Pass 1 — register all top-level declarations
         for decl in program.declarations:
-            if isinstance(decl, FnDecl):       self._register_fn(decl)
-            elif isinstance(decl, StructDecl): self._register_struct(decl)
+            if isinstance(decl, FnDecl):
+                if decl.type_params:
+                    self._generic_fns[decl.name] = decl
+                    # Register with placeholder sig so calls don't error
+                    self._fn_sigs[decl.name] = FnSig(
+                        [(p.name, p.type_name) for p in decl.params],
+                        decl.return_type or VX_VOID,
+                        variadic=any(p.variadic for p in decl.params),
+                        type_params=decl.type_params,
+                    )
+                else:
+                    self._register_fn(decl)
+            elif isinstance(decl, StructDecl):
+                self._register_struct(decl)
             elif isinstance(decl, (GlobalLet, GlobalConst)):
                 self._register_global(decl)
             elif isinstance(decl, EnumDecl):
@@ -136,16 +145,19 @@ class Analyzer:
                     self._scopes[0][key]    = VX_INT
             elif isinstance(decl, TypeAlias):
                 self._type_aliases[decl.name] = decl.target
+            elif isinstance(decl, NamespaceHint):
+                self._namespaces.add(decl.alias)
 
-        # Pass 2
+        # Pass 2 — analyze function bodies
         for decl in program.declarations:
-            if isinstance(decl, FnDecl):
+            if isinstance(decl, FnDecl) and not decl.type_params:
                 self._analyze_fn(decl)
 
         return AnalysisResult(
             self._errors, self._fn_sigs,
             self._struct_fields, self._global_types,
-            self._type_aliases,
+            self._type_aliases, self._namespaces,
+            self._generic_fns,
         )
 
     # ------------------------------------------------------------------ #
@@ -153,8 +165,10 @@ class Analyzer:
     # ------------------------------------------------------------------ #
 
     def _register_fn(self, d: FnDecl):
-        params = [(p.name, p.type_name) for p in d.params]
-        self._fn_sigs[d.name] = FnSig(params, d.return_type or VX_VOID)
+        params   = [(p.name, p.type_name) for p in d.params]
+        variadic = any(p.variadic for p in d.params)
+        self._fn_sigs[d.name] = FnSig(params, d.return_type or VX_VOID,
+                                      variadic=variadic)
 
     def _register_struct(self, d: StructDecl):
         self._struct_fields[d.name] = [(f.name, f.type_name) for f in d.fields]
@@ -201,6 +215,15 @@ class Analyzer:
         if isinstance(node, LetStmt):
             t = self._infer_expr(node.value)
             self._declare(node.name, node.type_annotation or t)
+
+        elif isinstance(node, TupleUnpack):
+            t = self._infer_expr(node.value)
+            # t is like "(int,float)" — extract element types
+            elem_types = self._parse_tuple_type(t)
+            for i, name in enumerate(node.names):
+                ann = node.annotations[i] if i < len(node.annotations) else None
+                et  = ann or (elem_types[i] if i < len(elem_types) else VX_INT)
+                self._declare(name, et)
 
         elif isinstance(node, AssignStmt):
             if isinstance(node.target, Identifier):
@@ -301,8 +324,34 @@ class Analyzer:
             for s in node.body: self._analyze_stmt(s, ret_type)
             self._loop_depth -= 1; self._pop()
 
-        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias)):
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint)):
             pass  # handled in pass 1 or before analysis
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _parse_tuple_type(self, t: str) -> list[str]:
+        """Extract element types from tuple type string like '(int,float)'."""
+        if t.startswith("(") and t.endswith(")"):
+            inner = t[1:-1]
+            return self._split_types(inner)
+        return []
+
+    def _split_types(self, s: str) -> list[str]:
+        """Split type list respecting nesting."""
+        parts, depth, cur = [], 0, []
+        for c in s:
+            if c in ('(', '[', '<'): depth += 1
+            elif c in (')', ']', '>'): depth -= 1
+            if c == ',' and depth == 0:
+                parts.append(''.join(cur).strip())
+                cur = []
+            else:
+                cur.append(c)
+        if cur:
+            parts.append(''.join(cur).strip())
+        return parts
 
     # ------------------------------------------------------------------ #
     #  Expression type inference                                           #
@@ -320,10 +369,41 @@ class Analyzer:
             et = self._infer_expr(node.elements[0])
             return f"{et}[]"
 
+        if isinstance(node, DictLiteral):
+            if not node.pairs: return "dict[str,int]"
+            kt = self._infer_expr(node.pairs[0][0])
+            vt = self._infer_expr(node.pairs[0][1])
+            return f"dict[{kt},{vt}]"
+
+        if isinstance(node, TupleLiteral):
+            types = [self._infer_expr(e) for e in node.elements]
+            return "(" + ",".join(types) + ")"
+
+        if isinstance(node, LambdaExpr):
+            param_types = ",".join(p.type_name for p in node.params)
+            ret = node.ret_type or VX_VOID
+            # Register the lambda as an anonymous function
+            lname = f"__lambda_{self._lambda_count}"
+            self._lambda_count += 1
+            self._fn_sigs[lname] = FnSig(
+                [(p.name, p.type_name) for p in node.params], ret
+            )
+            # Analyze the body
+            self._push()
+            for p in node.params:
+                self._declare(p.name, p.type_name)
+            for s in node.body:
+                self._analyze_stmt(s, ret)
+            self._pop()
+            return f"fn({param_types})->{ret}"
+
         if isinstance(node, Identifier):
             # Built-in constants
             if node.name in ("PI", "E"):
                 return VX_FLOAT
+            # Namespace name used as value? Return special marker
+            if node.name in self._namespaces:
+                return f"__namespace__{node.name}"
             t = self._lookup(node.name)
             if t is None:
                 self._err(f"Undefined variable '{node.name}'")
@@ -347,6 +427,13 @@ class Analyzer:
         if isinstance(node, Call):
             sig = self._fn_sigs.get(node.func)
             if sig is None:
+                # Check if node.func is a variable with a function type
+                var_t = self._lookup(node.func)
+                if var_t and var_t.startswith("fn("):
+                    # Extract return type from "fn(int,float)->str"
+                    arrow_idx = var_t.rindex("->")
+                    for a in node.args: self._infer_expr(a)
+                    return var_t[arrow_idx+2:]
                 self._err(f"Undefined function '{node.func}'")
                 return VX_VOID
             # For overloaded builtins, infer return type from args
@@ -354,12 +441,40 @@ class Analyzer:
                 if node.args:
                     at = self._infer_expr(node.args[0])
                     return VX_FLOAT if at == VX_FLOAT else VX_INT
+            # For generic functions, substitute T
+            if sig.type_params and node.args:
+                at = self._infer_expr(node.args[0])
+                # Infer return type by substituting type param
+                ret = sig.return_type
+                if sig.type_params:
+                    tp = sig.type_params[0]
+                    # Infer T from first arg
+                    inferred_t = at[:-2] if at.endswith("[]") else at
+                    ret = ret.replace(tp, inferred_t) if tp in ret else ret
+                return ret
             for a in node.args: self._infer_expr(a)
             return sig.return_type
 
         if isinstance(node, MethodCall):
             obj_t = self._infer_expr(node.obj)
             for a in node.args: self._infer_expr(a)
+
+            # Namespace call: ns.func(args)
+            if obj_t.startswith("__namespace__"):
+                ns = obj_t[len("__namespace__"):]
+                fn_name = f"{ns}__{node.method}"
+                sig = self._fn_sigs.get(fn_name)
+                if sig:
+                    return sig.return_type
+                self._err(f"Namespace '{ns}' has no function '{node.method}'")
+                return VX_VOID
+
+            if obj_t.startswith("dict["):
+                inner = obj_t[5:-1]
+                ci = inner.index(',')
+                vt = inner[ci+1:]
+                return {"has": VX_BOOL, "remove": VX_VOID,
+                        "len": VX_INT, "keys": "str[]"}.get(node.method, VX_VOID)
             if obj_t == VX_STR:
                 str_methods = {
                     "len":         VX_INT,
@@ -383,6 +498,12 @@ class Analyzer:
                     "reverse":  VX_VOID,
                 }
                 return arr_methods.get(node.method, VX_VOID)
+            # Nullable type: strip ? and recurse
+            if obj_t.endswith("?"):
+                inner_t = obj_t[:-1]
+                # Try struct methods
+                for fn_name, ft in self._struct_fields.get(inner_t, []):
+                    if fn_name == node.method: return ft
             return VX_VOID
 
         if isinstance(node, TernaryExpr):
@@ -401,6 +522,10 @@ class Analyzer:
             ot = self._infer_expr(node.obj)
             for fn, ft in self._struct_fields.get(ot, []):
                 if fn == node.field: return ft
+            # Nullable struct field
+            if ot.endswith("?"):
+                for fn, ft in self._struct_fields.get(ot[:-1], []):
+                    if fn == node.field: return ft
             self._err(f"Type '{ot}' has no field '{node.field}'")
             return VX_INT
 
@@ -412,8 +537,11 @@ class Analyzer:
         if isinstance(node, IndexExpr):
             ot = self._infer_expr(node.obj)
             self._infer_expr(node.index)
+            if ot.startswith("dict["):
+                inner = ot[5:-1]
+                return inner[inner.index(',')+1:]
             if ot.endswith("[]"): return ot[:-2]
-            if ot == VX_STR: return VX_STR   # string indexing returns single char as str
+            if ot == VX_STR: return VX_STR
             return VX_INT
 
         return VX_INT

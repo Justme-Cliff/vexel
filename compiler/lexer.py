@@ -18,6 +18,10 @@ New in v4:
   - TRY, CATCH, TYPE keywords
   - Triple-quoted strings: \"\"\"...\"\"\"  (newlines become \\n)
   - F-strings: f"Hello {name}!"  desugared to concatenation at lex time
+
+New in v5:
+  - AS keyword (for namespace imports)
+  - ELLIPSIS token (... for variadic params)
 """
 
 import re
@@ -63,6 +67,7 @@ class TT(Enum):
     TRY          = auto()
     CATCH        = auto()
     TYPE         = auto()
+    AS           = auto()
 
     # Arithmetic operators
     PLUS         = auto()
@@ -88,6 +93,7 @@ class TT(Enum):
     # Misc operators
     ASSIGN       = auto()   # =
     ARROW        = auto()   # ->
+    ELLIPSIS     = auto()   # ...
     DOTDOT       = auto()   # ..
     QUESTION     = auto()   # ?
 
@@ -140,6 +146,7 @@ KEYWORDS: dict[str, TT] = {
     "try":      TT.TRY,
     "catch":    TT.CATCH,
     "type":     TT.TYPE,
+    "as":       TT.AS,
 }
 
 
@@ -358,7 +365,10 @@ class Lexer:
             tt   = KEYWORDS.get(word, TT.IDENT)
             return Token(tt, word, self.line), pos + m.end()
 
-        # Three-char (none yet, but placeholder)
+        # Three-char — ELLIPSIS must be checked before DOTDOT
+        three = s[pos:pos + 3]
+        if three == "...":
+            return Token(TT.ELLIPSIS, "...", self.line), pos + 3
 
         # Two-char operators — check BEFORE single-char
         two = s[pos:pos + 2]

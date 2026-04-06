@@ -1,0 +1,29 @@
+fn main():
+    # --- Chained comparisons ---
+    let x: int = 5
+    print(0 < x < 10)
+    print(1 < x < 4)
+
+    # --- Tuples ---
+    let t: (int, int) = (10, 20)
+    let (a, b) = t
+    print(a)
+    print(b)
+
+    # --- Nullable types ---
+    let maybe: int? = null
+    if maybe == null:
+        print("is null")
+    let val: int? = 42
+    if val != null:
+        print("not null")
+
+    # --- parse_int / parse_float ---
+    let n: int = parse_int("123")
+    let f: float = parse_float("3.14")
+    print(n)
+    print(f)
+
+    # --- time_now ---
+    let t2: int = time_now()
+    print(t2 > 0)

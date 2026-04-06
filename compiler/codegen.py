@@ -96,7 +96,20 @@ class Compiler:
         # Default parameter values per function (registered in compile pass)
         self._fn_defaults: dict[str, list] = {}
 
+        # Lambda counter (for unique naming)
+        self._lambda_count: int = 0
+
+        # Tuple type registry: type-string → LLVM identified struct type
+        self._tuple_types: dict[str, ir.IdentifiedStructType] = {}
+
+        # Monomorphized generic function cache
+        self._mono_cache: dict[str, str] = {}  # (fn_name, type_key) → concrete_name
+
+        # Namespace registry (alias → True)
+        self._namespaces: set[str] = set()
+
         self._define_array_type()
+        self._define_dict_type()
         self._declare_externs()
 
     # ------------------------------------------------------------------ #
@@ -109,6 +122,15 @@ class Compiler:
             # {i8* data, i64 len, i64 cap}
             self.arr_type.set_body(I8PTR, I64_TY, I64_TY)
         self.arr_ptr_type = ir.PointerType(self.arr_type)
+
+    def _define_dict_type(self):
+        self.dict_type = self.module.context.get_identified_type("vx_dict")
+        if self.dict_type.is_opaque:
+            # {i8* keys_ptr, i8* vals_ptr, i64 len, i64 cap}
+            # keys_ptr → array of i8* (string pointers)
+            # vals_ptr → array of i64  (type-erased values)
+            self.dict_type.set_body(I8PTR, I8PTR, I64_TY, I64_TY)
+        self.dict_ptr_type = ir.PointerType(self.dict_type)
 
     # ------------------------------------------------------------------ #
     #  External declarations                                               #
@@ -174,6 +196,14 @@ class Compiler:
         self.rmdir_fn    = _fn(I32_TY, I8PTR,           name="_rmdir"   if _win else "rmdir")
         self.strerror_fn = _fn(I8PTR,  I32_TY,          name="strerror")
 
+        # v5 new builtins
+        self.atoll_fn    = _fn(I64_TY, I8PTR,            name="atoll")
+        self.atof_fn     = _fn(F64_TY, I8PTR,            name="atof")
+        self.strftime_fn = _fn(I64_TY, I8PTR, I64_TY, I8PTR, I8PTR, name="strftime")  # (buf,sz,fmt,tm*)
+        self.localtime_fn= _fn(I8PTR,  I8PTR,            name="localtime")  # tm* localtime(time_t*)
+        self.fgets_fn    = _fn(I8PTR,  I8PTR, I32_TY, I8PTR, name="fgets")
+        self.stdin_fn    = None  # resolved lazily via helper
+
         # v4 error state (global buffer defined in this module)
         arr_ty = ir.ArrayType(I8_TY, 512)
         self._vx_error_buf = ir.GlobalVariable(self.module, arr_ty,
@@ -229,7 +259,17 @@ class Compiler:
         if vx == "str":    return I8PTR
         if vx == "void":   return VOID_TY
         if vx == "null":   return I8PTR
-        if vx.endswith("[]"):  return self.arr_ptr_type
+        if vx.endswith("[]"):      return self.arr_ptr_type
+        if vx.startswith("dict["): return self.dict_ptr_type
+        # Tuple type: (int,float,...) → pointer to struct
+        if vx.startswith("(") and vx.endswith(")"):
+            return I8PTR  # stored as opaque pointer; cast when needed
+        # Nullable types: T? → i8* (opaque pointer; null means null, non-null is boxed value)
+        if vx.endswith("?"):
+            return I8PTR
+        # Function type: fn(int)->float → i8* (opaque fn pointer)
+        if vx.startswith("fn("):
+            return I8PTR
         if vx in self._structs:
             return ir.PointerType(self._structs[vx]["llvm_type"])
         raise CodegenError(f"Unknown type: {vx!r}")
@@ -243,6 +283,11 @@ class Compiler:
         if isinstance(node, ArrayLiteral):
             if not node.elements: return "int[]"
             return self._infer_type(node.elements[0]) + "[]"
+        if isinstance(node, DictLiteral):
+            if not node.pairs: return "dict[str,int]"
+            kt = self._infer_type(node.pairs[0][0])
+            vt = self._infer_type(node.pairs[0][1])
+            return f"dict[{kt},{vt}]"
         if isinstance(node, Identifier):
             if node.name in ("PI", "E"): return "float"
             info = self._lookup(node.name)
@@ -264,6 +309,11 @@ class Compiler:
             return sig.return_type if sig else "void"
         if isinstance(node, MethodCall):
             obj_t = self._infer_type(node.obj)
+            if obj_t.startswith("dict["):
+                inner = obj_t[5:-1]
+                vt = inner[inner.index(',')+1:]
+                return {"has": "bool", "remove": "void",
+                        "len": "int", "keys": "str[]"}.get(node.method, "void")
             if obj_t == "str":
                 return {"len": "int", "upper": "str", "lower": "str", "trim": "str",
                         "contains": "bool", "starts_with": "bool", "ends_with": "bool",
@@ -292,6 +342,9 @@ class Compiler:
         if isinstance(node, IndexExpr):
             ot = self._infer_type(node.obj)
             if ot == "str": return "str"
+            if ot.startswith("dict["):
+                inner = ot[5:-1]
+                return inner[inner.index(',')+1:]
             return ot[:-2] if ot.endswith("[]") else "int"
         return "int"
 
@@ -315,6 +368,13 @@ class Compiler:
     # ------------------------------------------------------------------ #
 
     def compile(self, program: Program) -> str:
+        # 0. Collect namespace hints
+        for d in program.declarations:
+            if isinstance(d, NamespaceHint):
+                self._namespaces.add(d.alias)
+        if self.analysis.namespaces:
+            self._namespaces.update(self.analysis.namespaces)
+
         # 1. Struct definitions
         for d in program.declarations:
             if isinstance(d, StructDecl): self._define_struct(d)
@@ -335,13 +395,15 @@ class Compiler:
             if isinstance(d, (GlobalLet, GlobalConst)):
                 self._compile_global(d)
 
-        # 4. Forward-declare all functions
+        # 4. Forward-declare all non-generic functions
         for d in program.declarations:
-            if isinstance(d, FnDecl): self._declare_fn(d)
+            if isinstance(d, FnDecl) and not d.type_params:
+                self._declare_fn(d)
 
-        # 5. Compile function bodies
+        # 5. Compile non-generic function bodies
         for d in program.declarations:
-            if isinstance(d, FnDecl): self._compile_fn(d)
+            if isinstance(d, FnDecl) and not d.type_params:
+                self._compile_fn(d)
 
         return str(self.module)
 
@@ -437,6 +499,7 @@ class Compiler:
             return   # dead code — skip
 
         if   isinstance(node, LetStmt):         self._compile_let(node)
+        elif isinstance(node, TupleUnpack):      self._compile_tuple_unpack(node)
         elif isinstance(node, AssignStmt):       self._compile_assign(node)
         elif isinstance(node, IndexAssignStmt):  self._compile_index_assign(node)
         elif isinstance(node, ReturnStmt):       self._compile_return(node)
@@ -452,7 +515,7 @@ class Compiler:
         elif isinstance(node, AssertStmt):       self._compile_assert(node)
         elif isinstance(node, TryCatch):         self._compile_try_catch(node)
         elif isinstance(node, ForEnumerate):     self._compile_for_enumerate(node)
-        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias)):
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint)):
             pass  # handled in compile() pass or before codegen
         else:
             raise CodegenError(f"Unknown stmt: {type(node).__name__}")
@@ -465,9 +528,46 @@ class Compiler:
         if declared == "float" and vt == "int":
             val = self.builder.sitofp(val, F64_TY); vt = "float"
 
+        # Nullable boxing: T? with a non-null value → box into malloc cell
+        if declared.endswith("?"):
+            if vt == "null":
+                val = ir.Constant(I8PTR, None)
+            elif vt != declared:
+                # Box the value into heap
+                base = declared[:-1]
+                base_ll = self._vx_to_llvm(base) if base else I64_TY
+                esz = ir.Constant(I64_TY, _elem_size(base))
+                box = self.builder.call(self.malloc_fn, [esz])
+                if base_ll != VOID_TY:
+                    typed_box = self.builder.bitcast(box, ir.PointerType(base_ll))
+                    # Promote int→float if needed
+                    if base == "float" and vt == "int":
+                        val = self.builder.sitofp(val, F64_TY)
+                    self.builder.store(val, typed_box)
+                val = box  # i8*
+
         al = self.builder.alloca(ll_ty, name=node.name)
         self.builder.store(val, al)
         self._declare(node.name, al, declared)
+
+    def _compile_tuple_unpack(self, node: TupleUnpack):
+        """Compile: let (a, b) = expr"""
+        val, vt = self._compile_expr(node.value)
+        # vt is like "(int,float)" or the type of what was returned
+        elem_types = self._parse_tuple_type_str(vt)
+        tup_struct = self._get_tuple_llvm_type(elem_types)
+        tup_ptr = self.builder.bitcast(val, ir.PointerType(tup_struct))
+        for i, name in enumerate(node.names):
+            ann = node.annotations[i] if i < len(node.annotations) else None
+            et  = ann or (elem_types[i] if i < len(elem_types) else "int")
+            et  = self._resolve_type(et)
+            ll_ty = self._vx_to_llvm(et)
+            al = self.builder.alloca(ll_ty, name=name)
+            fp = self.builder.gep(tup_ptr,
+                                  [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, i)],
+                                  inbounds=True)
+            self.builder.store(self.builder.load(fp), al)
+            self._declare(name, al, et)
 
     def _compile_assign(self, node: AssignStmt):
         val, vt = self._compile_expr(node.value)
@@ -485,12 +585,23 @@ class Compiler:
 
     def _compile_index_assign(self, node: IndexAssignStmt):
         val, vt      = self._compile_expr(node.value)
-        arr_val, avt = self._compile_expr(node.obj)
+        obj_val, avt = self._compile_expr(node.obj)
         idx_val, _   = self._compile_expr(node.index)
-        elem_vt      = avt[:-2] if avt.endswith("[]") else "int"
-        elem_lt      = self._vx_to_llvm(elem_vt)
 
-        data_ptr = self._arr_data_ptr(arr_val, elem_lt)
+        # Dict assignment: d["key"] = val
+        if avt.startswith("dict["):
+            inner = avt[5:-1]
+            vt_expected = inner[inner.index(',')+1:]
+            raw64 = self._val_to_i64(val, vt, vt_expected)
+            fn_h = self._get_helper("__vx_dict_set")
+            dict_raw = self.builder.bitcast(obj_val, I8PTR)
+            self.builder.call(fn_h, [dict_raw, idx_val, raw64])
+            return
+
+        # Array assignment
+        elem_vt = avt[:-2] if avt.endswith("[]") else "int"
+        elem_lt = self._vx_to_llvm(elem_vt)
+        data_ptr = self._arr_data_ptr(obj_val, elem_lt)
         ep       = self.builder.gep(data_ptr, [idx_val], inbounds=True)
         if elem_vt == "float" and vt == "int":
             val = self.builder.sitofp(val, F64_TY)
@@ -537,6 +648,30 @@ class Compiler:
             s = self.builder.select(val, t, f)
             fmt = self._gstr_ptr(self._global_str("%s"))
             self.builder.call(self.printf, [fmt, s])
+        elif vt.endswith("?"):
+            # Nullable: print "null" or the underlying value
+            fn = self.current_fn
+            null_b  = fn.append_basic_block("print.null")
+            val_b   = fn.append_basic_block("print.val")
+            after_b = fn.append_basic_block("print.after")
+            val_int = self.builder.ptrtoint(val, I64_TY)
+            is_null = self.builder.icmp_unsigned("==", val_int, ir.Constant(I64_TY, 0))
+            self.builder.cbranch(is_null, null_b, val_b)
+            self.builder.position_at_end(null_b)
+            fmt_n = self._gstr_ptr(self._global_str("null"))
+            self.builder.call(self.printf, [self._gstr_ptr(self._global_str("%s")), fmt_n])
+            self.builder.branch(after_b)
+            self.builder.position_at_end(val_b)
+            base_t = vt[:-1]
+            base_ll = self._vx_to_llvm(base_t) if base_t else I64_TY
+            if base_ll != VOID_TY and base_ll != I8PTR:
+                typed_ptr = self.builder.bitcast(val, ir.PointerType(base_ll))
+                inner_val = self.builder.load(typed_ptr)
+                self._print_value(inner_val, base_t)
+            else:
+                self._print_value(val, "str")
+            self.builder.branch(after_b)
+            self.builder.position_at_end(after_b)
         elif vt.endswith("[]"):
             fmt = self._gstr_ptr(self._global_str(f"<{vt} len="))
             self.builder.call(self.printf, [fmt])
@@ -544,6 +679,10 @@ class Compiler:
             ln  = self.builder.load(lp)
             fmtd = self._gstr_ptr(self._global_str("%lld>"))
             self.builder.call(self.printf, [fmtd, ln])
+        elif vt.startswith("("):
+            # Tuple — print as <tuple>
+            fmt = self._gstr_ptr(self._global_str(f"<tuple>"))
+            self.builder.call(self.printf, [self._gstr_ptr(self._global_str("%s")), fmt])
         else:
             # Struct / unknown — print type
             fmt = self._gstr_ptr(self._global_str(f"<{vt}>"))
@@ -946,6 +1085,12 @@ class Compiler:
 
         if isinstance(node, ArrayLiteral):
             return self._compile_array_literal(node)
+        if isinstance(node, DictLiteral):
+            return self._compile_dict_literal(node)
+        if isinstance(node, TupleLiteral):
+            return self._compile_tuple_literal(node)
+        if isinstance(node, LambdaExpr):
+            return self._compile_lambda(node)
 
         if isinstance(node, Identifier):
             # Built-in constants
@@ -983,6 +1128,11 @@ class Compiler:
         if isinstance(node, IndexExpr):
             obj_v, obj_t = self._compile_expr(node.obj)
             idx_v, _     = self._compile_expr(node.index)
+            # Dict indexing: dict["key"] → value
+            if obj_t.startswith("dict["):
+                inner = obj_t[5:-1]
+                vt = inner[inner.index(',')+1:]
+                return self._compile_dict_index_get(obj_v, idx_v, vt)
             # String indexing: return 1-char string
             if obj_t == "str":
                 cp  = self.builder.gep(obj_v, [idx_v], inbounds=False)
@@ -1043,8 +1193,39 @@ class Compiler:
     # ------------------------------------------------------------------ #
 
     def _compile_method_call(self, node: MethodCall) -> tuple[ir.Value, str]:
+        # Namespace call: ns.func(args) where ns is a known namespace alias
+        if isinstance(node.obj, Identifier) and node.obj.name in self._namespaces:
+            ns = node.obj.name
+            fn_name = f"{ns}__{node.method}"
+            fi = self._functions.get(fn_name)
+            if fi is None:
+                raise CodegenError(f"Namespace '{ns}' has no function '{node.method}'")
+            fn  = fi["fn"]
+            sig = fi["sig"]
+            defaults = self._fn_defaults.get(fn_name, [])
+            args_list = list(node.args)
+            while len(args_list) < len(sig.params):
+                idx = len(args_list)
+                if idx < len(defaults) and defaults[idx] is not None:
+                    args_list.append(defaults[idx])
+                else:
+                    break
+            compiled_args = []
+            for arg_node, (_, pt) in zip(args_list, sig.params):
+                av, at = self._compile_expr(arg_node)
+                if pt == "float" and at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+                compiled_args.append(av)
+            result = self.builder.call(fn, compiled_args)
+            return result, sig.return_type
+
         obj_v, obj_t = self._compile_expr(node.obj)
         method = node.method
+
+        if obj_t.startswith("dict["):
+            inner = obj_t[5:-1]
+            vt = inner[inner.index(',')+1:]
+            return self._compile_dict_method(obj_v, obj_t, vt, method, node.args)
 
         if obj_t == "str":
             return self._compile_str_method(obj_v, method, node.args)
@@ -1185,6 +1366,18 @@ class Compiler:
             "__vx_file_write":           self._build_file_write,
             "__vx_file_append":          self._build_file_append,
             "__vx_file_exists":          self._build_file_exists,
+            # Dict helpers
+            "__vx_dict_new":             self._build_dict_new,
+            "__vx_dict_set":             self._build_dict_set,
+            "__vx_dict_get":             self._build_dict_get,
+            "__vx_dict_has":             self._build_dict_has,
+            "__vx_dict_remove":          self._build_dict_remove,
+            "__vx_dict_len":             self._build_dict_len,
+            "__vx_dict_keys":            self._build_dict_keys,
+            # v5 helpers
+            "__vx_time_format":          self._build_time_format,
+            "__vx_input":                self._build_input,
+            "__vx_os_list_dir":          self._build_os_list_dir,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -1930,6 +2123,17 @@ class Compiler:
         lv, lt = self._compile_expr(node.left)
         rv, rt = self._compile_expr(node.right)
 
+        # Nullable comparison: T? == null / T? != null
+        if op in ("==", "!=") and (lt.endswith("?") or rt == "null" or
+                                    rt.endswith("?") or lt == "null"):
+            # Both sides to i64 for pointer comparison
+            li = self.builder.ptrtoint(lv, I64_TY)
+            ri = self.builder.ptrtoint(rv, I64_TY)
+            if op == "==":
+                return self.builder.icmp_unsigned("==", li, ri), "bool"
+            else:
+                return self.builder.icmp_unsigned("!=", li, ri), "bool"
+
         # String + concatenation (inline — no external runtime needed)
         if op == "+" and lt == "str":
             return self._str_concat_inline(lv, rv), "str"
@@ -2322,15 +2526,66 @@ class Compiler:
             phi.add_incoming(dir_ok, try_b)
             return phi, "bool"
 
-        # --- User-defined functions (with default param support) ---
+        # --- v5 new builtins ---
+        if name == "parse_int":
+            s_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self.atoll_fn, [s_v]), "int"
+
+        if name == "parse_float":
+            s_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self.atof_fn, [s_v]), "float"
+
+        if name == "time_now":
+            null_ptr = ir.Constant(I8PTR, None)
+            t = self.builder.call(self.time_fn, [null_ptr])
+            return t, "int"
+
+        if name == "time_format":
+            t_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_time_format")
+            return self.builder.call(fn_h, [t_v]), "str"
+
+        if name == "input":
+            prompt_v, _ = self._compile_expr(node.args[0]) if node.args else (self._gstr_ptr(self._global_str("")), "str")
+            fn_h = self._get_helper("__vx_input")
+            return self.builder.call(fn_h, [prompt_v]), "str"
+
+        if name == "os_list_dir":
+            path_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_os_list_dir")
+            raw = self.builder.call(fn_h, [path_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
+
+        # --- Generic function monomorphization ---
+        if name in self.analysis.generic_fns:
+            return self._compile_generic_call(node)
+
+        # --- User-defined functions (with default param support and variadic) ---
         fi = self._functions.get(name)
+
+        # --- Indirect call through function pointer variable ---
         if fi is None:
+            info = self._lookup(name)
+            if info is not None and self._is_fn_type(info["vx_type"]):
+                return self._compile_indirect_call(info, node.args)
             raise CodegenError(f"Undefined function '{name}'")
+
         fn  = fi["fn"]
         sig = fi["sig"]
         # Collect defaults registered during compile phase
         defaults = self._fn_defaults.get(name, [])
         args_with_defaults = list(node.args)
+
+        # Handle variadic: pack extra args into array
+        if sig.variadic and len(sig.params) > 0:
+            _, vptype = sig.params[-1]     # e.g. "int[]"
+            elem_vt = vptype[:-2] if vptype.endswith("[]") else "int"
+            n_fixed = len(sig.params) - 1
+            fixed_args  = args_with_defaults[:n_fixed]
+            variadic_args = args_with_defaults[n_fixed:]
+            arr_node = ArrayLiteral(variadic_args)
+            args_with_defaults = fixed_args + [arr_node]
+
         while len(args_with_defaults) < len(sig.params):
             idx = len(args_with_defaults)
             if idx < len(defaults) and defaults[idx] is not None:
@@ -2346,6 +2601,220 @@ class Compiler:
             compiled_args.append(av)
         result = self.builder.call(fn, compiled_args)
         return result, sig.return_type
+
+    def _is_fn_type(self, vx_type: str) -> bool:
+        return vx_type.startswith("fn(")
+
+    def _compile_indirect_call(self, info: dict, args) -> tuple[ir.Value, str]:
+        """Call through a function pointer variable."""
+        fn_type_str = info["vx_type"]  # "fn(int,float)->str"
+        ptr_val = self.builder.load(info["ptr"])
+
+        # Parse fn type string: fn(T1,T2,...)->R
+        assert fn_type_str.startswith("fn(")
+        arrow_idx = fn_type_str.rindex("->")
+        params_str = fn_type_str[3:fn_type_str.index(")")]
+        ret_str    = fn_type_str[arrow_idx+2:]
+        param_types = [t.strip() for t in params_str.split(",") if t.strip()]
+        ret_type   = ret_str.strip()
+
+        ll_params = [self._vx_to_llvm(pt) for pt in param_types]
+        ll_ret    = self._vx_to_llvm(ret_type)
+        fn_ty     = ir.FunctionType(ll_ret, ll_params)
+        fn_ptr_ty = ir.PointerType(fn_ty)
+
+        # Cast i8* → fn_ptr_ty and call
+        typed_fn = self.builder.bitcast(ptr_val, fn_ptr_ty)
+        compiled_args = []
+        for arg_node, pt in zip(args, param_types):
+            av, at = self._compile_expr(arg_node)
+            if pt == "float" and at == "int":
+                av = self.builder.sitofp(av, F64_TY)
+            compiled_args.append(av)
+        result = self.builder.call(typed_fn, compiled_args)
+        return result, ret_type
+
+    def _compile_generic_call(self, node: Call) -> tuple[ir.Value, str]:
+        """Monomorphize and call a generic function."""
+        import copy, re
+        decl = self.analysis.generic_fns[node.func]
+
+        # Infer type arguments from actual argument types
+        actual_types = []
+        for arg in node.args:
+            actual_types.append(self._infer_type(arg))
+
+        # Build type substitution map: T → concrete type
+        type_map = {}
+        for i, tp in enumerate(decl.type_params):
+            if i < len(decl.params) and i < len(actual_types):
+                param_declared = decl.params[i].type_name  # e.g. "T[]"
+                actual = actual_types[i]                    # e.g. "int[]"
+                # Strip common suffix to infer T
+                if param_declared.endswith("[]") and actual.endswith("[]"):
+                    type_map[tp] = actual[:-2]
+                else:
+                    type_map[tp] = actual
+
+        # Name of the concrete version: first__int
+        suffix = "__".join(type_map.get(tp, "any") for tp in decl.type_params)
+        concrete_name = f"{decl.name}__{suffix}"
+
+        # Monomorphize if not already done
+        if concrete_name not in self._functions:
+            def _subst(s: str) -> str:
+                for tp, concrete in type_map.items():
+                    s = re.sub(rf'\b{re.escape(tp)}\b', concrete, s)
+                return s
+
+            new_decl = copy.deepcopy(decl)
+            new_decl.name = concrete_name
+            new_decl.type_params = []
+            for p in new_decl.params:
+                p.type_name = _subst(p.type_name)
+            if new_decl.return_type:
+                new_decl.return_type = _subst(new_decl.return_type)
+
+            # Register in analyzer fn_sigs
+            from compiler.analyzer import FnSig as _FnSig
+            self.analysis.fn_sigs[concrete_name] = _FnSig(
+                [(p.name, p.type_name) for p in new_decl.params],
+                new_decl.return_type or "void"
+            )
+
+            self._declare_fn(new_decl)
+            # Compile body — save and restore builder state
+            saved_builder  = self.builder
+            saved_fn       = self.current_fn
+            saved_scopes   = self._scope_stack
+            self._scope_stack = [{}]
+            self._compile_fn(new_decl)
+            self.builder      = saved_builder
+            self.current_fn   = saved_fn
+            self._scope_stack = saved_scopes
+
+        # Now call the concrete function
+        fi  = self._functions[concrete_name]
+        fn  = fi["fn"]
+        sig = fi["sig"]
+        compiled_args = []
+        for arg_node, (_, pt) in zip(node.args, sig.params):
+            av, at = self._compile_expr(arg_node)
+            if pt == "float" and at == "int":
+                av = self.builder.sitofp(av, F64_TY)
+            compiled_args.append(av)
+        result = self.builder.call(fn, compiled_args)
+        return result, sig.return_type
+
+    # ------------------------------------------------------------------ #
+    #  Lambdas (non-capturing anonymous functions)                        #
+    # ------------------------------------------------------------------ #
+
+    def _compile_lambda(self, node: LambdaExpr) -> tuple[ir.Value, str]:
+        """Compile a lambda expression. Returns (fn_ptr as i8*, fn_type_str)."""
+        lname = f"__lambda_{self._lambda_count}"
+        self._lambda_count += 1
+
+        param_vx_types = [p.type_name for p in node.params]
+        ret_vx = node.ret_type or "void"
+        fn_type_str = f"fn({','.join(param_vx_types)})->{ret_vx}"
+
+        # Build a concrete FnDecl and compile it
+        import copy as _copy
+        decl = FnDecl(lname, node.params, node.ret_type, node.body)
+        from compiler.analyzer import FnSig as _FnSig
+        self.analysis.fn_sigs[lname] = _FnSig(
+            [(p.name, p.type_name) for p in node.params], ret_vx
+        )
+        self._fn_defaults[lname] = [None] * len(node.params)
+
+        # Compile in saved context
+        saved_builder  = self.builder
+        saved_fn       = self.current_fn
+        saved_scopes   = self._scope_stack
+        self._scope_stack = [{}]
+        self._declare_fn(decl)
+        self._compile_fn(decl)
+        self.builder      = saved_builder
+        self.current_fn   = saved_fn
+        self._scope_stack = saved_scopes
+
+        # Return pointer to the function cast to i8*
+        fn_ir = self._functions[lname]["fn"]
+        fn_ptr = self.builder.bitcast(fn_ir, I8PTR)
+        return fn_ptr, fn_type_str
+
+    # ------------------------------------------------------------------ #
+    #  Tuples                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _parse_tuple_type_str(self, vt: str) -> list[str]:
+        """Parse '(int,float)' → ['int', 'float']."""
+        if vt.startswith("(") and vt.endswith(")"):
+            inner = vt[1:-1]
+            parts, depth, cur = [], 0, []
+            for c in inner:
+                if c in ('(', '[', '<'): depth += 1
+                elif c in (')', ']', '>'): depth -= 1
+                if c == ',' and depth == 0:
+                    parts.append(''.join(cur).strip())
+                    cur = []
+                else:
+                    cur.append(c)
+            if cur:
+                parts.append(''.join(cur).strip())
+            return parts
+        return []
+
+    def _get_tuple_llvm_type(self, elem_types: list[str]) -> ir.IdentifiedStructType:
+        """Get or create the LLVM struct type for a tuple."""
+        key = "(" + ",".join(elem_types) + ")"
+        if key in self._tuple_types:
+            return self._tuple_types[key]
+        tname = "vx_tuple_" + "_".join(t.replace("[]","Arr").replace("?","Opt") for t in elem_types)
+        lt = self.module.context.get_identified_type(tname)
+        if lt.is_opaque:
+            lt.set_body(*[self._vx_to_llvm(t) for t in elem_types])
+        self._tuple_types[key] = lt
+        return lt
+
+    def _compile_tuple_literal(self, node: TupleLiteral) -> tuple[ir.Value, str]:
+        """Compile (a, b, c) → heap-allocated tuple struct pointer."""
+        vals_types = [self._compile_expr(e) for e in node.elements]
+        elem_types = [vt for _, vt in vals_types]
+        tup_lt     = self._get_tuple_llvm_type(elem_types)
+        sz = ir.Constant(I64_TY, sum(_elem_size(et) for et in elem_types))
+        # Heap-allocate the tuple
+        raw = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 0)])
+        # Use alloca instead for simplicity (stack allocation)
+        tup_al = self.builder.alloca(tup_lt)
+        for i, (val, vt) in enumerate(vals_types):
+            fp = self.builder.gep(tup_al,
+                                  [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, i)],
+                                  inbounds=True)
+            self.builder.store(val, fp)
+        # Heap-allocate and copy (so it can escape the function)
+        struct_sz_bytes = sum(_elem_size(et) for et in elem_types)
+        heap_raw = self.builder.call(self.malloc_fn,
+                                     [ir.Constant(I64_TY, struct_sz_bytes + 8)])
+        heap_typed = self.builder.bitcast(heap_raw, ir.PointerType(tup_lt))
+        self.builder.call(self.memcpy_fn, [heap_raw,
+                          self.builder.bitcast(tup_al, I8PTR),
+                          ir.Constant(I64_TY, struct_sz_bytes)])
+        vt_str = "(" + ",".join(elem_types) + ")"
+        return heap_raw, vt_str
+
+    # ------------------------------------------------------------------ #
+    #  Tuple type helpers                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _vx_to_llvm_tuple(self, vt: str) -> ir.Type:
+        """Convert tuple type string to LLVM pointer to struct."""
+        elem_types = self._parse_tuple_type_str(vt)
+        if not elem_types:
+            return I8PTR
+        lt = self._get_tuple_llvm_type(elem_types)
+        return ir.PointerType(lt)
 
     # ------------------------------------------------------------------ #
     #  Arrays                                                              #
@@ -2367,7 +2836,9 @@ class Compiler:
 
         esz  = ir.Constant(I64_TY, _elem_size(elem_vt))
         cnt  = ir.Constant(I64_TY, n)
-        tsz  = self.builder.mul(cnt, esz) if n > 0 else ir.Constant(I64_TY, 8)
+        # Allocate at least max(n, 4) elements so push() doesn't immediately overflow
+        alloc_count = max(n, 4)
+        tsz = ir.Constant(I64_TY, alloc_count * _elem_size(elem_vt))
 
         # Allocate data
         raw_data = self.builder.call(self.malloc_fn, [tsz])
@@ -2474,6 +2945,635 @@ class Compiler:
                                         [ir.Constant(I32_TY,0), ir.Constant(I32_TY,idx)],
                                         inbounds=True)
         raise CodegenError(f"Struct '{ot}' has no field '{node.field}'")
+
+    # ------------------------------------------------------------------ #
+    #  Dict value type conversions (type-erase to i64 and back)          #
+    # ------------------------------------------------------------------ #
+
+    def _val_to_i64(self, val: ir.Value, vt: str, expected_vt: str = None) -> ir.Value:
+        """Convert any Vexel value to i64 for dict storage."""
+        vt = self._resolve_type(vt)
+        if vt == "int":   return val
+        if vt == "float": return self.builder.bitcast(val, I64_TY)
+        if vt == "bool":  return self.builder.zext(val, I64_TY)
+        if vt == "str":   return self.builder.ptrtoint(val, I64_TY)
+        # Promote int to float if expected type is float
+        if expected_vt and self._resolve_type(expected_vt) == "float":
+            fval = self.builder.sitofp(val, F64_TY)
+            return self.builder.bitcast(fval, I64_TY)
+        return val
+
+    def _i64_to_val(self, raw: ir.Value, vt: str) -> tuple[ir.Value, str]:
+        """Convert i64 dict storage back to Vexel value."""
+        vt = self._resolve_type(vt)
+        if vt == "int":   return raw, "int"
+        if vt == "float": return self.builder.bitcast(raw, F64_TY), "float"
+        if vt == "bool":  return self.builder.trunc(raw, I1_TY), "bool"
+        if vt == "str":   return self.builder.inttoptr(raw, I8PTR), "str"
+        return raw, vt
+
+    # ------------------------------------------------------------------ #
+    #  Dict compilation                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _parse_dict_types(self, vx_type: str) -> tuple[str, str]:
+        """Given 'dict[K,V]', return (K, V)."""
+        inner = vx_type[5:-1]
+        depth = 0
+        for i, c in enumerate(inner):
+            if c == '[': depth += 1
+            elif c == ']': depth -= 1
+            elif c == ',' and depth == 0:
+                return inner[:i].strip(), inner[i+1:].strip()
+        return "str", "int"
+
+    def _compile_dict_literal(self, node: DictLiteral) -> tuple[ir.Value, str]:
+        if not node.pairs:
+            dict_t = "dict[str,int]"
+        else:
+            kt = self._infer_type(node.pairs[0][0])
+            vt = self._infer_type(node.pairs[0][1])
+            dict_t = f"dict[{kt},{vt}]"
+        kt, vt = self._parse_dict_types(dict_t)
+
+        fn_new = self._get_helper("__vx_dict_new")
+        fn_set = self._get_helper("__vx_dict_set")
+        raw    = self.builder.call(fn_new, [])
+        d      = self.builder.bitcast(raw, self.dict_ptr_type)
+
+        for key_node, val_node in node.pairs:
+            kv, _  = self._compile_expr(key_node)
+            vv, vvt = self._compile_expr(val_node)
+            raw64  = self._val_to_i64(vv, vvt, vt)
+            self.builder.call(fn_set, [raw, kv, raw64])
+
+        return d, dict_t
+
+    def _compile_dict_index_get(self, dict_v: ir.Value, key_v: ir.Value,
+                                 vt: str) -> tuple[ir.Value, str]:
+        fn_get  = self._get_helper("__vx_dict_get")
+        raw     = self.builder.bitcast(dict_v, I8PTR)
+        raw64   = self.builder.call(fn_get, [raw, key_v])
+        return self._i64_to_val(raw64, vt)
+
+    def _compile_dict_method(self, dict_v: ir.Value, dict_t: str,
+                              vt: str, method: str, args) -> tuple[ir.Value, str]:
+        raw = self.builder.bitcast(dict_v, I8PTR)
+
+        if method == "has":
+            kv, _ = self._compile_expr(args[0])
+            fn_h  = self._get_helper("__vx_dict_has")
+            return self.builder.call(fn_h, [raw, kv]), "bool"
+
+        if method == "remove":
+            kv, _ = self._compile_expr(args[0])
+            fn_h  = self._get_helper("__vx_dict_remove")
+            self.builder.call(fn_h, [raw, kv])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if method == "len":
+            fn_h = self._get_helper("__vx_dict_len")
+            return self.builder.call(fn_h, [raw]), "int"
+
+        if method == "keys":
+            fn_h = self._get_helper("__vx_dict_keys")
+            raw_arr = self.builder.call(fn_h, [raw])
+            arr_ptr = self.builder.bitcast(raw_arr, self.arr_ptr_type)
+            return arr_ptr, "str[]"
+
+        raise CodegenError(f"Unknown dict method '{method}'")
+
+    # ------------------------------------------------------------------ #
+    #  Dict LLVM IR helper builders                                       #
+    # ------------------------------------------------------------------ #
+
+    def _dict_fields(self, b: ir.IRBuilder, hdr: ir.Value):
+        """Return (kf, vf, lf, cf) — GEPs for the four dict header fields."""
+        c0 = ir.Constant(I32_TY, 0)
+        kf = b.gep(hdr, [c0, ir.Constant(I32_TY, 0)], inbounds=True)
+        vf = b.gep(hdr, [c0, ir.Constant(I32_TY, 1)], inbounds=True)
+        lf = b.gep(hdr, [c0, ir.Constant(I32_TY, 2)], inbounds=True)
+        cf = b.gep(hdr, [c0, ir.Constant(I32_TY, 3)], inbounds=True)
+        return kf, vf, lf, cf
+
+    def _build_dict_new(self) -> ir.Function:
+        """Create an empty dict. Returns i8* (vx_dict*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_dict_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        INIT_CAP = ir.Constant(I64_TY, 4)
+        SZ8      = ir.Constant(I64_TY, 8)
+
+        hdr_raw  = b.call(self.malloc_fn, [ir.Constant(I64_TY, 32)])  # 4 fields × 8
+        hdr      = b.bitcast(hdr_raw, self.dict_ptr_type)
+        keys_raw = b.call(self.malloc_fn, [b.mul(INIT_CAP, SZ8)])
+        vals_raw = b.call(self.malloc_fn, [b.mul(INIT_CAP, SZ8)])
+
+        kf, vf, lf, cf = self._dict_fields(b, hdr)
+        b.store(keys_raw, kf)
+        b.store(vals_raw, vf)
+        b.store(ir.Constant(I64_TY, 0), lf)
+        b.store(INIT_CAP, cf)
+
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_dict_set(self) -> ir.Function:
+        """Set or update a key. Args: (dict: i8*, key: i8*, val: i64)."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(VOID_TY, [I8PTR, I8PTR, I64_TY]),
+                         name="__vx_dict_set")
+        fn.linkage = "private"
+        dict_raw, key, val = fn.args
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        hdr = b.bitcast(dict_raw, self.dict_ptr_type)
+        kf, vf, lf, cf = self._dict_fields(b, hdr)
+
+        # Grow if len >= cap
+        grow_bb  = fn.append_basic_block("set.grow")
+        scan_bb  = fn.append_basic_block("set.scan")
+        b.cbranch(b.icmp_signed(">=", b.load(lf), b.load(cf)), grow_bb, scan_bb)
+
+        b.position_at_end(grow_bb)
+        new_cap = b.mul(b.load(cf), ir.Constant(I64_TY, 2))
+        sz8     = b.mul(new_cap, ir.Constant(I64_TY, 8))
+        b.store(b.call(self.realloc_fn, [b.load(kf), sz8]), kf)
+        b.store(b.call(self.realloc_fn, [b.load(vf), sz8]), vf)
+        b.store(new_cap, cf)
+        b.branch(scan_bb)
+
+        # Linear scan for existing key
+        b.position_at_end(scan_bb)
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+
+        chk  = fn.append_basic_block("set.chk")
+        bdy  = fn.append_basic_block("set.bdy")
+        upd  = fn.append_basic_block("set.upd")
+        app  = fn.append_basic_block("set.app")
+        b.branch(chk)
+
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.load(lf)), bdy, app)
+
+        b.position_at_end(bdy)
+        iv2      = b.load(i_al)
+        keys_ptr = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        ek       = b.load(b.gep(keys_ptr, [iv2], inbounds=False))
+        r        = b.call(self.strcmp_fn, [ek, key])
+        is_eq    = b.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+        b.store(b.add(iv2, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_eq, upd, chk)
+
+        b.position_at_end(upd)  # update existing
+        vals_ptr = b.bitcast(b.load(vf), ir.PointerType(I64_TY))
+        b.store(val, b.gep(vals_ptr, [iv2], inbounds=False))
+        b.ret_void()
+
+        b.position_at_end(app)  # append new
+        cur_len  = b.load(lf)
+        keys_ptr2 = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        vals_ptr2 = b.bitcast(b.load(vf), ir.PointerType(I64_TY))
+        b.store(key, b.gep(keys_ptr2, [cur_len], inbounds=False))
+        b.store(val, b.gep(vals_ptr2, [cur_len], inbounds=False))
+        b.store(b.add(cur_len, ir.Constant(I64_TY, 1)), lf)
+        b.ret_void()
+        return fn
+
+    def _build_dict_get(self) -> ir.Function:
+        """Get value by key. Returns 0 if not found. Args: (dict: i8*, key: i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_dict_get")
+        fn.linkage = "private"
+        dict_raw, key = fn.args
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        hdr = b.bitcast(dict_raw, self.dict_ptr_type)
+        kf, vf, lf, _ = self._dict_fields(b, hdr)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk  = fn.append_basic_block("get.chk")
+        bdy  = fn.append_basic_block("get.bdy")
+        ret_found = fn.append_basic_block("get.found")
+        ret_miss  = fn.append_basic_block("get.miss")
+        b.branch(chk)
+
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.load(lf)), bdy, ret_miss)
+
+        b.position_at_end(bdy)
+        iv2  = b.load(i_al)
+        kp   = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        ek   = b.load(b.gep(kp, [iv2], inbounds=False))
+        r    = b.call(self.strcmp_fn, [ek, key])
+        is_eq = b.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+        b.store(b.add(iv2, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_eq, ret_found, chk)
+
+        b.position_at_end(ret_found)
+        vp = b.bitcast(b.load(vf), ir.PointerType(I64_TY))
+        b.ret(b.load(b.gep(vp, [iv2], inbounds=False)))
+
+        b.position_at_end(ret_miss)
+        b.ret(ir.Constant(I64_TY, 0))
+        return fn
+
+    def _build_dict_has(self) -> ir.Function:
+        """Returns 1 if key exists. Args: (dict: i8*, key: i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I1_TY, [I8PTR, I8PTR]),
+                         name="__vx_dict_has")
+        fn.linkage = "private"
+        dict_raw, key = fn.args
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        hdr = b.bitcast(dict_raw, self.dict_ptr_type)
+        kf, _, lf, _ = self._dict_fields(b, hdr)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk  = fn.append_basic_block("has.chk")
+        bdy  = fn.append_basic_block("has.bdy")
+        ret_t = fn.append_basic_block("has.t")
+        ret_f = fn.append_basic_block("has.f")
+        b.branch(chk)
+
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.load(lf)), bdy, ret_f)
+
+        b.position_at_end(bdy)
+        iv2  = b.load(i_al)
+        kp   = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        ek   = b.load(b.gep(kp, [iv2], inbounds=False))
+        r    = b.call(self.strcmp_fn, [ek, key])
+        is_eq = b.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+        b.store(b.add(iv2, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_eq, ret_t, chk)
+
+        b.position_at_end(ret_t); b.ret(ir.Constant(I1_TY, 1))
+        b.position_at_end(ret_f); b.ret(ir.Constant(I1_TY, 0))
+        return fn
+
+    def _build_dict_remove(self) -> ir.Function:
+        """Remove a key (shift elements left). Args: (dict: i8*, key: i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR, I8PTR]),
+                         name="__vx_dict_remove")
+        fn.linkage = "private"
+        dict_raw, key = fn.args
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        hdr = b.bitcast(dict_raw, self.dict_ptr_type)
+        kf, vf, lf, _ = self._dict_fields(b, hdr)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk  = fn.append_basic_block("rm.chk")
+        bdy  = fn.append_basic_block("rm.bdy")
+        shift_init = fn.append_basic_block("rm.shift_init")
+        shift_chk  = fn.append_basic_block("rm.shift_chk")
+        shift_bdy  = fn.append_basic_block("rm.shift_bdy")
+        done = fn.append_basic_block("rm.done")
+        not_found = fn.append_basic_block("rm.notfound")
+        b.branch(chk)
+
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.load(lf)), bdy, not_found)
+
+        b.position_at_end(bdy)
+        iv2  = b.load(i_al)
+        kp   = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        ek   = b.load(b.gep(kp, [iv2], inbounds=False))
+        r    = b.call(self.strcmp_fn, [ek, key])
+        is_eq = b.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+        b.store(b.add(iv2, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_eq, shift_init, chk)
+
+        # Shift elements left starting at found position (iv2)
+        b.position_at_end(shift_init)
+        found_i = iv2   # SSA value from bdy block — valid here
+        j_al = b.alloca(I64_TY); b.store(found_i, j_al)
+        b.branch(shift_chk)
+
+        b.position_at_end(shift_chk)
+        jv = b.load(j_al)
+        new_len = b.sub(b.load(lf), ir.Constant(I64_TY, 1))
+        b.cbranch(b.icmp_signed("<", jv, new_len), shift_bdy, done)
+
+        b.position_at_end(shift_bdy)
+        jv2  = b.load(j_al)
+        jv2n = b.add(jv2, ir.Constant(I64_TY, 1))
+        kp2  = b.bitcast(b.load(kf), ir.PointerType(I8PTR))
+        vp2  = b.bitcast(b.load(vf), ir.PointerType(I64_TY))
+        b.store(b.load(b.gep(kp2, [jv2n], inbounds=False)),
+                b.gep(kp2, [jv2], inbounds=False))
+        b.store(b.load(b.gep(vp2, [jv2n], inbounds=False)),
+                b.gep(vp2, [jv2], inbounds=False))
+        b.store(b.add(jv2, ir.Constant(I64_TY, 1)), j_al)
+        b.branch(shift_chk)
+
+        b.position_at_end(done)
+        new_len2 = b.sub(b.load(lf), ir.Constant(I64_TY, 1))
+        b.store(new_len2, lf)
+        b.ret_void()
+
+        b.position_at_end(not_found)
+        b.ret_void()
+        return fn
+
+    def _build_dict_len(self) -> ir.Function:
+        """Return number of entries. Args: (dict: i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_dict_len")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        hdr = b.bitcast(fn.args[0], self.dict_ptr_type)
+        _, _, lf, _ = self._dict_fields(b, hdr)
+        b.ret(b.load(lf))
+        return fn
+
+    def _build_dict_keys(self) -> ir.Function:
+        """Return all keys as a str[] (vx_array*). Args: (dict: i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_dict_keys")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+
+        hdr = b.bitcast(fn.args[0], self.dict_ptr_type)
+        kf, _, lf, _ = self._dict_fields(b, hdr)
+        ln = b.load(lf)
+
+        # Create a vx_array with len=ln, cap=ln, data = copy of keys
+        hsz     = ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)
+        hdr_raw = b.call(self.malloc_fn, [hsz])
+        arr_hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+
+        data_sz  = b.mul(ln, ir.Constant(I64_TY, 8))
+        data_raw = b.call(self.malloc_fn, [b.add(data_sz, ir.Constant(I64_TY, 8))])
+        src_keys = b.load(kf)
+        b.call(self.memcpy_fn, [data_raw, src_keys, data_sz])
+
+        dp_f  = b.gep(arr_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,0)], inbounds=True)
+        ln_f  = b.gep(arr_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+        cap_f = b.gep(arr_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(data_raw, dp_f)
+        b.store(ln, ln_f)
+        b.store(ln, cap_f)
+
+        b.ret(hdr_raw)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v5 helper builders                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _build_time_format(self) -> ir.Function:
+        """Format a Unix timestamp as a human-readable string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_time_format")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        t_val = fn.args[0]
+
+        # Store t_val in a local so we can pass its address to localtime
+        t_al = b.alloca(I64_TY)
+        b.store(t_val, t_al)
+        t_ptr = b.bitcast(t_al, I8PTR)
+        tm_ptr = b.call(self.localtime_fn, [t_ptr])
+
+        # Format: strftime(buf, 64, "%Y-%m-%d %H:%M:%S", tm_ptr)
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        fmt_gv  = self._global_str("%Y-%m-%d %H:%M:%S")
+        fmt_ptr = self._gstr_ptr_const(fmt_gv)
+        b.call(self.strftime_fn, [buf, ir.Constant(I64_TY, 64), fmt_ptr, tm_ptr])
+        b.ret(buf)
+        return fn
+
+    def _build_input(self) -> ir.Function:
+        """Read a line from stdin (strips trailing newline)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_input")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        prompt = fn.args[0]
+
+        # Print the prompt
+        fmt = self._global_str("%s")
+        fmt_ptr = self._gstr_ptr_const(fmt)
+        b.call(self.printf, [fmt_ptr, prompt])
+
+        # Read up to 1024 chars from stdin
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 1024)])
+        # Get stdin — use global pointer (declare __acrt_iob_func on Windows or just stdin)
+        # Simpler: just read directly via fgets with FILE* 0 trick → use scanf
+        # Use scanf(" %1023[^\n]", buf) to read a full line
+        scanf_ft = ir.FunctionType(I32_TY, [I8PTR], var_arg=True)
+        scanf_fn = ir.Function(self.module, scanf_ft, name="scanf") \
+            if "scanf" not in [f.name for f in self.module.functions] \
+            else next(f for f in self.module.functions if f.name == "scanf")
+        fmt2 = self._global_str(" %1023[^\n]")
+        fmt2_ptr = self._gstr_ptr_const(fmt2)
+        b.call(scanf_fn, [fmt2_ptr, buf])
+        b.ret(buf)
+        return fn
+
+    def _build_os_list_dir(self) -> ir.Function:
+        """List directory entries. Returns vx_array* (as i8*) of str[]."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_os_list_dir")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        path = fn.args[0]
+
+        # Allocate result array header
+        hsz     = ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)
+        hdr_raw = b.call(self.malloc_fn, [hsz])
+        hdr     = b.bitcast(hdr_raw, self.arr_ptr_type)
+        init_cap = ir.Constant(I64_TY, 16)
+        data_sz  = b.mul(init_cap, ir.Constant(I64_TY, 8))
+        raw_data = b.call(self.malloc_fn, [data_sz])
+        dp_f  = b.gep(hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,0)], inbounds=True)
+        ln_f  = b.gep(hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+        cap_f = b.gep(hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(raw_data, dp_f)
+        b.store(ir.Constant(I64_TY, 0), ln_f)
+        b.store(init_cap, cap_f)
+
+        if _sys.platform == "win32":
+            # Build search pattern: path + "\\*"
+            # Use sprintf to build pattern
+            pat_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 512)])
+            fmt_gv = self._global_str("%s\\*")
+            fmt_ptr = self._gstr_ptr_const(fmt_gv)
+            b.call(self.sprintf_fn, [pat_buf, fmt_ptr, path])
+
+            # _finddata64_t is 592 bytes; use raw buffer
+            fd_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 592)])
+
+            # Declare _findfirst64 and _findnext64 and _findclose
+            ff64_ty  = ir.FunctionType(I64_TY, [I8PTR, I8PTR])
+            fn64_ty  = ir.FunctionType(I32_TY, [I64_TY, I8PTR])
+            fc64_ty  = ir.FunctionType(I32_TY, [I64_TY])
+            ff64 = ir.Function(self.module, ff64_ty, name="_findfirst64") \
+                if "_findfirst64" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="_findfirst64")
+            fn64 = ir.Function(self.module, fn64_ty, name="_findnext64") \
+                if "_findnext64" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="_findnext64")
+            fc64 = ir.Function(self.module, fc64_ty, name="_findclose") \
+                if "_findclose" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="_findclose")
+
+            handle = b.call(ff64, [pat_buf, fd_buf])
+            invalid = ir.Constant(I64_TY, -1)   # INVALID_HANDLE_VALUE as i64
+
+            ok_b    = fn.append_basic_block("listdir.ok")
+            done_b  = fn.append_basic_block("listdir.done")
+            loop_b  = fn.append_basic_block("listdir.loop")
+            next_b  = fn.append_basic_block("listdir.next")
+
+            is_inv = b.icmp_signed("==", handle, invalid)
+            b.cbranch(is_inv, done_b, ok_b)
+
+            b.position_at_end(ok_b)
+            b.branch(loop_b)
+
+            b.position_at_end(loop_b)
+            # The file name is at offset 32 in _finddata64_t (the cFileName field)
+            name_ptr = b.gep(fd_buf, [ir.Constant(I64_TY, 32)], inbounds=False)
+            # Skip "." and ".."
+            dot_gv    = self._global_str(".")
+            dotdot_gv = self._global_str("..")
+            dot_ptr    = self._gstr_ptr_const(dot_gv)
+            dotdot_ptr = self._gstr_ptr_const(dotdot_gv)
+            r1 = b.call(self.strcmp_fn, [name_ptr, dot_ptr])
+            r2 = b.call(self.strcmp_fn, [name_ptr, dotdot_ptr])
+            is_dot    = b.icmp_signed("==", r1, ir.Constant(I32_TY, 0))
+            is_dotdot = b.icmp_signed("==", r2, ir.Constant(I32_TY, 0))
+            skip = b.or_(is_dot, is_dotdot)
+            push_b2 = fn.append_basic_block("listdir.push")
+            b.cbranch(skip, next_b, push_b2)
+
+            b.position_at_end(push_b2)
+            # Copy name into malloc'd string
+            nlen = b.call(self.strlen_fn, [name_ptr])
+            nbuf = b.call(self.malloc_fn, [b.add(nlen, ir.Constant(I64_TY, 1))])
+            b.call(self.memcpy_fn, [nbuf, name_ptr, b.add(nlen, ir.Constant(I64_TY, 1))])
+            # Push to array
+            cur_ln  = b.load(ln_f)
+            cur_cap = b.load(cap_f)
+            ng = b.icmp_signed(">=", cur_ln, cur_cap)
+            grow_b3 = fn.append_basic_block("listdir.grow")
+            store_b = fn.append_basic_block("listdir.store")
+            b.cbranch(ng, grow_b3, store_b)
+
+            b.position_at_end(grow_b3)
+            new_cap = b.mul(cur_cap, ir.Constant(I64_TY, 2))
+            new_sz  = b.mul(new_cap, ir.Constant(I64_TY, 8))
+            old_d   = b.load(dp_f)
+            new_d   = b.call(self.realloc_fn, [old_d, new_sz])
+            b.store(new_d, dp_f)
+            b.store(new_cap, cap_f)
+            b.branch(store_b)
+
+            b.position_at_end(store_b)
+            cur_ln2 = b.load(ln_f)
+            dp2     = b.load(dp_f)
+            pp2     = b.bitcast(dp2, ir.PointerType(I8PTR))
+            ep2     = b.gep(pp2, [cur_ln2], inbounds=False)
+            b.store(nbuf, ep2)
+            b.store(b.add(cur_ln2, ir.Constant(I64_TY, 1)), ln_f)
+            b.branch(next_b)
+
+            b.position_at_end(next_b)
+            r_next = b.call(fn64, [handle, fd_buf])
+            cont = b.icmp_signed("==", r_next, ir.Constant(I32_TY, 0))
+            b.cbranch(cont, loop_b, done_b)
+
+            b.position_at_end(done_b)
+            b.call(fc64, [handle])
+            b.ret(hdr_raw)
+        else:
+            # POSIX: opendir/readdir/closedir
+            od_ty  = ir.FunctionType(I8PTR, [I8PTR])
+            rd_ty  = ir.FunctionType(I8PTR, [I8PTR])
+            cd_ty  = ir.FunctionType(I32_TY, [I8PTR])
+            od_fn = ir.Function(self.module, od_ty, name="opendir") \
+                if "opendir" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="opendir")
+            rd_fn = ir.Function(self.module, rd_ty, name="readdir") \
+                if "readdir" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="readdir")
+            cd_fn = ir.Function(self.module, cd_ty, name="closedir") \
+                if "closedir" not in [f.name for f in self.module.functions] \
+                else next(f for f in self.module.functions if f.name=="closedir")
+
+            dirp = b.call(od_fn, [path])
+            null_int = b.ptrtoint(dirp, I64_TY)
+            is_null = b.icmp_unsigned("==", null_int, ir.Constant(I64_TY, 0))
+            done_b2 = fn.append_basic_block("listdir.done")
+            loop_b2 = fn.append_basic_block("listdir.loop")
+            b.cbranch(is_null, done_b2, loop_b2)
+
+            b.position_at_end(loop_b2)
+            ent = b.call(rd_fn, [dirp])
+            ent_int = b.ptrtoint(ent, I64_TY)
+            is_end  = b.icmp_unsigned("==", ent_int, ir.Constant(I64_TY, 0))
+            push_b3 = fn.append_basic_block("listdir.push2")
+            b.cbranch(is_end, done_b2, push_b3)
+
+            b.position_at_end(push_b3)
+            # d_name is at offset 19 in struct dirent on Linux (varies by platform)
+            # Use a conservative offset of 19 for Linux; this is best-effort
+            name_ptr2 = b.gep(ent, [ir.Constant(I64_TY, 19)], inbounds=False)
+            dot_gv2    = self._global_str(".")
+            dotdot_gv2 = self._global_str("..")
+            dot_p2    = self._gstr_ptr_const(dot_gv2)
+            dotdot_p2 = self._gstr_ptr_const(dotdot_gv2)
+            r1b = b.call(self.strcmp_fn, [name_ptr2, dot_p2])
+            r2b = b.call(self.strcmp_fn, [name_ptr2, dotdot_p2])
+            is_dot2    = b.icmp_signed("==", r1b, ir.Constant(I32_TY, 0))
+            is_dotdot2 = b.icmp_signed("==", r2b, ir.Constant(I32_TY, 0))
+            skip2 = b.or_(is_dot2, is_dotdot2)
+            b.cbranch(skip2, loop_b2, fn.append_basic_block("listdir.add"))
+            add_b = list(fn.blocks)[-1]
+
+            b.position_at_end(add_b)
+            nlen2 = b.call(self.strlen_fn, [name_ptr2])
+            nbuf2 = b.call(self.malloc_fn, [b.add(nlen2, ir.Constant(I64_TY, 1))])
+            b.call(self.memcpy_fn, [nbuf2, name_ptr2, b.add(nlen2, ir.Constant(I64_TY, 1))])
+            cur_ln3  = b.load(ln_f)
+            cur_cap3 = b.load(cap_f)
+            ng3 = b.icmp_signed(">=", cur_ln3, cur_cap3)
+            grow_b4  = fn.append_basic_block("listdir.grow2")
+            store_b2 = fn.append_basic_block("listdir.store2")
+            b.cbranch(ng3, grow_b4, store_b2)
+
+            b.position_at_end(grow_b4)
+            nc4 = b.mul(cur_cap3, ir.Constant(I64_TY, 2))
+            ns4 = b.mul(nc4, ir.Constant(I64_TY, 8))
+            od4 = b.load(dp_f)
+            nd4 = b.call(self.realloc_fn, [od4, ns4])
+            b.store(nd4, dp_f)
+            b.store(nc4, cap_f)
+            b.branch(store_b2)
+
+            b.position_at_end(store_b2)
+            cl4 = b.load(ln_f)
+            dp4 = b.load(dp_f)
+            pp4 = b.bitcast(dp4, ir.PointerType(I8PTR))
+            ep4 = b.gep(pp4, [cl4], inbounds=False)
+            b.store(nbuf2, ep4)
+            b.store(b.add(cl4, ir.Constant(I64_TY, 1)), ln_f)
+            b.branch(loop_b2)
+
+            b.position_at_end(done_b2)
+            b.call(cd_fn, [dirp])
+            b.ret(hdr_raw)
+        return fn
 
 
 # ================================================================== #
