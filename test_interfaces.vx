@@ -1,0 +1,53 @@
+interface Shape:
+    fn area(self) -> float
+    fn name(self) -> str
+
+interface Printable:
+    fn to_str(self) -> str
+
+struct Circle:
+    radius: float
+
+struct Rect:
+    width: float
+    height: float
+
+impl Shape for Circle:
+    fn area(self) -> float:
+        return 3.14159 * self.radius * self.radius
+    fn name(self) -> str:
+        return "Circle"
+
+impl Shape for Rect:
+    fn area(self) -> float:
+        return self.width * self.height
+    fn name(self) -> str:
+        return "Rect"
+
+impl Printable for Circle:
+    fn to_str(self) -> str:
+        return "Circle(r=" + str(self.radius) + ")"
+
+fn describe(s: Shape):
+    print(s.name() + " area=" + str(s.area()))
+
+fn show(p: Printable):
+    print(p.to_str())
+
+fn classify(s: Shape) -> str:
+    match s:
+        case Circle(r):
+            return "circle with radius " + str(r)
+        case Rect(w, h):
+            return "rect " + str(w) + "x" + str(h)
+    return "unknown"
+
+fn main():
+    let c: Shape = new Circle(5.0)
+    let r: Shape = new Rect(4.0, 3.0)
+    describe(c)
+    describe(r)
+    print(classify(c))
+    print(classify(r))
+    let p: Printable = new Circle(7.0)
+    show(p)

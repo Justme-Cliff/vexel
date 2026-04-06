@@ -1,6 +1,6 @@
 """
-Vexel Parser  (v5)
-------------------
+Vexel Parser  (v5 / v6)
+------------------------
 Recursive descent parser.
 
 New in v2:
@@ -32,6 +32,11 @@ New in v5:
   - fn(x: int): ...        (lambda expressions)
   - (a, b) = expr          (tuple destructuring in let)
   - 0 < x < 10             (chained comparisons)
+
+New in v6:
+  - interface / impl blocks
+  - TypePattern in match: case Circle(r):  (type dispatch + field binding)
+  - Line numbers propagated to AST nodes via node.line
 """
 
 from compiler.lexer import Token, TT
@@ -110,6 +115,10 @@ class Parser:
             return self._parse_enum()
         if self._match(TT.TYPE):
             return self._parse_type_alias()
+        if self._match(TT.INTERFACE):
+            return self._parse_interface()
+        if self._match(TT.IMPL):
+            return self._parse_impl()
         return self._parse_stmt()
 
     # ------------------------------------------------------------------ #
@@ -117,6 +126,7 @@ class Parser:
     # ------------------------------------------------------------------ #
 
     def _parse_fn(self) -> FnDecl:
+        start_line = self._cur().line
         self._expect(TT.FN)
         name = self._expect(TT.IDENT).value
 
@@ -156,7 +166,9 @@ class Parser:
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         body = self._parse_block()
-        return FnDecl(name, params, ret, body, type_params)
+        node = FnDecl(name, params, ret, body, type_params)
+        node.line = start_line
+        return node
 
     def _parse_type_alias(self) -> TypeAlias:
         self._expect(TT.TYPE)
@@ -165,6 +177,104 @@ class Parser:
         target = self._parse_type()
         self._eat_newline()
         return TypeAlias(name, target)
+
+    def _parse_interface(self) -> InterfaceDecl:
+        """interface Name:\n    fn method(self, x: int) -> str\n    ..."""
+        start_line = self._cur().line
+        self._expect(TT.INTERFACE)
+        name = self._expect(TT.IDENT).value
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        self._expect(TT.INDENT)
+        methods = []
+        while not self._match(TT.DEDENT) and not self._match(TT.EOF):
+            self._skip_newlines()
+            if self._match(TT.DEDENT):
+                break
+            self._expect(TT.FN)
+            mname = self._expect(TT.IDENT).value
+            self._expect(TT.LPAREN)
+            # Consume optional bare 'self' param
+            if self._match(TT.IDENT) and self._cur().value == "self":
+                self._advance()
+                if self._match(TT.COMMA):
+                    self._advance()
+            params = []
+            while not self._match(TT.RPAREN):
+                pname = self._expect(TT.IDENT).value
+                self._expect(TT.COLON)
+                ptype = self._parse_type()
+                params.append(Param(pname, ptype))
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RPAREN)
+            ret = None
+            if self._match(TT.ARROW):
+                self._advance()
+                ret = self._parse_type()
+            self._eat_newline()
+            methods.append(MethodSig(mname, params, ret))
+        self._expect(TT.DEDENT)
+        node = InterfaceDecl(name, methods)
+        node.line = start_line
+        return node
+
+    def _parse_impl(self) -> ImplDecl:
+        """impl InterfaceName for StructName:\n    fn method(self, ...) -> T:\n        body"""
+        start_line = self._cur().line
+        self._expect(TT.IMPL)
+        iface_name  = self._expect(TT.IDENT).value
+        self._expect(TT.FOR)   # reuses existing TT.FOR keyword
+        struct_name = self._expect(TT.IDENT).value
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        self._expect(TT.INDENT)
+        methods = []
+        while not self._match(TT.DEDENT) and not self._match(TT.EOF):
+            self._skip_newlines()
+            if self._match(TT.DEDENT):
+                break
+            methods.append(self._parse_impl_fn(struct_name))
+        self._expect(TT.DEDENT)
+        node = ImplDecl(iface_name, struct_name, methods)
+        node.line = start_line
+        return node
+
+    def _parse_impl_fn(self, struct_name: str) -> FnDecl:
+        """Parse one method inside an impl block. 'self' gets type=struct_name."""
+        start_line = self._cur().line
+        self._expect(TT.FN)
+        name = self._expect(TT.IDENT).value
+        self._expect(TT.LPAREN)
+        params = []
+        # Consume bare 'self' as first param with type = struct_name
+        if self._match(TT.IDENT) and self._cur().value == "self":
+            self._advance()
+            params.append(Param("self", struct_name))
+            if self._match(TT.COMMA):
+                self._advance()
+        while not self._match(TT.RPAREN):
+            pname = self._expect(TT.IDENT).value
+            self._expect(TT.COLON)
+            ptype = self._parse_type()
+            default = None
+            if self._match(TT.ASSIGN):
+                self._advance()
+                default = self._parse_expr()
+            params.append(Param(pname, ptype, default))
+            if self._match(TT.COMMA):
+                self._advance()
+        self._expect(TT.RPAREN)
+        ret = None
+        if self._match(TT.ARROW):
+            self._advance()
+            ret = self._parse_type()
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        body = self._parse_block()
+        node = FnDecl(name, params, ret, body)
+        node.line = start_line
+        return node
 
     def _parse_type(self) -> str:
         """Parse a type annotation.
@@ -392,6 +502,7 @@ class Parser:
         return ExprStmt(expr)
 
     def _parse_let(self) -> Node:
+        start_line = self._cur().line
         self._expect(TT.LET)
 
         # Tuple unpack: let (a, b): (int, float) = expr
@@ -416,7 +527,9 @@ class Parser:
             self._expect(TT.ASSIGN)
             value = self._parse_expr()
             self._eat_newline()
-            return TupleUnpack(names, annotations, value)
+            node = TupleUnpack(names, annotations, value)
+            node.line = start_line
+            return node
 
         name = self._expect(TT.IDENT).value
         ann  = None
@@ -426,7 +539,9 @@ class Parser:
         self._expect(TT.ASSIGN)
         value = self._parse_expr()
         self._eat_newline()
-        return LetStmt(name, ann, value)
+        node = LetStmt(name, ann, value)
+        node.line = start_line
+        return node
 
     def _split_type_list(self, s: str) -> list[str]:
         """Split 'int,float,str' respecting nested parens/brackets."""
@@ -562,10 +677,10 @@ class Parser:
                 break
             if self._match(TT.CASE):
                 self._advance()
-                patterns = [self._parse_expr()]
+                patterns = [self._parse_case_pattern()]
                 while self._match(TT.COMMA):
                     self._advance()
-                    patterns.append(self._parse_expr())
+                    patterns.append(self._parse_case_pattern())
                 self._expect(TT.COLON)
                 self._expect(TT.NEWLINE)
                 body = self._parse_block()
@@ -579,6 +694,33 @@ class Parser:
                 break
         self._expect(TT.DEDENT)
         return MatchStmt(value, cases, default_body)
+
+    def _parse_case_pattern(self) -> Node:
+        """Parse a single match case pattern.
+        If it looks like  NAME(ident, ident, ...)  where all args are bare
+        identifiers, produce a TypePattern; otherwise fall back to a regular
+        expression.
+        """
+        if self._match(TT.IDENT) and self._peek(1).type == TT.LPAREN:
+            saved = self.pos
+            type_name = self._advance().value
+            self._advance()   # LPAREN
+            bindings = []
+            ok = True
+            while not self._match(TT.RPAREN):
+                if self._match(TT.IDENT):
+                    bindings.append(self._advance().value)
+                else:
+                    ok = False
+                    break
+                if self._match(TT.COMMA):
+                    self._advance()
+            if ok and self._match(TT.RPAREN):
+                self._advance()   # consume RPAREN
+                return TypePattern(type_name, bindings)
+            # Backtrack
+            self.pos = saved
+        return self._parse_expr()
 
     def _parse_assert(self) -> AssertStmt:
         self._expect(TT.ASSERT)
@@ -670,6 +812,7 @@ class Parser:
         expr = self._parse_primary()
         while True:
             if self._match(TT.DOT):
+                call_line = self._cur().line
                 self._advance()
                 field = self._expect(TT.IDENT).value
                 if self._match(TT.LPAREN):
@@ -681,10 +824,13 @@ class Parser:
                         if self._match(TT.COMMA):
                             self._advance()
                     self._expect(TT.RPAREN)
-                    expr = MethodCall(expr, field, args)
+                    mc = MethodCall(expr, field, args)
+                    mc.line = call_line
+                    expr = mc
                 else:
                     expr = FieldAccess(expr, field)
             elif self._match(TT.LPAREN) and isinstance(expr, Identifier):
+                call_line = getattr(expr, 'line', 0) or self._cur().line
                 self._advance()
                 args = []
                 while not self._match(TT.RPAREN):
@@ -692,7 +838,9 @@ class Parser:
                     if self._match(TT.COMMA):
                         self._advance()
                 self._expect(TT.RPAREN)
-                expr = Call(expr.name, args)
+                c = Call(expr.name, args)
+                c.line = call_line
+                expr = c
             elif self._match(TT.LBRACKET):
                 self._advance()
                 idx  = self._parse_expr()
@@ -718,7 +866,8 @@ class Parser:
         if t.type == TT.NULL:
             self._advance(); return NullLiteral()
         if t.type == TT.IDENT:
-            self._advance(); return Identifier(t.value)
+            self._advance()
+            n = Identifier(t.value); n.line = t.line; return n
         if t.type == TT.NEW:
             self._advance()
             type_name = self._expect(TT.IDENT).value

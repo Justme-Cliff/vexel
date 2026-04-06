@@ -108,6 +108,16 @@ class Compiler:
         # Namespace registry (alias → True)
         self._namespaces: set[str] = set()
 
+        # Interface vtable registry
+        # name → {methods:[str,...], method_sigs:{name:MethodSig}, vtable_ll, fat_ll}
+        self._interfaces: dict[str, dict] = {}
+
+        # Impl vtable data: "{struct}__{iface}" → {vtable_gv, impl_fns:[fn,...]}
+        self._impls_data: dict[str, dict] = {}
+
+        # Schedule of vtable slots to fill: [(vtable_gv, vtable_ll, [fn,...])]
+        self._vtable_init_list: list = []
+
         self._define_array_type()
         self._define_dict_type()
         self._declare_externs()
@@ -272,6 +282,9 @@ class Compiler:
             return I8PTR
         if vx in self._structs:
             return ir.PointerType(self._structs[vx]["llvm_type"])
+        # Interface types are fat pointers stored as i8*
+        if vx in self._interfaces:
+            return I8PTR
         raise CodegenError(f"Unknown type: {vx!r}")
 
     def _infer_type(self, node: Node) -> str:
@@ -379,7 +392,12 @@ class Compiler:
         for d in program.declarations:
             if isinstance(d, StructDecl): self._define_struct(d)
 
-        # 2. Enum definitions (global i64 constants)
+        # 2. Interface definitions (must be before forward-declaring fns that use them)
+        for d in program.declarations:
+            if isinstance(d, InterfaceDecl):
+                self._define_interface(d)
+
+        # 3. Enum definitions (global i64 constants)
         for d in program.declarations:
             if isinstance(d, EnumDecl):
                 for i, variant in enumerate(d.variants):
@@ -390,20 +408,33 @@ class Compiler:
                     gv.initializer = ir.Constant(I64_TY, i)
                     self._globals[gname] = {"ptr": gv, "vx_type": "int"}
 
-        # 3. Global variables
+        # 4. Global variables
         for d in program.declarations:
             if isinstance(d, (GlobalLet, GlobalConst)):
                 self._compile_global(d)
 
-        # 4. Forward-declare all non-generic functions
+        # 5. Forward-declare all non-generic user functions
         for d in program.declarations:
             if isinstance(d, FnDecl) and not d.type_params:
                 self._declare_fn(d)
 
-        # 5. Compile non-generic function bodies
+        # 6. Forward-declare impl methods + create vtable globals
+        for d in program.declarations:
+            if isinstance(d, ImplDecl):
+                self._declare_impl(d)
+
+        # 7. Build the vtable init function (needs impl fns already declared)
+        self._build_vtable_init_fn()
+
+        # 8. Compile non-generic function bodies
         for d in program.declarations:
             if isinstance(d, FnDecl) and not d.type_params:
                 self._compile_fn(d)
+
+        # 9. Compile impl method bodies
+        for d in program.declarations:
+            if isinstance(d, ImplDecl):
+                self._compile_impl(d)
 
         return str(self.module)
 
@@ -472,6 +503,10 @@ class Compiler:
         self.builder = ir.IRBuilder(entry)
         self._push_scope()
 
+        # Inject vtable initializer at the start of main
+        if d.name == "main" and "__vx_vtable_init" in self._helper_fns:
+            self.builder.call(self._helper_fns["__vx_vtable_init"], [])
+
         for arg, param in zip(fn.args, d.params):
             resolved = self._resolve_type(param.type_name)
             al = self.builder.alloca(self._vx_to_llvm(resolved), name=param.name)
@@ -489,6 +524,304 @@ class Compiler:
                 self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
 
         self._pop_scope()
+
+    # ------------------------------------------------------------------ #
+    #  Interfaces                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _define_interface(self, decl: 'InterfaceDecl'):
+        """Register an interface: create vtable + fat-pointer LLVM struct types."""
+        vtable_ty = self.module.context.get_identified_type(f"{decl.name}__vtable_ty")
+        if vtable_ty.is_opaque:
+            # Each slot is an i8* (opaque function pointer)
+            vtable_ty.set_body(*([I8PTR] * max(len(decl.methods), 1)))
+
+        fat_ty = self.module.context.get_identified_type(f"{decl.name}__fat_ty")
+        if fat_ty.is_opaque:
+            fat_ty.set_body(I8PTR, I8PTR)   # {data_ptr, vtable_ptr}
+
+        self._interfaces[decl.name] = {
+            "methods":      [m.name for m in decl.methods],
+            "method_sigs":  {m.name: m for m in decl.methods},
+            "vtable_ll":    vtable_ty,
+            "fat_ll":       fat_ty,
+        }
+
+    def _declare_impl(self, decl: 'ImplDecl'):
+        """Forward-declare impl method functions and create zero-initialised vtable global."""
+        iface_info = self._interfaces.get(decl.interface_name)
+        if iface_info is None:
+            raise CodegenError(f"Unknown interface '{decl.interface_name}'")
+
+        vtable_ll = iface_info["vtable_ll"]
+        impl_fns  = []
+
+        for method_name in iface_info["methods"]:
+            impl_method = next((m for m in decl.methods if m.name == method_name), None)
+            if impl_method is None:
+                raise CodegenError(
+                    f"impl {decl.interface_name} for {decl.struct_name}: "
+                    f"missing method '{method_name}'"
+                )
+
+            # First param is 'self' (type=struct_name) — compiled as i8* in LLVM
+            non_self = [p for p in impl_method.params if p.name != "self"]
+            param_tys = [I8PTR] + [self._vx_to_llvm(p.type_name) for p in non_self]
+            ret_ty    = self._vx_to_llvm(impl_method.return_type or "void")
+
+            fn_name = f"{decl.struct_name}__{method_name}__impl_{decl.interface_name}"
+            fn_ty   = ir.FunctionType(ret_ty, param_tys)
+            fn      = ir.Function(self.module, fn_ty, name=fn_name)
+            fn.linkage = "private"
+            fn.args[0].name = "self_raw"
+            for i, p in enumerate(non_self):
+                fn.args[i + 1].name = p.name
+
+            from compiler.analyzer import FnSig as _FnSig
+            self._functions[fn_name] = {
+                "fn":  fn,
+                "sig": _FnSig(
+                    [("self", decl.struct_name)] + [(p.name, p.type_name) for p in non_self],
+                    impl_method.return_type or "void"
+                ),
+            }
+            self._fn_defaults[fn_name] = [None] * (1 + len(non_self))
+            impl_fns.append(fn)
+
+        # Create zero-initialised vtable global
+        vtable_gv = ir.GlobalVariable(
+            self.module, vtable_ll,
+            name=f"{decl.struct_name}__vtable__{decl.interface_name}"
+        )
+        vtable_gv.linkage = "private"
+        vtable_gv.initializer = ir.Constant(vtable_ll, [ir.Constant(I8PTR, None)] * len(impl_fns))
+
+        impl_key = f"{decl.struct_name}__{decl.interface_name}"
+        self._impls_data[impl_key] = {
+            "vtable_gv": vtable_gv,
+            "impl_fns":  impl_fns,
+        }
+        self._vtable_init_list.append((vtable_gv, vtable_ll, impl_fns))
+
+    def _build_vtable_init_fn(self):
+        """Create __vx_vtable_init that fills vtable globals with impl function pointers."""
+        if not self._vtable_init_list:
+            return
+
+        fn_ty = ir.FunctionType(VOID_TY, [])
+        fn = ir.Function(self.module, fn_ty, name="__vx_vtable_init")
+        fn.linkage = "private"
+        self._helper_fns["__vx_vtable_init"] = fn
+
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        z = ir.Constant(I32_TY, 0)
+
+        for vtable_gv, vtable_ll, impl_fns in self._vtable_init_list:
+            for i, impl_fn in enumerate(impl_fns):
+                fn_as_i8ptr = b.bitcast(impl_fn, I8PTR)
+                slot = b.gep(vtable_gv, [z, ir.Constant(I32_TY, i)], inbounds=True)
+                b.store(fn_as_i8ptr, slot)
+
+        b.ret_void()
+
+    def _compile_impl(self, decl: 'ImplDecl'):
+        """Compile the body of each impl method."""
+        iface_info  = self._interfaces[decl.interface_name]
+        struct_info = self._structs.get(decl.struct_name)
+        if struct_info is None:
+            raise CodegenError(f"Unknown struct '{decl.struct_name}'")
+        struct_ll_ty = struct_info["llvm_type"]
+
+        for method_name in iface_info["methods"]:
+            impl_method = next((m for m in decl.methods if m.name == method_name), None)
+            if impl_method is None:
+                continue
+
+            fn_name = f"{decl.struct_name}__{method_name}__impl_{decl.interface_name}"
+            fn = self._functions[fn_name]["fn"]
+            self.current_fn = fn
+
+            entry = fn.append_basic_block("entry")
+            self.builder = ir.IRBuilder(entry)
+            self._push_scope()
+
+            # Bind 'self': bitcast i8* → StructType* and put in an alloca
+            self_raw    = fn.args[0]
+            self_typed  = self.builder.bitcast(self_raw, ir.PointerType(struct_ll_ty))
+            self_al     = self.builder.alloca(ir.PointerType(struct_ll_ty), name="self")
+            self.builder.store(self_typed, self_al)
+            self._declare("self", self_al, decl.struct_name)
+
+            # Bind remaining params
+            non_self = [p for p in impl_method.params if p.name != "self"]
+            for i, param in enumerate(non_self):
+                arg = fn.args[i + 1]
+                al  = self.builder.alloca(self._vx_to_llvm(param.type_name), name=param.name)
+                self.builder.store(arg, al)
+                self._declare(param.name, al, param.type_name)
+
+            for stmt in impl_method.body:
+                if self.builder.block.is_terminated:
+                    break
+                self._compile_stmt(stmt)
+
+            if not self.builder.block.is_terminated:
+                if fn.ftype.return_type == VOID_TY:
+                    self.builder.ret_void()
+                else:
+                    self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
+
+            self._pop_scope()
+
+    def _box_as_interface(self, val: ir.Value, struct_type: str, iface_name: str) -> ir.Value:
+        """Pack a struct pointer + vtable into a heap-allocated fat pointer and return i8*."""
+        if struct_type == iface_name:
+            return val   # already an interface fat pointer
+
+        impl_key = f"{struct_type}__{iface_name}"
+        if impl_key not in self._impls_data:
+            raise CodegenError(
+                f"'{struct_type}' does not implement interface '{iface_name}'"
+            )
+
+        iface_info = self._interfaces[iface_name]
+        fat_ll     = iface_info["fat_ll"]
+        vtable_gv  = self._impls_data[impl_key]["vtable_gv"]
+
+        # fat = malloc(16)  → {i8* data, i8* vtable}
+        fat     = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
+        fat_ptr = self.builder.bitcast(fat, ir.PointerType(fat_ll))
+        z       = ir.Constant(I32_TY, 0)
+
+        # Store data ptr
+        data_i8 = self.builder.bitcast(val, I8PTR)
+        data_sl = self.builder.gep(fat_ptr, [z, z], inbounds=True)
+        self.builder.store(data_i8, data_sl)
+
+        # Store vtable ptr (bitcast from vtable type* to i8*)
+        vtable_i8 = self.builder.bitcast(vtable_gv, I8PTR)
+        vtl_sl    = self.builder.gep(fat_ptr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        self.builder.store(vtable_i8, vtl_sl)
+
+        return fat   # i8* pointing to the fat pointer
+
+    def _compile_interface_method_call(
+            self, fat_i8: ir.Value, iface_name: str,
+            method_name: str, arg_nodes) -> tuple[ir.Value, str]:
+        """Dispatch a method call through a vtable."""
+        iface_info = self._interfaces[iface_name]
+        methods    = iface_info["methods"]
+        if method_name not in methods:
+            raise CodegenError(f"Interface '{iface_name}' has no method '{method_name}'")
+
+        method_idx = methods.index(method_name)
+        method_sig = iface_info["method_sigs"][method_name]
+        fat_ll     = iface_info["fat_ll"]
+        vtable_ll  = iface_info["vtable_ll"]
+
+        fat_ptr = self.builder.bitcast(fat_i8, ir.PointerType(fat_ll))
+        z = ir.Constant(I32_TY, 0)
+
+        # data_ptr = fat[0]
+        data_sl  = self.builder.gep(fat_ptr, [z, z], inbounds=True)
+        data_ptr = self.builder.load(data_sl)
+
+        # vtable_ptr = fat[1]  (stored as i8*, cast to vtable type*)
+        vtl_sl       = self.builder.gep(fat_ptr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        vtable_i8    = self.builder.load(vtl_sl)
+        vtable_ptr   = self.builder.bitcast(vtable_i8, ir.PointerType(vtable_ll))
+
+        # fn_ptr_i8 = vtable[method_idx]
+        fn_sl        = self.builder.gep(vtable_ptr,
+                                         [z, ir.Constant(I32_TY, method_idx)],
+                                         inbounds=True)
+        fn_ptr_i8    = self.builder.load(fn_sl)
+
+        # Build typed function type: (i8*, arg_types...) → ret_type
+        param_tys = [I8PTR]
+        for p in method_sig.params:     # params do NOT include self in MethodSig
+            param_tys.append(self._vx_to_llvm(p.type_name))
+        ret_ty = self._vx_to_llvm(method_sig.return_type or "void")
+        typed_fn_ty = ir.FunctionType(ret_ty, param_tys)
+        fn_ptr = self.builder.bitcast(fn_ptr_i8, ir.PointerType(typed_fn_ty))
+
+        compiled_args = [data_ptr]
+        for i, arg_node in enumerate(arg_nodes):
+            av, at = self._compile_expr(arg_node)
+            if i < len(method_sig.params):
+                pt = method_sig.params[i].type_name
+                if pt == "float" and at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+            compiled_args.append(av)
+
+        result = self.builder.call(fn_ptr, compiled_args)
+        return result, method_sig.return_type or "void"
+
+    def _compile_type_pattern_case(
+            self, fn, val_al: ir.Value, iface_name: str,
+            pat: 'TypePattern', body, next_b, merge_b):
+        """Emit code for a single 'case StructName(bind1, bind2):' arm."""
+        iface_info = self._interfaces[iface_name]
+        fat_ll     = iface_info["fat_ll"]
+        z          = ir.Constant(I32_TY, 0)
+
+        # Load the fat pointer
+        loaded   = self.builder.load(val_al)
+        fat_ptr  = self.builder.bitcast(loaded, ir.PointerType(fat_ll))
+
+        # Load vtable pointer stored at slot 1
+        vtl_sl       = self.builder.gep(fat_ptr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        actual_vtl   = self.builder.load(vtl_sl)
+
+        # Get expected vtable address for this struct type
+        impl_key = f"{pat.type_name}__{iface_name}"
+        if impl_key not in self._impls_data:
+            raise CodegenError(
+                f"match: '{pat.type_name}' does not implement '{iface_name}'"
+            )
+        expected_vtl_gv = self._impls_data[impl_key]["vtable_gv"]
+        expected_vtl    = self.builder.bitcast(expected_vtl_gv, I8PTR)
+
+        # Compare vtable pointers
+        ai = self.builder.ptrtoint(actual_vtl,   I64_TY)
+        ei = self.builder.ptrtoint(expected_vtl, I64_TY)
+        matches = self.builder.icmp_unsigned("==", ai, ei)
+
+        body_b = fn.append_basic_block(f"match.type.{pat.type_name}.body")
+        self.builder.cbranch(matches, body_b, next_b)
+
+        self.builder.position_at_end(body_b)
+        self._push_scope()
+
+        # Extract data pointer and bind fields
+        if pat.bindings:
+            struct_info = self._structs.get(pat.type_name)
+            if struct_info:
+                data_sl  = self.builder.gep(fat_ptr, [z, z], inbounds=True)
+                data_ptr = self.builder.load(data_sl)
+                sptr     = self.builder.bitcast(
+                    data_ptr, ir.PointerType(struct_info["llvm_type"])
+                )
+                for i, bind_name in enumerate(pat.bindings):
+                    if i < len(struct_info["fields"]):
+                        _, ftype = struct_info["fields"][i]
+                        fl_ty    = self._vx_to_llvm(ftype)
+                        fp = self.builder.gep(sptr,
+                                              [z, ir.Constant(I32_TY, i)],
+                                              inbounds=True)
+                        fval = self.builder.load(fp)
+                        al   = self.builder.alloca(fl_ty, name=bind_name)
+                        self.builder.store(fval, al)
+                        self._declare(bind_name, al, ftype)
+
+        for s in body:
+            if self.builder.block.is_terminated:
+                break
+            self._compile_stmt(s)
+
+        self._pop_scope()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(merge_b)
 
     # ------------------------------------------------------------------ #
     #  Statements                                                          #
@@ -515,7 +848,8 @@ class Compiler:
         elif isinstance(node, AssertStmt):       self._compile_assert(node)
         elif isinstance(node, TryCatch):         self._compile_try_catch(node)
         elif isinstance(node, ForEnumerate):     self._compile_for_enumerate(node)
-        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint)):
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint,
+                               InterfaceDecl, ImplDecl)):
             pass  # handled in compile() pass or before codegen
         else:
             raise CodegenError(f"Unknown stmt: {type(node).__name__}")
@@ -527,6 +861,11 @@ class Compiler:
 
         if declared == "float" and vt == "int":
             val = self.builder.sitofp(val, F64_TY); vt = "float"
+
+        # Interface boxing: struct → interface fat pointer
+        if declared in self._interfaces and vt != declared:
+            val = self._box_as_interface(val, vt, declared)
+            vt = declared
 
         # Nullable boxing: T? with a non-null value → box into malloc cell
         if declared.endswith("?"):
@@ -683,6 +1022,10 @@ class Compiler:
             # Tuple — print as <tuple>
             fmt = self._gstr_ptr(self._global_str(f"<tuple>"))
             self.builder.call(self.printf, [self._gstr_ptr(self._global_str("%s")), fmt])
+        elif vt in self._interfaces:
+            # Interface value — print as <interface:name>
+            fmt = self._gstr_ptr(self._global_str(f"<{vt}>"))
+            self.builder.call(self.printf, [fmt])
         else:
             # Struct / unknown — print type
             fmt = self._gstr_ptr(self._global_str(f"<{vt}>"))
@@ -733,6 +1076,42 @@ class Compiler:
         fn = self.current_fn
         val, vt = self._compile_expr(node.value)
 
+        # Check if any case uses a TypePattern (interface type dispatch)
+        has_type_patterns = any(
+            isinstance(p, TypePattern)
+            for case in node.cases
+            for p in case.patterns
+        )
+
+        if has_type_patterns and vt in self._interfaces:
+            # Interface type-pattern matching
+            val_al = self.builder.alloca(I8PTR, name="match_iface_val")
+            self.builder.store(val, val_al)
+            merge_b = fn.append_basic_block("match.merge")
+
+            for case in node.cases:
+                next_b = fn.append_basic_block("match.next")
+                for pat in case.patterns:
+                    if isinstance(pat, TypePattern):
+                        self._compile_type_pattern_case(
+                            fn, val_al, vt, pat, case.body, next_b, merge_b
+                        )
+                        break
+                self.builder.position_at_end(next_b)
+
+            if node.default_body:
+                self._push_scope()
+                for s in node.default_body:
+                    if self.builder.block.is_terminated: break
+                    self._compile_stmt(s)
+                self._pop_scope()
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_b)
+
+            self.builder.position_at_end(merge_b)
+            return
+
+        # Regular value equality matching
         # Alloca to hold the match value (so we can reload in each case)
         if vt == "float":
             val_al = self.builder.alloca(F64_TY, name="match_val")
@@ -745,16 +1124,11 @@ class Compiler:
         merge_b = fn.append_basic_block("match.merge")
 
         for case in node.cases:
-            # Build an "any pattern matches" check
-            # For each pattern, compare and OR together
             case_body_b = fn.append_basic_block("match.case.body")
             next_b = fn.append_basic_block("match.case.next")
 
-            # Evaluate all patterns and OR them
-            # Load val once per case
             loaded = self.builder.load(val_al)
 
-            # Build chain: if pat1 or pat2 or ... -> case_body_b else next_b
             combined_cond = None
             for pat in case.patterns:
                 pv, pt = self._compile_expr(pat)
@@ -763,15 +1137,11 @@ class Compiler:
                     c = self.builder.icmp_signed("==", r, ir.Constant(I32_TY, 0))
                 elif vt == "float" or pt == "float":
                     if pt == "int": pv = self.builder.sitofp(pv, F64_TY)
-                    if vt == "int": loaded_f = self.builder.sitofp(loaded, F64_TY)
-                    else: loaded_f = loaded
+                    loaded_f = self.builder.sitofp(loaded, F64_TY) if vt == "int" else loaded
                     c = self.builder.fcmp_ordered("==", loaded_f, pv)
                 else:
                     c = self.builder.icmp_signed("==", loaded, pv)
-                if combined_cond is None:
-                    combined_cond = c
-                else:
-                    combined_cond = self.builder.or_(combined_cond, c)
+                combined_cond = c if combined_cond is None else self.builder.or_(combined_cond, c)
 
             if combined_cond is None:
                 combined_cond = ir.Constant(I1_TY, 0)
@@ -789,7 +1159,6 @@ class Compiler:
 
             self.builder.position_at_end(next_b)
 
-        # Default body (currently positioned at last next_b)
         if node.default_body:
             self._push_scope()
             for s in node.default_body:
@@ -1221,6 +1590,10 @@ class Compiler:
 
         obj_v, obj_t = self._compile_expr(node.obj)
         method = node.method
+
+        # Interface method dispatch via vtable
+        if obj_t in self._interfaces:
+            return self._compile_interface_method_call(obj_v, obj_t, method, node.args)
 
         if obj_t.startswith("dict["):
             inner = obj_t[5:-1]
@@ -2596,7 +2969,12 @@ class Compiler:
         compiled_args = []
         for arg_node, (_, pt) in zip(args_with_defaults, sig.params):
             av, at = self._compile_expr(arg_node)
-            if pt == "float" and at == "int":
+            pt_resolved = self._resolve_type(pt)
+            # Auto-box struct to interface if needed
+            if pt_resolved in self._interfaces and at != pt_resolved:
+                av = self._box_as_interface(av, at, pt_resolved)
+                at = pt_resolved
+            elif pt_resolved == "float" and at == "int":
                 av = self.builder.sitofp(av, F64_TY)
             compiled_args.append(av)
         result = self.builder.call(fn, compiled_args)

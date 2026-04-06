@@ -68,6 +68,8 @@ class TT(Enum):
     CATCH        = auto()
     TYPE         = auto()
     AS           = auto()
+    INTERFACE    = auto()
+    IMPL         = auto()
 
     # Arithmetic operators
     PLUS         = auto()
@@ -146,7 +148,9 @@ KEYWORDS: dict[str, TT] = {
     "try":      TT.TRY,
     "catch":    TT.CATCH,
     "type":     TT.TYPE,
-    "as":       TT.AS,
+    "as":        TT.AS,
+    "interface": TT.INTERFACE,
+    "impl":      TT.IMPL,
 }
 
 

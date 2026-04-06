@@ -1,6 +1,6 @@
 """
-Vexel AST Node Definitions  (v5)
----------------------------------
+Vexel AST Node Definitions  (v5 / v6)
+--------------------------------------
 All node types the parser can produce.
 New in v2: ArrayLiteral, ForEach, BreakStmt, ContinueStmt,
            GlobalLet, GlobalConst, NullLiteral.
@@ -12,6 +12,8 @@ New in v5: LambdaExpr, TupleLiteral, TupleUnpack, NamespaceHint.
            ImportStmt gains optional alias.
            Param gains variadic flag.
            FnDecl gains type_params for generics.
+New in v6: InterfaceDecl, MethodSig, ImplDecl, TypePattern.
+           Node gains optional `line` attribute (set by parser).
 """
 
 from __future__ import annotations
@@ -20,7 +22,8 @@ from typing import Optional, List
 
 
 class Node:
-    pass
+    """Base AST node.  The parser may attach a `line` attribute after construction."""
+    line: int = 0   # source line; 0 = unknown
 
 
 # ============================================================
@@ -285,3 +288,32 @@ class TypeAlias(Node):
 @dataclass
 class Program(Node):
     declarations: List[Node]
+
+
+# ============================================================
+# v6 — Interfaces and implementation blocks
+# ============================================================
+
+@dataclass
+class MethodSig(Node):
+    """Interface method signature — no body.  Does NOT include the 'self' parameter."""
+    name:        str
+    params:      List[Param]
+    return_type: Optional[str]
+
+@dataclass
+class InterfaceDecl(Node):
+    name:    str
+    methods: List[MethodSig]
+
+@dataclass
+class ImplDecl(Node):
+    interface_name: str
+    struct_name:    str
+    methods:        List[FnDecl]   # each has 'self' as first Param
+
+@dataclass
+class TypePattern(Node):
+    """In a match case: Circle(r, c) — checks concrete type and binds fields positionally."""
+    type_name: str
+    bindings:  List[str]   # variable names for positional fields

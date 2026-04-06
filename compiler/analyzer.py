@@ -1,6 +1,6 @@
 """
-Vexel Semantic Analyzer  (v5)
-------------------------------
+Vexel Semantic Analyzer  (v5 / v6)
+------------------------------------
 Two-pass analysis:
   Pass 1 — register all function / struct / global / enum signatures.
   Pass 2 — walk bodies, check undefined names, infer types.
@@ -14,6 +14,11 @@ New in v5:
   - Generic functions: fn first[T](arr: T[]) -> T
   - Nullable types: int?, str?
   - New builtins: os_list_dir, parse_int, parse_float, time_now, time_format, input
+
+New in v6:
+  - InterfaceDecl / ImplDecl: register interfaces and check implementations
+  - TypePattern: in match cases, bind struct fields positionally
+  - Line numbers in error messages (where available)
 """
 
 from __future__ import annotations
@@ -93,11 +98,15 @@ class AnalysisResult:
     type_aliases:  dict[str, str] = None   # name → canonical type
     namespaces:    "set[str]" = None       # set of namespace alias names
     generic_fns:   dict = None             # name → FnDecl (unevaluated generics)
+    interfaces:    dict = None             # name → InterfaceDecl
+    impls:         dict = None             # (struct, iface) → ImplDecl
 
     def __post_init__(self):
         if self.type_aliases is None:  self.type_aliases = {}
         if self.namespaces is None:    self.namespaces   = set()
         if self.generic_fns is None:   self.generic_fns  = {}
+        if self.interfaces is None:    self.interfaces   = {}
+        if self.impls is None:         self.impls        = {}
 
 
 class Analyzer:
@@ -109,6 +118,8 @@ class Analyzer:
         self._type_aliases:  dict[str, str]                   = {}
         self._namespaces:    set[str]                         = set()
         self._generic_fns:   dict[str, "FnDecl"]              = {}
+        self._interfaces:    dict[str, "InterfaceDecl"]       = {}
+        self._impls:         dict[tuple, "ImplDecl"]          = {}
         self._scopes:        list[dict[str, str]]             = [{}]
         self._loop_depth:    int                              = 0
         self._lambda_count:  int                              = 0
@@ -147,17 +158,31 @@ class Analyzer:
                 self._type_aliases[decl.name] = decl.target
             elif isinstance(decl, NamespaceHint):
                 self._namespaces.add(decl.alias)
+            elif isinstance(decl, InterfaceDecl):
+                self._interfaces[decl.name] = decl
+            elif isinstance(decl, ImplDecl):
+                key = (decl.struct_name, decl.interface_name)
+                self._impls[key] = decl
+                # Register each impl method so calls inside bodies resolve
+                for m in decl.methods:
+                    fn_key = f"{decl.struct_name}__{m.name}__impl_{decl.interface_name}"
+                    params = [(p.name, p.type_name) for p in m.params]
+                    self._fn_sigs[fn_key] = FnSig(params, m.return_type or VX_VOID)
 
         # Pass 2 — analyze function bodies
         for decl in program.declarations:
             if isinstance(decl, FnDecl) and not decl.type_params:
                 self._analyze_fn(decl)
+            elif isinstance(decl, ImplDecl):
+                for m in decl.methods:
+                    self._analyze_fn(m)
 
         return AnalysisResult(
             self._errors, self._fn_sigs,
             self._struct_fields, self._global_types,
             self._type_aliases, self._namespaces,
             self._generic_fns,
+            self._interfaces, self._impls,
         )
 
     # ------------------------------------------------------------------ #
@@ -193,7 +218,10 @@ class Analyzer:
             if name in s: return s[name]
         return None
 
-    def _err(self, msg: str): self._errors.append(msg)
+    def _err(self, msg: str, node=None):
+        line = getattr(node, 'line', 0) if node else 0
+        prefix = f"Line {line}: " if line else ""
+        self._errors.append(prefix + msg)
 
     # ------------------------------------------------------------------ #
     #  Functions                                                           #
@@ -285,14 +313,28 @@ class Analyzer:
             self._infer_expr(node.expr)
 
         elif isinstance(node, MatchStmt):
-            self._infer_expr(node.value)
+            vt = self._infer_expr(node.value)
             for case in node.cases:
-                for pat in case.patterns:
-                    self._infer_expr(pat)
-                self._push()
-                for s in case.body:
-                    self._analyze_stmt(s, ret_type)
-                self._pop()
+                has_tp = any(isinstance(p, TypePattern) for p in case.patterns)
+                if has_tp:
+                    # TypePattern: push scope, bind fields, analyze body
+                    self._push()
+                    for pat in case.patterns:
+                        if isinstance(pat, TypePattern):
+                            fields = self._struct_fields.get(pat.type_name, [])
+                            for i, bind in enumerate(pat.bindings):
+                                ft = fields[i][1] if i < len(fields) else VX_INT
+                                self._declare(bind, ft)
+                    for s in case.body:
+                        self._analyze_stmt(s, ret_type)
+                    self._pop()
+                else:
+                    for pat in case.patterns:
+                        self._infer_expr(pat)
+                    self._push()
+                    for s in case.body:
+                        self._analyze_stmt(s, ret_type)
+                    self._pop()
             if node.default_body:
                 self._push()
                 for s in node.default_body:
@@ -324,7 +366,8 @@ class Analyzer:
             for s in node.body: self._analyze_stmt(s, ret_type)
             self._loop_depth -= 1; self._pop()
 
-        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint)):
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint,
+                               InterfaceDecl, ImplDecl)):
             pass  # handled in pass 1 or before analysis
 
     # ------------------------------------------------------------------ #
@@ -358,6 +401,7 @@ class Analyzer:
     # ------------------------------------------------------------------ #
 
     def _infer_expr(self, node: Node) -> str:
+        if isinstance(node, TypePattern):   return VX_BOOL  # type checks are boolean
         if isinstance(node, IntLiteral):    return VX_INT
         if isinstance(node, FloatLiteral):  return VX_FLOAT
         if isinstance(node, BoolLiteral):   return VX_BOOL
@@ -406,7 +450,7 @@ class Analyzer:
                 return f"__namespace__{node.name}"
             t = self._lookup(node.name)
             if t is None:
-                self._err(f"Undefined variable '{node.name}'")
+                self._err(f"Undefined variable '{node.name}'", node)
                 return VX_INT
             return t
 
@@ -434,7 +478,7 @@ class Analyzer:
                     arrow_idx = var_t.rindex("->")
                     for a in node.args: self._infer_expr(a)
                     return var_t[arrow_idx+2:]
-                self._err(f"Undefined function '{node.func}'")
+                self._err(f"Undefined function '{node.func}'", node)
                 return VX_VOID
             # For overloaded builtins, infer return type from args
             if node.func in ("abs", "min", "max", "clamp"):
@@ -458,6 +502,15 @@ class Analyzer:
         if isinstance(node, MethodCall):
             obj_t = self._infer_expr(node.obj)
             for a in node.args: self._infer_expr(a)
+
+            # Interface method dispatch
+            if obj_t in self._interfaces:
+                iface = self._interfaces[obj_t]
+                for m in iface.methods:
+                    if m.name == node.method:
+                        return m.return_type or VX_VOID
+                self._err(f"Interface '{obj_t}' has no method '{node.method}'", node)
+                return VX_VOID
 
             # Namespace call: ns.func(args)
             if obj_t.startswith("__namespace__"):
