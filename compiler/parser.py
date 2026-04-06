@@ -93,6 +93,8 @@ class Parser:
             return self._parse_import()
         if self._match(TT.ENUM):
             return self._parse_enum()
+        if self._match(TT.TYPE):
+            return self._parse_type_alias()
         return self._parse_stmt()
 
     # ------------------------------------------------------------------ #
@@ -108,7 +110,11 @@ class Parser:
             pname = self._expect(TT.IDENT).value
             self._expect(TT.COLON)
             ptype = self._parse_type()
-            params.append(Param(pname, ptype))
+            default = None
+            if self._match(TT.ASSIGN):
+                self._advance()
+                default = self._parse_expr()
+            params.append(Param(pname, ptype, default))
             if self._match(TT.COMMA):
                 self._advance()
         self._expect(TT.RPAREN)
@@ -120,6 +126,14 @@ class Parser:
         self._expect(TT.NEWLINE)
         body = self._parse_block()
         return FnDecl(name, params, ret, body)
+
+    def _parse_type_alias(self) -> TypeAlias:
+        self._expect(TT.TYPE)
+        name = self._expect(TT.IDENT).value
+        self._expect(TT.ASSIGN)
+        target = self._parse_type()
+        self._eat_newline()
+        return TypeAlias(name, target)
 
     def _parse_type(self) -> str:
         """Parse a type annotation: int, float, str, bool, int[], Vec2, etc."""
@@ -233,6 +247,8 @@ class Parser:
             return self._parse_match()
         if self._match(TT.ASSERT):
             return self._parse_assert()
+        if self._match(TT.TRY):
+            return self._parse_try()
 
         # Expression, assignment, compound assignment, or index assignment
         expr = self._parse_expr()
@@ -326,6 +342,18 @@ class Parser:
     def _parse_for(self) -> Node:
         self._expect(TT.FOR)
         var = self._expect(TT.IDENT).value
+
+        # Enumerate: for i, v in arr
+        if self._match(TT.COMMA):
+            self._advance()
+            val_var = self._expect(TT.IDENT).value
+            self._expect(TT.IN)
+            iterable = self._parse_expr()
+            self._expect(TT.COLON)
+            self._expect(TT.NEWLINE)
+            body = self._parse_block()
+            return ForEnumerate(var, val_var, iterable, body)
+
         self._expect(TT.IN)
         expr = self._parse_expr()
 
@@ -343,6 +371,18 @@ class Parser:
             self._expect(TT.NEWLINE)
             body = self._parse_block()
             return ForEach(var, expr, body)
+
+    def _parse_try(self) -> TryCatch:
+        self._expect(TT.TRY)
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        try_body = self._parse_block()
+        self._expect(TT.CATCH)
+        catch_var = self._expect(TT.IDENT).value
+        self._expect(TT.COLON)
+        self._expect(TT.NEWLINE)
+        catch_body = self._parse_block()
+        return TryCatch(try_body, catch_var, catch_body)
 
     def _parse_while(self) -> WhileStmt:
         self._expect(TT.WHILE)
@@ -433,8 +473,9 @@ class Parser:
 
     def _parse_comparison(self) -> Node:
         left = self._parse_addition()
-        while self._match(TT.EQ, TT.NEQ, TT.LT, TT.GT, TT.LTE, TT.GTE):
-            op   = self._advance().value
+        while self._match(TT.EQ, TT.NEQ, TT.LT, TT.GT, TT.LTE, TT.GTE, TT.IN):
+            tok  = self._advance()
+            op   = "in" if tok.type == TT.IN else tok.value
             left = BinOp(op, left, self._parse_addition())
         return left
 

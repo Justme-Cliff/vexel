@@ -1,11 +1,13 @@
 """
-Vexel AST Node Definitions  (v3)
+Vexel AST Node Definitions  (v4)
 ---------------------------------
 All node types the parser can produce.
 New in v2: ArrayLiteral, ForEach, BreakStmt, ContinueStmt,
            GlobalLet, GlobalConst, NullLiteral.
 New in v3: MethodCall, EnumDecl, MatchCase, MatchStmt, AssertStmt,
            ImportStmt, TernaryExpr.
+New in v4: TryCatch, ForEnumerate, TypeAlias.
+           Param gains optional default value.
 """
 
 from __future__ import annotations
@@ -175,8 +177,9 @@ class AssertStmt(Node):
 
 @dataclass
 class Param(Node):
-    name: str
+    name:     str
     type_name: str
+    default:   Optional[Node] = None
 
 @dataclass
 class FnDecl(Node):
@@ -226,6 +229,24 @@ class MatchStmt(Node):
 @dataclass
 class ImportStmt(Node):
     path: str
+
+@dataclass
+class TryCatch(Node):
+    try_body:   List[Node]
+    catch_var:  str
+    catch_body: List[Node]
+
+@dataclass
+class ForEnumerate(Node):          # for i, v in arr:
+    idx_var:  str
+    val_var:  str
+    iterable: Node
+    body:     List[Node]
+
+@dataclass
+class TypeAlias(Node):
+    name:   str
+    target: str
 
 @dataclass
 class Program(Node):

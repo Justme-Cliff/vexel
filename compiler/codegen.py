@@ -93,6 +93,9 @@ class Compiler:
         # Private helper function cache
         self._helper_fns: dict[str, ir.Function] = {}
 
+        # Default parameter values per function (registered in compile pass)
+        self._fn_defaults: dict[str, list] = {}
+
         self._define_array_type()
         self._declare_externs()
 
@@ -158,6 +161,26 @@ class Compiler:
         self.fseek_fn   = _fn(I32_TY, I8PTR, I64_TY, I32_TY,         name="fseek")
         self.ftell_fn   = _fn(I64_TY, I8PTR,                          name="ftell")
 
+        # v4 math
+        self.round_fn   = _fn(F64_TY, F64_TY,         name="round")
+        self.atan2_fn   = _fn(F64_TY, F64_TY, F64_TY, name="atan2")
+
+        # v4 OS — use platform-specific names available in MSVC CRT and MinGW
+        import sys as _sys
+        _win = _sys.platform == "win32"
+        self.getcwd_fn   = _fn(I8PTR,  I8PTR, I32_TY,  name="_getcwd"  if _win else "getcwd")
+        self.mkdir_fn    = _fn(I32_TY, I8PTR,           name="_mkdir"   if _win else "mkdir")
+        self.remove_fn   = _fn(I32_TY, I8PTR,           name="remove")
+        self.rmdir_fn    = _fn(I32_TY, I8PTR,           name="_rmdir"   if _win else "rmdir")
+        self.strerror_fn = _fn(I8PTR,  I32_TY,          name="strerror")
+
+        # v4 error state (global buffer defined in this module)
+        arr_ty = ir.ArrayType(I8_TY, 512)
+        self._vx_error_buf = ir.GlobalVariable(self.module, arr_ty,
+                                               name="__vx_error_buf")
+        self._vx_error_buf.linkage = "private"
+        self._vx_error_buf.initializer = ir.Constant(arr_ty, bytearray(512))
+
     # ------------------------------------------------------------------ #
     #  Global string helpers                                               #
     # ------------------------------------------------------------------ #
@@ -189,7 +212,17 @@ class Compiler:
     #  Type helpers                                                        #
     # ------------------------------------------------------------------ #
 
+    def _resolve_type(self, vx: str) -> str:
+        """Resolve type aliases to their canonical type."""
+        seen = set()
+        while vx in self.analysis.type_aliases and vx not in seen:
+            seen.add(vx)
+            vx = self.analysis.type_aliases[vx]
+        return vx
+
     def _vx_to_llvm(self, vx: str) -> ir.Type:
+        # Resolve type aliases first
+        vx = self._resolve_type(vx)
         if vx == "int":    return I64_TY
         if vx == "float":  return F64_TY
         if vx == "bool":   return I1_TY
@@ -215,7 +248,7 @@ class Compiler:
             info = self._lookup(node.name)
             return info["vx_type"] if info else "int"
         if isinstance(node, BinOp):
-            if node.op in ("==","!=","<",">","<=",">=","and","or"): return "bool"
+            if node.op in ("==","!=","<",">","<=",">=","and","or","in"): return "bool"
             lt = self._infer_type(node.left)
             rt = self._infer_type(node.right)
             if node.op == "+" and lt == "str": return "str"
@@ -224,7 +257,7 @@ class Compiler:
             return "bool" if node.op == "not" else self._infer_type(node.operand)
         if isinstance(node, Call):
             # Overloaded builtins
-            if node.func in ("abs","min","max") and node.args:
+            if node.func in ("abs","min","max","clamp") and node.args:
                 at = self._infer_type(node.args[0])
                 return "float" if at == "float" else "int"
             sig = self.analysis.fn_sigs.get(node.func)
@@ -365,6 +398,8 @@ class Compiler:
         for i, (pname, _) in enumerate(sig.params):
             fn.args[i].name = pname
         self._functions[d.name] = {"fn": fn, "sig": sig}
+        # Register default param values for this function
+        self._fn_defaults[d.name] = [p.default for p in d.params]
 
     def _compile_fn(self, d: FnDecl):
         info = self._functions[d.name]
@@ -376,9 +411,10 @@ class Compiler:
         self._push_scope()
 
         for arg, param in zip(fn.args, d.params):
-            al = self.builder.alloca(self._vx_to_llvm(param.type_name), name=param.name)
+            resolved = self._resolve_type(param.type_name)
+            al = self.builder.alloca(self._vx_to_llvm(resolved), name=param.name)
             self.builder.store(arg, al)
-            self._declare(param.name, al, param.type_name)
+            self._declare(param.name, al, resolved)
 
         for stmt in d.body:
             if self.builder.block.is_terminated: break
@@ -414,14 +450,16 @@ class Compiler:
         elif isinstance(node, ExprStmt):         self._compile_expr(node.expr)
         elif isinstance(node, MatchStmt):        self._compile_match(node)
         elif isinstance(node, AssertStmt):       self._compile_assert(node)
-        elif isinstance(node, (EnumDecl, ImportStmt)):
+        elif isinstance(node, TryCatch):         self._compile_try_catch(node)
+        elif isinstance(node, ForEnumerate):     self._compile_for_enumerate(node)
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias)):
             pass  # handled in compile() pass or before codegen
         else:
             raise CodegenError(f"Unknown stmt: {type(node).__name__}")
 
     def _compile_let(self, node: LetStmt):
         val, vt  = self._compile_expr(node.value)
-        declared = node.type_annotation or vt
+        declared = self._resolve_type(node.type_annotation or vt)
         ll_ty    = self._vx_to_llvm(declared)
 
         if declared == "float" and vt == "int":
@@ -650,6 +688,116 @@ class Compiler:
         self.builder.position_at_end(ok_b)
 
     # ------------------------------------------------------------------ #
+    #  Try / catch (global error-state approach)                         #
+    # ------------------------------------------------------------------ #
+
+    def _compile_try_catch(self, node: TryCatch):
+        fn = self.current_fn
+
+        # Clear error buffer: store 0 into first byte
+        ep0 = self.builder.gep(self._vx_error_buf,
+                               [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                               inbounds=True)
+        self.builder.store(ir.Constant(I8_TY, 0), ep0)
+
+        # Compile try body
+        self._push_scope()
+        for s in node.try_body:
+            if self.builder.block.is_terminated:
+                break
+            self._compile_stmt(s)
+        self._pop_scope()
+
+        if self.builder.block.is_terminated:
+            return  # try body already returned
+
+        # Check if an error was set
+        first = self.builder.load(ep0)
+        has_err = self.builder.icmp_unsigned("!=", first, ir.Constant(I8_TY, 0))
+
+        catch_b = fn.append_basic_block("try.catch")
+        after_b = fn.append_basic_block("try.after")
+        self.builder.cbranch(has_err, catch_b, after_b)
+
+        # Catch block
+        self.builder.position_at_end(catch_b)
+        err_ptr = self.builder.gep(self._vx_error_buf,
+                                   [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                                   inbounds=True)
+        self._push_scope()
+        al = self.builder.alloca(I8PTR, name=node.catch_var)
+        self.builder.store(err_ptr, al)
+        self._declare(node.catch_var, al, "str")
+        for s in node.catch_body:
+            if self.builder.block.is_terminated:
+                break
+            self._compile_stmt(s)
+        self._pop_scope()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(after_b)
+
+        self.builder.position_at_end(after_b)
+
+    # ------------------------------------------------------------------ #
+    #  For enumerate  (for i, v in arr:)                                 #
+    # ------------------------------------------------------------------ #
+
+    def _compile_for_enumerate(self, node: ForEnumerate):
+        fn          = self.current_fn
+        arr_v, avt  = self._compile_expr(node.iterable)
+        elem_vt     = avt[:-2] if avt.endswith("[]") else "str"
+        elem_lt     = self._vx_to_llvm(elem_vt)
+
+        lp     = self.builder.gep(arr_v,
+                                  [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)],
+                                  inbounds=True)
+        arr_ln = self.builder.load(lp)
+
+        # Index counter
+        i_al = self.builder.alloca(I64_TY, name=node.idx_var)
+        self.builder.store(ir.Constant(I64_TY, 0), i_al)
+
+        # Element slot
+        item_al = self.builder.alloca(elem_lt, name=node.val_var)
+
+        chk = fn.append_basic_block("fen.check")
+        bdy = fn.append_basic_block("fen.body")
+        ext = fn.append_basic_block("fen.exit")
+
+        self.builder.branch(chk)
+        self.builder.position_at_end(chk)
+        iv   = self.builder.load(i_al)
+        cond = self.builder.icmp_signed("<", iv, arr_ln)
+        self.builder.cbranch(cond, bdy, ext)
+
+        self.builder.position_at_end(bdy)
+        self._push_scope()
+        self._declare(node.idx_var, i_al, "int")
+        self._declare(node.val_var, item_al, elem_vt)
+        dp = self._arr_data_ptr(arr_v, elem_lt)
+        ep = self.builder.gep(dp, [iv], inbounds=True)
+        ev = self.builder.load(ep)
+        self.builder.store(ev, item_al)
+
+        self._break_targets.append(ext)
+        self._continue_targets.append(chk)
+        for s in node.body:
+            if self.builder.block.is_terminated:
+                break
+            self._compile_stmt(s)
+        self._break_targets.pop()
+        self._continue_targets.pop()
+        self._pop_scope()
+
+        if not self.builder.block.is_terminated:
+            ic   = self.builder.load(i_al)
+            inxt = self.builder.add(ic, ir.Constant(I64_TY, 1))
+            self.builder.store(inxt, i_al)
+            self.builder.branch(chk)
+
+        self.builder.position_at_end(ext)
+
+    # ------------------------------------------------------------------ #
     #  Loops                                                               #
     # ------------------------------------------------------------------ #
 
@@ -808,7 +956,8 @@ class Compiler:
             info = self._lookup(node.name)
             if info is None:
                 raise CodegenError(f"Undefined variable '{node.name}'")
-            return self.builder.load(info["ptr"], name=node.name), info["vx_type"]
+            vx_t = self._resolve_type(info["vx_type"])
+            return self.builder.load(info["ptr"], name=node.name), vx_t
 
         if isinstance(node, BinOp):    return self._compile_binop(node)
         if isinstance(node, UnaryOp):  return self._compile_unary(node)
@@ -1774,6 +1923,10 @@ class Compiler:
         if op == "or":
             return self._compile_or(node)
 
+        # `x in container`
+        if op == "in":
+            return self._compile_in(node)
+
         lv, lt = self._compile_expr(node.left)
         rv, rt = self._compile_expr(node.right)
 
@@ -1855,6 +2008,37 @@ class Compiler:
         phi.add_incoming(ir.Constant(I1_TY, 1), lblock)
         phi.add_incoming(rv, rblock)
         return phi, "bool"
+
+    def _compile_in(self, node: BinOp) -> tuple[ir.Value, str]:
+        """Compile  x in collection  → bool."""
+        lv, lt = self._compile_expr(node.left)
+        rv, rt = self._compile_expr(node.right)
+
+        if rt == "str":
+            # substring check: strstr(container, needle) != NULL
+            result = self.builder.call(self.strstr_fn, [rv, lv])
+            null_int = ir.Constant(I64_TY, 0)
+            res_int  = self.builder.ptrtoint(result, I64_TY)
+            return self.builder.icmp_unsigned("!=", res_int, null_int), "bool"
+
+        if rt.endswith("[]"):
+            elem_vt = rt[:-2]
+            arr_raw = self.builder.bitcast(rv, I8PTR)
+            if elem_vt == "int":
+                if lt == "float":
+                    lv = self.builder.fptosi(lv, I64_TY)
+                fn_h = self._get_helper("__vx_array_contains_i64")
+                return self.builder.call(fn_h, [arr_raw, lv]), "bool"
+            elif elem_vt == "float":
+                if lt == "int":
+                    lv = self.builder.sitofp(lv, F64_TY)
+                fn_h = self._get_helper("__vx_array_contains_f64")
+                return self.builder.call(fn_h, [arr_raw, lv]), "bool"
+            else:
+                fn_h = self._get_helper("__vx_array_contains_str")
+                return self.builder.call(fn_h, [arr_raw, lv]), "bool"
+
+        raise CodegenError(f"'in' not supported for type '{rt}'")
 
     def _compile_unary(self, node: UnaryOp) -> tuple[ir.Value, str]:
         val, vt = self._compile_expr(node.operand)
@@ -2044,14 +2228,118 @@ class Compiler:
             fn_h = self._get_helper("__vx_file_exists")
             return self.builder.call(fn_h, [path_v]), "bool"
 
-        # --- User-defined functions ---
+        # --- v4 Math ---
+        if name == "round":
+            val, vt = self._compile_expr(node.args[0])
+            if vt == "int": val = self.builder.sitofp(val, F64_TY)
+            r = self.builder.call(self.round_fn, [val])
+            return self.builder.fptosi(r, I64_TY), "int"
+
+        if name == "clamp":
+            val, vt = self._compile_expr(node.args[0])
+            lo_v, lo_t = self._compile_expr(node.args[1])
+            hi_v, hi_t = self._compile_expr(node.args[2])
+            if vt == "float" or lo_t == "float" or hi_t == "float":
+                if vt == "int":   val  = self.builder.sitofp(val,  F64_TY)
+                if lo_t == "int": lo_v = self.builder.sitofp(lo_v, F64_TY)
+                if hi_t == "int": hi_v = self.builder.sitofp(hi_v, F64_TY)
+                c1 = self.builder.fcmp_ordered("<", val, lo_v)
+                v1 = self.builder.select(c1, lo_v, val)
+                c2 = self.builder.fcmp_ordered(">", v1, hi_v)
+                return self.builder.select(c2, hi_v, v1), "float"
+            c1 = self.builder.icmp_signed("<", val, lo_v)
+            v1 = self.builder.select(c1, lo_v, val)
+            c2 = self.builder.icmp_signed(">", v1, hi_v)
+            return self.builder.select(c2, hi_v, v1), "int"
+
+        if name == "lerp":
+            av, at = self._compile_expr(node.args[0])
+            bv, bt = self._compile_expr(node.args[1])
+            tv, tt = self._compile_expr(node.args[2])
+            if at == "int": av = self.builder.sitofp(av, F64_TY)
+            if bt == "int": bv = self.builder.sitofp(bv, F64_TY)
+            if tt == "int": tv = self.builder.sitofp(tv, F64_TY)
+            diff   = self.builder.fsub(bv, av)
+            scaled = self.builder.fmul(diff, tv)
+            return self.builder.fadd(av, scaled), "float"
+
+        if name == "atan2":
+            yv, yt = self._compile_expr(node.args[0])
+            xv, xt = self._compile_expr(node.args[1])
+            if yt == "int": yv = self.builder.sitofp(yv, F64_TY)
+            if xt == "int": xv = self.builder.sitofp(xv, F64_TY)
+            return self.builder.call(self.atan2_fn, [yv, xv]), "float"
+
+        # --- v4 Error / OS ---
+        if name == "throw":
+            msg_v, _ = self._compile_expr(node.args[0])
+            # Copy message into error buffer via sprintf
+            fmt = self._gstr_ptr(self._global_str("%s"))
+            ep0 = self.builder.gep(self._vx_error_buf,
+                                   [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                                   inbounds=True)
+            self.builder.call(self.sprintf_fn, [ep0, fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "os_cwd":
+            buf = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 512)])
+            result = self.builder.call(self.getcwd_fn, [buf, ir.Constant(I32_TY, 512)])
+            null_int = ir.Constant(I64_TY, 0)
+            res_int  = self.builder.ptrtoint(result, I64_TY)
+            is_null  = self.builder.icmp_unsigned("==", res_int, null_int)
+            empty = self._gstr_ptr(self._global_str(""))
+            return self.builder.select(is_null, empty, buf), "str"
+
+        if name == "os_mkdir":
+            path_v, _ = self._compile_expr(node.args[0])
+            r = self.builder.call(self.mkdir_fn, [path_v])
+            z = ir.Constant(I32_TY, 0)
+            return self.builder.icmp_signed("==", r, z), "bool"
+
+        if name == "os_delete":
+            # Try remove() first (works for files); fall back to rmdir (for directories)
+            path_v, _ = self._compile_expr(node.args[0])
+            fn = self.current_fn
+            r = self.builder.call(self.remove_fn, [path_v])
+            z = ir.Constant(I32_TY, 0)
+            ok_b   = fn.append_basic_block("del.ok")
+            try_b  = fn.append_basic_block("del.try_rmdir")
+            done_b = fn.append_basic_block("del.done")
+            file_ok = self.builder.icmp_signed("==", r, z)
+            self.builder.cbranch(file_ok, ok_b, try_b)
+            # File remove failed — try rmdir
+            self.builder.position_at_end(try_b)
+            r2 = self.builder.call(self.rmdir_fn, [path_v])
+            dir_ok = self.builder.icmp_signed("==", r2, z)
+            self.builder.branch(done_b)
+            # ok_b
+            self.builder.position_at_end(ok_b)
+            self.builder.branch(done_b)
+            # merge
+            self.builder.position_at_end(done_b)
+            phi = self.builder.phi(I1_TY)
+            phi.add_incoming(ir.Constant(I1_TY, 1), ok_b)
+            phi.add_incoming(dir_ok, try_b)
+            return phi, "bool"
+
+        # --- User-defined functions (with default param support) ---
         fi = self._functions.get(name)
         if fi is None:
             raise CodegenError(f"Undefined function '{name}'")
         fn  = fi["fn"]
         sig = fi["sig"]
+        # Collect defaults registered during compile phase
+        defaults = self._fn_defaults.get(name, [])
+        args_with_defaults = list(node.args)
+        while len(args_with_defaults) < len(sig.params):
+            idx = len(args_with_defaults)
+            if idx < len(defaults) and defaults[idx] is not None:
+                args_with_defaults.append(defaults[idx])
+            else:
+                break
+
         compiled_args = []
-        for arg_node, (_, pt) in zip(node.args, sig.params):
+        for arg_node, (_, pt) in zip(args_with_defaults, sig.params):
             av, at = self._compile_expr(arg_node)
             if pt == "float" and at == "int":
                 av = self.builder.sitofp(av, F64_TY)

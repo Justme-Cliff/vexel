@@ -24,6 +24,14 @@ New in v3:
   - PI / E constants
   - New builtins: exit, read_file, write_file, append_file, file_exists,
                   rand, rand_int, sin, cos, tan, log, log2
+
+New in v4:
+  - TryCatch statement
+  - ForEnumerate statement
+  - TypeAlias declaration
+  - `in` operator support
+  - New builtins: round, clamp, lerp, atan2, throw,
+                  os_cwd, os_mkdir, os_delete
 """
 
 from __future__ import annotations
@@ -67,6 +75,15 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "tan":         (["float"],                  VX_FLOAT),
     "log":         (["float"],                  VX_FLOAT),
     "log2":        (["float"],                  VX_FLOAT),
+    # v4 additions
+    "round":       (["float"],                  VX_INT),
+    "clamp":       (["any", "any", "any"],      VX_INT),    # overloaded
+    "lerp":        (["float", "float", "float"], VX_FLOAT),
+    "atan2":       (["float", "float"],         VX_FLOAT),
+    "throw":       (["str"],                    VX_VOID),
+    "os_cwd":      ([],                         VX_STR),
+    "os_mkdir":    (["str"],                    VX_BOOL),
+    "os_delete":   (["str"],                    VX_BOOL),
 }
 
 
@@ -82,6 +99,11 @@ class AnalysisResult:
     fn_sigs:       dict[str, FnSig]
     struct_fields: dict[str, list[tuple[str, str]]]
     global_types:  dict[str, str]
+    type_aliases:  dict[str, str] = None  # name → canonical type
+
+    def __post_init__(self):
+        if self.type_aliases is None:
+            self.type_aliases = {}
 
 
 class Analyzer:
@@ -90,6 +112,7 @@ class Analyzer:
         self._fn_sigs:       dict[str, FnSig]            = {}
         self._struct_fields: dict[str, list[tuple[str, str]]] = {}
         self._global_types:  dict[str, str]              = {}
+        self._type_aliases:  dict[str, str]              = {}
         self._scopes:        list[dict[str, str]]        = [{}]
         self._loop_depth:    int                         = 0
 
@@ -111,6 +134,8 @@ class Analyzer:
                     key = f"{decl.name}.{variant}"
                     self._global_types[key] = VX_INT
                     self._scopes[0][key]    = VX_INT
+            elif isinstance(decl, TypeAlias):
+                self._type_aliases[decl.name] = decl.target
 
         # Pass 2
         for decl in program.declarations:
@@ -120,6 +145,7 @@ class Analyzer:
         return AnalysisResult(
             self._errors, self._fn_sigs,
             self._struct_fields, self._global_types,
+            self._type_aliases,
         )
 
     # ------------------------------------------------------------------ #
@@ -255,7 +281,27 @@ class Analyzer:
             if node.message:
                 self._infer_expr(node.message)
 
-        elif isinstance(node, (EnumDecl, ImportStmt)):
+        elif isinstance(node, TryCatch):
+            self._push()
+            for s in node.try_body:
+                self._analyze_stmt(s, ret_type)
+            self._pop()
+            self._push()
+            self._declare(node.catch_var, VX_STR)
+            for s in node.catch_body:
+                self._analyze_stmt(s, ret_type)
+            self._pop()
+
+        elif isinstance(node, ForEnumerate):
+            arr_type  = self._infer_expr(node.iterable)
+            elem_type = arr_type[:-2] if arr_type.endswith("[]") else VX_STR
+            self._push(); self._loop_depth += 1
+            self._declare(node.idx_var, VX_INT)
+            self._declare(node.val_var, elem_type)
+            for s in node.body: self._analyze_stmt(s, ret_type)
+            self._loop_depth -= 1; self._pop()
+
+        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias)):
             pass  # handled in pass 1 or before analysis
 
     # ------------------------------------------------------------------ #
@@ -287,7 +333,7 @@ class Analyzer:
         if isinstance(node, BinOp):
             lt = self._infer_expr(node.left)
             rt = self._infer_expr(node.right)
-            if node.op in ("==","!=","<",">","<=",">=","and","or"):
+            if node.op in ("==","!=","<",">","<=",">=","and","or","in"):
                 return VX_BOOL
             # str + str → str
             if node.op == "+" and lt == VX_STR: return VX_STR
@@ -304,7 +350,7 @@ class Analyzer:
                 self._err(f"Undefined function '{node.func}'")
                 return VX_VOID
             # For overloaded builtins, infer return type from args
-            if node.func in ("abs", "min", "max"):
+            if node.func in ("abs", "min", "max", "clamp"):
                 if node.args:
                     at = self._infer_expr(node.args[0])
                     return VX_FLOAT if at == VX_FLOAT else VX_INT

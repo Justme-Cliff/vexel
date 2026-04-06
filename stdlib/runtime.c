@@ -178,3 +178,25 @@ char *vx_float_to_str(double f) {
 char *vx_bool_to_str(int b) {
     return b ? "true" : "false";
 }
+
+/* ------------------------------------------------------------------ */
+/*  OS helpers (v4)                                                     */
+/* ------------------------------------------------------------------ */
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <direct.h>
+#define vx_platform_mkdir(p)  _mkdir(p)
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#define vx_platform_mkdir(p)  mkdir((p), 0755)
+#endif
+
+/* These are called from generated code via the 'getcwd' / 'mkdir' / 'remove'
+   extern declarations in codegen.py, so no separate vx_ wrapper is needed.
+   This file exists mainly to document platform compat. */
+
+/* Double-check that getcwd is available (it's in stdlib.h / unistd.h). */
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <unistd.h>
+#endif

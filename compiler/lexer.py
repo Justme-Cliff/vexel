@@ -13,6 +13,11 @@ New in v3:
   - ENUM, MATCH, CASE, DEFAULT, IMPORT, ASSERT keywords
   - QUESTION token for ?
   - { and } also count as paren depth (for multiline dict-style usage)
+
+New in v4:
+  - TRY, CATCH, TYPE keywords
+  - Triple-quoted strings: \"\"\"...\"\"\"  (newlines become \\n)
+  - F-strings: f"Hello {name}!"  desugared to concatenation at lex time
 """
 
 import re
@@ -55,6 +60,9 @@ class TT(Enum):
     DEFAULT      = auto()
     IMPORT       = auto()
     ASSERT       = auto()
+    TRY          = auto()
+    CATCH        = auto()
+    TYPE         = auto()
 
     # Arithmetic operators
     PLUS         = auto()
@@ -129,6 +137,9 @@ KEYWORDS: dict[str, TT] = {
     "default":  TT.DEFAULT,
     "import":   TT.IMPORT,
     "assert":   TT.ASSERT,
+    "try":      TT.TRY,
+    "catch":    TT.CATCH,
+    "type":     TT.TYPE,
 }
 
 
@@ -155,11 +166,108 @@ class Lexer:
         self._paren_depth  = 0   # suppress structure tokens inside ( ) [ ] { }
 
     # ------------------------------------------------------------------ #
+    #  Preprocessing (f-strings and triple-quoted strings)               #
+    # ------------------------------------------------------------------ #
+
+    def _preprocess(self, source: str) -> str:
+        """
+        Two passes over the raw source:
+          1. Replace triple-quoted strings with single-line equivalents
+             (literal newlines become the two-char sequence \\n so the
+             normal escape handler turns them back into real newlines).
+          2. Replace f"..." with a parenthesised concatenation expression.
+        """
+        result = []
+        i, n = 0, len(source)
+        while i < n:
+            # ---- triple-quoted string: """...""" ----
+            if source[i:i+3] == '"""':
+                j = i + 3
+                buf = []
+                while j <= n - 3:
+                    if source[j:j+3] == '"""':
+                        j += 3
+                        break
+                    c = source[j]
+                    if c == '\n':
+                        buf.append('\\n')
+                    elif c == '"':
+                        buf.append('\\"')
+                    elif c == '\\':
+                        buf.append('\\\\')
+                    else:
+                        buf.append(c)
+                    j += 1
+                else:
+                    j = n  # unterminated — will surface as lex error
+                result.append('"' + ''.join(buf) + '"')
+                i = j
+                continue
+
+            # ---- f-string: f"..." ----
+            if source[i] == 'f' and i + 1 < n and source[i + 1] == '"':
+                j = i + 2
+                segments: list[tuple[str, str]] = []
+                text_buf: list[str] = []
+
+                while j < n and source[j] != '"':
+                    if source[j] == '\\' and j + 1 < n:
+                        esc = source[j + 1]
+                        text_buf.append({'n': '\\n', 't': '\\t',
+                                         '\\': '\\\\', '"': '\\"'}.get(esc, esc))
+                        j += 2
+                    elif source[j] == '{':
+                        if text_buf:
+                            segments.append(('text', ''.join(text_buf)))
+                            text_buf = []
+                        j += 1
+                        depth = 1
+                        expr_buf: list[str] = []
+                        while j < n and depth > 0:
+                            if source[j] == '{':
+                                depth += 1
+                            elif source[j] == '}':
+                                depth -= 1
+                            if depth > 0:
+                                expr_buf.append(source[j])
+                            j += 1
+                        segments.append(('expr', ''.join(expr_buf).strip()))
+                    else:
+                        text_buf.append(source[j])
+                        j += 1
+
+                if text_buf:
+                    segments.append(('text', ''.join(text_buf)))
+                if j < n:
+                    j += 1  # consume closing "
+
+                parts = []
+                for seg_type, seg_val in segments:
+                    if seg_type == 'text':
+                        parts.append('"' + seg_val + '"')
+                    else:
+                        parts.append('str(' + seg_val + ')')
+
+                if not parts:
+                    result.append('""')
+                elif len(parts) == 1 and segments[0][0] == 'text':
+                    result.append(parts[0])
+                else:
+                    result.append('(' + ' + '.join(parts) + ')')
+                i = j
+                continue
+
+            result.append(source[i])
+            i += 1
+        return ''.join(result)
+
+    # ------------------------------------------------------------------ #
     #  Public API                                                          #
     # ------------------------------------------------------------------ #
 
     def tokenize(self) -> list[Token]:
-        for line_text in self.source.splitlines(keepends=True):
+        source = self._preprocess(self.source)
+        for line_text in source.splitlines(keepends=True):
             self._process_line(line_text)
         while len(self._indent_stack) > 1:
             self._indent_stack.pop()
