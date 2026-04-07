@@ -1,36 +1,16 @@
 """
-Vexel LLVM Code Generator  (v3)
----------------------------------
-New in v2:
-  - Arrays (int[], float[], bool[], str[]) — heap-allocated {i8*, i64} header
-  - String concatenation (+) and equality (==)
-  - Math built-ins: sqrt abs min max pow floor ceil
-  - Type casts: int() float() str() bool()
-  - len() for arrays and strings
-  - break / continue
-  - Compound assignment (handled by parser, transparent here)
-  - for-each over arrays
-  - Global variables (constants)
-  - Multi-arg print  →  space-separated on one line
-  - Null literal
-  - Float printing via %g (no trailing zeros)
-  - Index assignment
+Vexel LLVM IR code generator.
 
-New in v3:
-  - Dynamic arrays: {i8*, i64, i64} (data, len, cap)
-  - String methods: len, upper, lower, trim, contains, starts_with, ends_with,
-                    replace, split, and string indexing
-  - Array methods: len, push, pop, contains, reverse
-  - File I/O: read_file, write_file, append_file, file_exists
-  - Enums (int constants)
-  - Match statement
-  - Assert statement
-  - Ternary expression
-  - More math: sin, cos, tan, log, log2, rand, rand_int
-  - PI / E constants
-  - exit() builtin
-  - Import statement (no-op; resolved before codegen)
-  - Private LLVM helper functions
+Walks the type-checked AST produced by the analyzer and emits LLVM IR
+via llvmlite.  The resulting IR string can be JIT-executed or compiled
+to a native binary through ``jit_run`` / ``compile_to_binary``.
+
+Key design decisions:
+  - Arrays are heap-allocated structs: ``{i8*, i64, i64}`` (data, len, cap).
+  - Strings are null-terminated ``i8*`` values managed by the C runtime.
+  - Interfaces use fat pointers: ``{i8* data, i8* vtable}`` boxed on the heap.
+  - Vtables are filled at program startup by ``__vx_vtable_init()``.
+  - Generic functions are monomorphized on first call.
 """
 
 from __future__ import annotations

@@ -1,24 +1,14 @@
 """
-Vexel Semantic Analyzer  (v5 / v6)
-------------------------------------
-Two-pass analysis:
-  Pass 1 — register all function / struct / global / enum signatures.
-  Pass 2 — walk bodies, check undefined names, infer types.
+Vexel semantic analyzer.
 
-New in v5:
-  - NamespaceHint: track namespace aliases
-  - LambdaExpr: anonymous functions with type fn(T,...)->R
-  - TupleUnpack: let (a, b) = expr
-  - TupleLiteral: (a, b, ...) inferred as (T1,T2,...) type
-  - Variadic params: ...nums: int[]
-  - Generic functions: fn first[T](arr: T[]) -> T
-  - Nullable types: int?, str?
-  - New builtins: os_list_dir, parse_int, parse_float, time_now, time_format, input
+Two-pass analysis over the AST:
+  Pass 1 — register all top-level declarations (functions, structs,
+            globals, enums, interfaces, impls).
+  Pass 2 — walk function bodies, check for undefined names, and infer
+            expression types.
 
-New in v6:
-  - InterfaceDecl / ImplDecl: register interfaces and check implementations
-  - TypePattern: in match cases, bind struct fields positionally
-  - Line numbers in error messages (where available)
+Errors accumulate in ``AnalysisResult.errors``; the compiler does not
+raise on the first problem so multiple errors can be reported at once.
 """
 
 from __future__ import annotations
@@ -95,18 +85,11 @@ class AnalysisResult:
     fn_sigs:       dict[str, FnSig]
     struct_fields: dict[str, list[tuple[str, str]]]
     global_types:  dict[str, str]
-    type_aliases:  dict[str, str] = None   # name → canonical type
-    namespaces:    "set[str]" = None       # set of namespace alias names
-    generic_fns:   dict = None             # name → FnDecl (unevaluated generics)
-    interfaces:    dict = None             # name → InterfaceDecl
-    impls:         dict = None             # (struct, iface) → ImplDecl
-
-    def __post_init__(self):
-        if self.type_aliases is None:  self.type_aliases = {}
-        if self.namespaces is None:    self.namespaces   = set()
-        if self.generic_fns is None:   self.generic_fns  = {}
-        if self.interfaces is None:    self.interfaces   = {}
-        if self.impls is None:         self.impls        = {}
+    type_aliases:  dict[str, str]      = field(default_factory=dict)
+    namespaces:    set[str]            = field(default_factory=set)
+    generic_fns:   dict[str, FnDecl]  = field(default_factory=dict)
+    interfaces:    dict[str, InterfaceDecl] = field(default_factory=dict)
+    impls:         dict[tuple, ImplDecl]    = field(default_factory=dict)
 
 
 class Analyzer:
@@ -523,9 +506,6 @@ class Analyzer:
                 return VX_VOID
 
             if obj_t.startswith("dict["):
-                inner = obj_t[5:-1]
-                ci = inner.index(',')
-                vt = inner[ci+1:]
                 return {"has": VX_BOOL, "remove": VX_VOID,
                         "len": VX_INT, "keys": "str[]"}.get(node.method, VX_VOID)
             if obj_t == VX_STR:

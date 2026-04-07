@@ -1,4 +1,4 @@
-"""Tests for Vexel v2 features."""
+"""Integration tests for the Vexel runtime (arrays, strings, control flow)."""
 import sys
 sys.path.insert(0, ".")
 

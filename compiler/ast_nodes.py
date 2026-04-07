@@ -1,19 +1,8 @@
 """
-Vexel AST Node Definitions  (v5 / v6)
---------------------------------------
-All node types the parser can produce.
-New in v2: ArrayLiteral, ForEach, BreakStmt, ContinueStmt,
-           GlobalLet, GlobalConst, NullLiteral.
-New in v3: MethodCall, EnumDecl, MatchCase, MatchStmt, AssertStmt,
-           ImportStmt, TernaryExpr.
-New in v4: TryCatch, ForEnumerate, TypeAlias.
-           Param gains optional default value.
-New in v5: LambdaExpr, TupleLiteral, TupleUnpack, NamespaceHint.
-           ImportStmt gains optional alias.
-           Param gains variadic flag.
-           FnDecl gains type_params for generics.
-New in v6: InterfaceDecl, MethodSig, ImplDecl, TypePattern.
-           Node gains optional `line` attribute (set by parser).
+Vexel AST node definitions.
+
+All node types produced by the parser.  Every node carries an optional
+``line`` attribute (set by the parser) used for error reporting.
 """
 
 from __future__ import annotations

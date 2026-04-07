@@ -1,27 +1,12 @@
 """
-Vexel Lexer
------------
-Converts raw source code into a flat list of tokens.
+Vexel lexer.
 
-New in v2:
-  - ELIF, BREAK, CONTINUE, NULL, CONST keywords
-  - PLUS_ASSIGN  +=   MINUS_ASSIGN  -=   STAR_ASSIGN  *=   SLASH_ASSIGN /=
-  - Paren-depth tracking: NEWLINE / INDENT / DEDENT are suppressed while
-    inside open parentheses, so function calls can span multiple lines.
+Converts raw source text into a flat list of tokens.
 
-New in v3:
-  - ENUM, MATCH, CASE, DEFAULT, IMPORT, ASSERT keywords
-  - QUESTION token for ?
-  - { and } also count as paren depth (for multiline dict-style usage)
-
-New in v4:
-  - TRY, CATCH, TYPE keywords
-  - Triple-quoted strings: \"\"\"...\"\"\"  (newlines become \\n)
-  - F-strings: f"Hello {name}!"  desugared to concatenation at lex time
-
-New in v5:
-  - AS keyword (for namespace imports)
-  - ELLIPSIS token (... for variadic params)
+F-strings and triple-quoted strings are desugared during a preprocessing
+pass before the main scan.  NEWLINE / INDENT / DEDENT tokens are
+suppressed while inside open parentheses, brackets, or braces so that
+multi-line expressions work naturally.
 """
 
 import re
@@ -148,7 +133,7 @@ KEYWORDS: dict[str, TT] = {
     "try":      TT.TRY,
     "catch":    TT.CATCH,
     "type":     TT.TYPE,
-    "as":        TT.AS,
+    "as":       TT.AS,
     "interface": TT.INTERFACE,
     "impl":      TT.IMPL,
 }

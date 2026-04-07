@@ -1,42 +1,9 @@
 """
-Vexel Parser  (v5 / v6)
-------------------------
-Recursive descent parser.
+Vexel recursive-descent parser.
 
-New in v2:
-  - elif chains
-  - break / continue
-  - array literals  [1, 2, 3]
-  - index assignment  arr[i] = v
-  - compound assignment  x += 1  x -= 1  x *= 2  x /= 2
-  - for-each  for item in arr:
-  - global let / const at top level
-  - null literal
-  - multi-arg print
-
-New in v3:
-  - import statement
-  - enum declaration
-  - match statement
-  - assert statement
-  - ternary expression  (cond ? then : else)
-  - method call syntax  (obj.method(args))
-
-New in v5:
-  - import "x.vx" as ns   (namespace imports)
-  - fn[T, U](...)          (generic functions)
-  - ...param: T[]          (variadic params)
-  - fn(int)->int           (function types in annotations)
-  - (T1, T2)               (tuple types)
-  - T?                     (nullable types)
-  - fn(x: int): ...        (lambda expressions)
-  - (a, b) = expr          (tuple destructuring in let)
-  - 0 < x < 10             (chained comparisons)
-
-New in v6:
-  - interface / impl blocks
-  - TypePattern in match: case Circle(r):  (type dispatch + field binding)
-  - Line numbers propagated to AST nodes via node.line
+Converts a token stream produced by the Lexer into an AST composed of
+the node types defined in ``compiler.ast_nodes``.  Line numbers are
+attached to key nodes for use in error messages.
 """
 
 from compiler.lexer import Token, TT
