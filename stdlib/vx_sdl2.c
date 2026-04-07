@@ -135,3 +135,36 @@ void vx_sdl2_delay(int64_t ms) {
     SDL_Delay((Uint32)ms);
 #endif
 }
+
+/* ------------------------------------------------------------------ */
+/*  Keyboard input                                                      */
+/* ------------------------------------------------------------------ */
+
+static int vx_space_pressed = 0;
+static int vx_should_quit   = 0;
+
+/*
+ * Call once per frame.  Drains the event queue, records SPACE and quit.
+ * Returns 1 = keep running, 0 = quit was requested.
+ */
+int64_t vx_sdl2_poll_events(void) {
+    vx_space_pressed = 0;
+#ifdef VX_SDL2_ENABLED
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            vx_should_quit = 1;
+        }
+        if (e.type == SDL_KEYDOWN) {
+            if (e.key.keysym.sym == SDLK_ESCAPE) vx_should_quit = 1;
+            if (e.key.keysym.sym == SDLK_SPACE)  vx_space_pressed = 1;
+        }
+    }
+#endif
+    return vx_should_quit ? 0 : 1;
+}
+
+/* Returns 1 if SPACE was pressed this frame, 0 otherwise. */
+int64_t vx_sdl2_key_space(void) {
+    return (int64_t)vx_space_pressed;
+}
