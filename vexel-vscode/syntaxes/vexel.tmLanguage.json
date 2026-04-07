@@ -1,0 +1,206 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Vexel",
+  "scopeName": "source.vexel",
+  "fileTypes": ["vx"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#triple-strings" },
+    { "include": "#fstrings" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#keywords-control" },
+    { "include": "#keywords-declaration" },
+    { "include": "#keywords-operator" },
+    { "include": "#builtin-types" },
+    { "include": "#builtin-functions" },
+    { "include": "#function-definition" },
+    { "include": "#struct-interface-name" },
+    { "include": "#impl-block" },
+    { "include": "#new-expr" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+
+    "comments": {
+      "name": "comment.line.number-sign.vexel",
+      "match": "#.*$"
+    },
+
+    "triple-strings": {
+      "name": "string.quoted.triple.vexel",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        { "name": "constant.character.escape.vexel", "match": "\\\\." }
+      ]
+    },
+
+    "fstrings": {
+      "name": "string.interpolated.vexel",
+      "begin": "f\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "meta.embedded.vexel",
+          "begin": "\\{",
+          "end": "\\}",
+          "patterns": [{ "include": "$self" }]
+        },
+        { "name": "constant.character.escape.vexel", "match": "\\\\." }
+      ]
+    },
+
+    "strings": {
+      "name": "string.quoted.double.vexel",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.vexel", "match": "\\\\." }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.vexel",
+          "match": "\\b\\d+\\.\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.vexel",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.vexel",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.vexel",
+          "match": "\\bnull\\b"
+        },
+        {
+          "name": "constant.language.vexel",
+          "match": "\\b(PI|E)\\b"
+        }
+      ]
+    },
+
+    "keywords-control": {
+      "name": "keyword.control.vexel",
+      "match": "\\b(if|elif|else|for|in|while|return|break|continue|match|case|default|try|catch)\\b"
+    },
+
+    "keywords-declaration": {
+      "name": "keyword.other.declaration.vexel",
+      "match": "\\b(fn|let|const|struct|enum|import|as|type|interface|impl|for|new)\\b"
+    },
+
+    "keywords-operator": {
+      "name": "keyword.operator.logical.vexel",
+      "match": "\\b(and|or|not)\\b"
+    },
+
+    "builtin-types": {
+      "name": "support.type.vexel",
+      "match": "(?<=[:\\[,(\\s])\\s*(int|float|bool|str|void|dict)(?=[\\]\\[,)?\\s]|$)"
+    },
+
+    "builtin-functions": {
+      "name": "support.function.builtin.vexel",
+      "match": "\\b(print|len|sqrt|abs|min|max|pow|floor|ceil|int|float|str|bool|sin|cos|tan|log|log2|rand|rand_int|round|clamp|lerp|atan2|exit|read_file|write_file|append_file|file_exists|os_cwd|os_mkdir|os_delete|os_list_dir|parse_int|parse_float|time_now|time_format|input|throw|assert)\\b(?=\\s*\\()"
+    },
+
+    "function-definition": {
+      "patterns": [
+        {
+          "comment": "fn keyword + function name",
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.declaration.vexel" },
+            "2": { "name": "entity.name.function.vexel" }
+          }
+        }
+      ]
+    },
+
+    "struct-interface-name": {
+      "patterns": [
+        {
+          "comment": "struct / enum / interface Name",
+          "match": "\\b(struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.declaration.vexel" },
+            "2": { "name": "entity.name.type.vexel" }
+          }
+        }
+      ]
+    },
+
+    "impl-block": {
+      "comment": "impl InterfaceName for StructName",
+      "match": "\\b(impl)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(for)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.declaration.vexel" },
+        "2": { "name": "entity.name.type.vexel" },
+        "3": { "name": "keyword.other.declaration.vexel" },
+        "4": { "name": "entity.name.type.vexel" }
+      }
+    },
+
+    "new-expr": {
+      "comment": "new StructName",
+      "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.declaration.vexel" },
+        "2": { "name": "entity.name.type.vexel" }
+      }
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.comparison.vexel",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.assignment.vexel",
+          "match": "\\+=|-=|\\*=|/=|="
+        },
+        {
+          "name": "keyword.operator.arithmetic.vexel",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.arrow.vexel",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.ternary.vexel",
+          "match": "\\?"
+        },
+        {
+          "name": "keyword.operator.range.vexel",
+          "match": "\\.\\."
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.separator.colon.vexel",  "match": ":" },
+        { "name": "punctuation.separator.comma.vexel",  "match": "," },
+        { "name": "punctuation.accessor.dot.vexel",     "match": "\\." },
+        { "name": "punctuation.section.parens.vexel",   "match": "[()]" },
+        { "name": "punctuation.section.brackets.vexel", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.braces.vexel",   "match": "[{}]" }
+      ]
+    }
+  }
+}

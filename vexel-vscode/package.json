@@ -1,0 +1,26 @@
+{
+  "name": "vexel",
+  "displayName": "Vexel",
+  "description": "Syntax highlighting for the Vexel programming language (.vx files)",
+  "version": "1.0.0",
+  "publisher": "vexel",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vexel",
+        "aliases": ["Vexel", "vexel"],
+        "extensions": [".vx"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vexel",
+        "scopeName": "source.vexel",
+        "path": "./syntaxes/vexel.tmLanguage.json"
+      }
+    ]
+  }
+}
