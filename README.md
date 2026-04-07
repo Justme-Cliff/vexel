@@ -48,9 +48,13 @@ On Windows a `vexel.bat` is included — add the project folder to PATH and run 
 
 **VS Code syntax highlighting:**
 
-Copy the `vexel-vscode/` folder into your VS Code extensions directory and restart VS Code:
-- Windows: `%USERPROFILE%\.vscode\extensions\vexel-1.0.0\`
-- macOS/Linux: `~/.vscode/extensions/vexel-1.0.0/`
+1. Download the file `vexel-vscode/vexel-1.0.0.vsix` from this repo
+2. Open VS Code
+3. Press `Ctrl+Shift+P` and type `Extensions: Install from VSIX...`
+4. Select the downloaded `vexel-1.0.0.vsix` file
+5. Reload VS Code when prompted
+
+Your `.vx` files will now have syntax highlighting.
 
 ## Usage
 

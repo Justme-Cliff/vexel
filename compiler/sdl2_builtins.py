@@ -20,8 +20,9 @@ SDL2_BUILTINS: dict[str, tuple[list[str], str]] = {
     "sdl2_poll":       ([],                       "int"),
     "sdl2_ticks":      ([],                       "int"),
     "sdl2_delay":        (["int"],                "void"),
-    "sdl2_poll_events":  ([],                    "int"),
-    "sdl2_key_space":    ([],                    "int"),
+    "sdl2_poll_events":    ([],                    "int"),
+    "sdl2_key_space":      ([],                    "int"),
+    "sdl2_key_space_held": ([],                    "int"),
 }
 
 # Map the simple names above to the actual C symbols in vx_sdl2.c
@@ -36,6 +37,7 @@ SDL2_C_NAMES: dict[str, str] = {
     "sdl2_poll":       "vx_sdl2_poll",
     "sdl2_ticks":      "vx_sdl2_ticks",
     "sdl2_delay":        "vx_sdl2_delay",
-    "sdl2_poll_events":  "vx_sdl2_poll_events",
-    "sdl2_key_space":    "vx_sdl2_key_space",
+    "sdl2_poll_events":    "vx_sdl2_poll_events",
+    "sdl2_key_space":      "vx_sdl2_key_space",
+    "sdl2_key_space_held": "vx_sdl2_key_space_held",
 }

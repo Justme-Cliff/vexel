@@ -141,6 +141,7 @@ void vx_sdl2_delay(int64_t ms) {
 /* ------------------------------------------------------------------ */
 
 static int vx_space_pressed = 0;
+static int vx_space_held    = 0;
 static int vx_should_quit   = 0;
 
 /*
@@ -157,7 +158,13 @@ int64_t vx_sdl2_poll_events(void) {
         }
         if (e.type == SDL_KEYDOWN) {
             if (e.key.keysym.sym == SDLK_ESCAPE) vx_should_quit = 1;
-            if (e.key.keysym.sym == SDLK_SPACE)  vx_space_pressed = 1;
+            if (e.key.keysym.sym == SDLK_SPACE) {
+                vx_space_pressed = 1;
+                vx_space_held    = 1;
+            }
+        }
+        if (e.type == SDL_KEYUP) {
+            if (e.key.keysym.sym == SDLK_SPACE) vx_space_held = 0;
         }
     }
 #endif
@@ -167,4 +174,9 @@ int64_t vx_sdl2_poll_events(void) {
 /* Returns 1 if SPACE was pressed this frame, 0 otherwise. */
 int64_t vx_sdl2_key_space(void) {
     return (int64_t)vx_space_pressed;
+}
+
+/* Returns 1 if SPACE is currently held down, 0 otherwise. */
+int64_t vx_sdl2_key_space_held(void) {
+    return (int64_t)vx_space_held;
 }
