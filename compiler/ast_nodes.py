@@ -306,3 +306,189 @@ class TypePattern(Node):
     """In a match case: Circle(r, c) — checks concrete type and binds fields positionally."""
     type_name: str
     bindings:  List[str]   # variable names for positional fields
+
+
+# ============================================================
+# v7 — New language features
+# ============================================================
+
+@dataclass
+class CharLiteral(Node):
+    """Single character literal: 'a'  Stored as the character string."""
+    value: str
+
+@dataclass
+class DoWhileStmt(Node):
+    """do: body while condition:"""
+    body:      List[Node]
+    condition: Node
+
+@dataclass
+class LabeledStmt(Node):
+    """label: loop_stmt  — attaches a name to any loop for break/continue."""
+    label: str
+    stmt:  Node   # must be a loop node
+
+@dataclass
+class BreakLabel(Node):
+    """break label — break out of the named loop."""
+    label: str
+
+@dataclass
+class ContinueLabel(Node):
+    """continue label — continue the named loop."""
+    label: str
+
+@dataclass
+class DeferStmt(Node):
+    """defer expr — run expr when the enclosing function returns."""
+    expr: Node
+
+@dataclass
+class YieldStmt(Node):
+    """yield value — produce a value from a generator (future)."""
+    value: Optional[Node]
+
+@dataclass
+class NullCoalesceExpr(Node):
+    """left ?? right — return left if not null, else right."""
+    left:  Node
+    right: Node
+
+@dataclass
+class OptionalChainExpr(Node):
+    """obj?.field — return null if obj is null, else obj.field."""
+    obj:   Node
+    field: str
+
+@dataclass
+class ListComp(Node):
+    """[expr for var in iterable if condition]"""
+    expr:      Node
+    var:       str
+    iterable:  Node
+    condition: Optional[Node]
+
+@dataclass
+class StructDestructure(Node):
+    """let {x, y} = point  — bind named fields."""
+    fields:  List[str]
+    aliases: List[Optional[str]]   # renamed bindings: {x: a, y: b}
+    value:   Node
+
+@dataclass
+class ArrayDestructure(Node):
+    """let [first, second, ...rest] = arr"""
+    names:    List[str]            # positional names; None = skip
+    rest_name: Optional[str]       # name for the rest slice
+    value:    Node
+
+@dataclass
+class MatchCaseGuard(Node):
+    """match case with guard: case x if x > 0: body"""
+    patterns: List[Node]
+    guard:    Optional[Node]
+    body:     List[Node]
+
+@dataclass
+class TestDecl(Node):
+    """test "name": body  — a test block."""
+    name: str
+    body: List[Node]
+
+@dataclass
+class ExternFnDecl(Node):
+    """extern fn name(params) -> ret  — declare a C function."""
+    name:        str
+    params:      List['Param']
+    return_type: Optional[str]
+
+@dataclass
+class AttributeNode(Node):
+    """@attribute_name(args)  — metadata on the next declaration."""
+    name: str
+    args: List[Node]
+
+@dataclass
+class CatchClause(Node):
+    """catch ErrorType as var: body  — typed catch clause."""
+    error_type: Optional[str]   # None = catch all
+    var:        str
+    body:       List[Node]
+
+@dataclass
+class TryCatchFinally(Node):
+    """try/catch(es)/finally with typed catch clauses."""
+    try_body:     List[Node]
+    catches:      List[CatchClause]
+    finally_body: Optional[List[Node]]
+
+@dataclass
+class ThrowStmt(Node):
+    """throw expr  — raise an error."""
+    value: Node
+
+@dataclass
+class RaiseStmt(Node):
+    """raise expr  — alias for throw."""
+    value: Node
+
+@dataclass
+class NamedArg(Node):
+    """name = expr  — named argument at a call site."""
+    name:  str
+    value: Node
+
+@dataclass
+class AwaitExpr(Node):
+    """await expr  — wait for an async result."""
+    expr: Node
+
+@dataclass
+class EnumVariant(Node):
+    """Single variant in an algebraic enum: Circle(radius: float)"""
+    name:   str
+    fields: List['StructField']   # may be empty for unit variants
+
+@dataclass
+class EnumDeclADT(Node):
+    """Algebraic Data Type enum with per-variant payload fields."""
+    name:     str
+    variants: List[EnumVariant]
+
+@dataclass
+class MatchCaseADT(Node):
+    """ADT match case: case Circle(r): ..."""
+    variant_name: str
+    bindings:     List[str]
+    guard:        Optional[Node]
+    body:         List[Node]
+
+@dataclass
+class PubDecl(Node):
+    """pub decl  — marks a declaration as public."""
+    inner: Node
+
+@dataclass
+class PrivDecl(Node):
+    """priv decl  — marks a declaration as private."""
+    inner: Node
+
+@dataclass
+class ComptimeDecl(Node):
+    """comptime let name = expr  — compile-time constant."""
+    name:  str
+    value: Node
+
+@dataclass
+class UnsafeBlock(Node):
+    """unsafe: body  — unsafe code block."""
+    body: List[Node]
+
+@dataclass
+class SliceExpr(Node):
+    """obj[start..end] or obj[start..=end]  — slice/range index."""
+    obj:       Node
+    start:     Optional[Node]
+    end:       Optional[Node]
+    inclusive: bool = False   # ..= vs ..

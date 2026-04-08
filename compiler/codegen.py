@@ -88,6 +88,13 @@ class Compiler:
         # Namespace registry (alias → True)
         self._namespaces: set[str] = set()
 
+        # Labeled loop targets: label → block
+        self._label_break_targets:    dict[str, ir.Block] = {}
+        self._label_continue_targets: dict[str, ir.Block] = {}
+
+        # Defer stacks: one list per function nesting level
+        self._defer_stack: list[list] = []
+
         # Interface vtable registry
         # name → {methods:[str,...], method_sigs:{name:MethodSig}, vtable_ll, fat_ll}
         self._interfaces: dict[str, dict] = {}
@@ -194,6 +201,14 @@ class Compiler:
         self.fgets_fn    = _fn(I8PTR,  I8PTR, I32_TY, I8PTR, name="fgets")
         self.stdin_fn    = None  # resolved lazily via helper
 
+        # v7 new builtins
+        self.log10_fn   = _fn(F64_TY, F64_TY,              name="log10")
+        self.exp_fn     = _fn(F64_TY, F64_TY,              name="exp")
+        self.hypot_fn   = _fn(F64_TY, F64_TY, F64_TY,     name="hypot")
+        self.getenv_fn  = _fn(I8PTR,  I8PTR,               name="getenv")
+        self.popen_fn   = _fn(I8PTR,  I8PTR, I8PTR,        name="popen")
+        self.pclose_fn  = _fn(I32_TY, I8PTR,               name="pclose")
+
         # v4 error state (global buffer defined in this module)
         arr_ty = ir.ArrayType(I8_TY, 512)
         self._vx_error_buf = ir.GlobalVariable(self.module, arr_ty,
@@ -249,6 +264,14 @@ class Compiler:
         if vx == "str":    return I8PTR
         if vx == "void":   return VOID_TY
         if vx == "null":   return I8PTR
+        # Integer type variants (#46)
+        if vx in ("i8",  "u8"):  return ir.IntType(8)
+        if vx in ("i16", "u16"): return ir.IntType(16)
+        if vx in ("i32", "u32"): return ir.IntType(32)
+        if vx in ("i64", "u64"): return ir.IntType(64)
+        if vx == "f32":  return ir.FloatType()
+        if vx == "f64":  return F64_TY
+        if vx == "char": return ir.IntType(8)   # char = i8
         if vx.endswith("[]"):      return self.arr_ptr_type
         if vx.startswith("dict["): return self.dict_ptr_type
         # Tuple type: (int,float,...) → pointer to struct
@@ -388,33 +411,50 @@ class Compiler:
                     gv.initializer = ir.Constant(I64_TY, i)
                     self._globals[gname] = {"ptr": gv, "vx_type": "int"}
 
+        # 3b. ADT Enum definitions (tagged union structs)
+        for d in program.declarations:
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, EnumDeclADT):
+                self._define_adt_enum(_d)
+
         # 4. Global variables
         for d in program.declarations:
-            if isinstance(d, (GlobalLet, GlobalConst)):
-                self._compile_global(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, (GlobalLet, GlobalConst)):
+                self._compile_global(_d)
+            elif isinstance(_d, ComptimeDecl):
+                self._compile_comptime(_d)
 
         # 5. Forward-declare all non-generic user functions
         for d in program.declarations:
-            if isinstance(d, FnDecl) and not d.type_params:
-                self._declare_fn(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, FnDecl) and not _d.type_params:
+                self._declare_fn(_d)
+            elif isinstance(_d, ExternFnDecl):
+                self._compile_extern_fn(_d)
 
         # 6. Forward-declare impl methods + create vtable globals
         for d in program.declarations:
-            if isinstance(d, ImplDecl):
-                self._declare_impl(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, ImplDecl):
+                self._declare_impl(_d)
 
         # 7. Build the vtable init function (needs impl fns already declared)
         self._build_vtable_init_fn()
 
         # 8. Compile non-generic function bodies
         for d in program.declarations:
-            if isinstance(d, FnDecl) and not d.type_params:
-                self._compile_fn(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, FnDecl) and not _d.type_params:
+                self._compile_fn(_d)
+            elif isinstance(_d, TestDecl):
+                self._compile_test_decl(_d)
 
         # 9. Compile impl method bodies
         for d in program.declarations:
-            if isinstance(d, ImplDecl):
-                self._compile_impl(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, ImplDecl):
+                self._compile_impl(_d)
 
         return str(self.module)
 
@@ -482,6 +522,7 @@ class Compiler:
         entry = fn.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
         self._push_scope()
+        self._defer_stack.append([])   # new defer frame
 
         # Inject vtable initializer at the start of main
         if d.name == "main" and "__vx_vtable_init" in self._helper_fns:
@@ -498,11 +539,13 @@ class Compiler:
             self._compile_stmt(stmt)
 
         if not self.builder.block.is_terminated:
+            self._emit_defers()
             if fn.ftype.return_type == VOID_TY:
                 self.builder.ret_void()
             else:
                 self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
 
+        self._defer_stack.pop()
         self._pop_scope()
 
     # ------------------------------------------------------------------ #
@@ -811,25 +854,46 @@ class Compiler:
         if self.builder.block.is_terminated:
             return   # dead code — skip
 
-        if   isinstance(node, LetStmt):         self._compile_let(node)
-        elif isinstance(node, TupleUnpack):      self._compile_tuple_unpack(node)
-        elif isinstance(node, AssignStmt):       self._compile_assign(node)
-        elif isinstance(node, IndexAssignStmt):  self._compile_index_assign(node)
-        elif isinstance(node, ReturnStmt):       self._compile_return(node)
-        elif isinstance(node, PrintStmt):        self._compile_print(node)
-        elif isinstance(node, IfStmt):           self._compile_if(node)
-        elif isinstance(node, ForStmt):          self._compile_for(node)
-        elif isinstance(node, ForEach):          self._compile_foreach(node)
-        elif isinstance(node, WhileStmt):        self._compile_while(node)
-        elif isinstance(node, BreakStmt):        self._compile_break()
-        elif isinstance(node, ContinueStmt):     self._compile_continue()
-        elif isinstance(node, ExprStmt):         self._compile_expr(node.expr)
-        elif isinstance(node, MatchStmt):        self._compile_match(node)
-        elif isinstance(node, AssertStmt):       self._compile_assert(node)
-        elif isinstance(node, TryCatch):         self._compile_try_catch(node)
-        elif isinstance(node, ForEnumerate):     self._compile_for_enumerate(node)
-        elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint,
-                               InterfaceDecl, ImplDecl)):
+        if   isinstance(node, LetStmt):              self._compile_let(node)
+        elif isinstance(node, TupleUnpack):           self._compile_tuple_unpack(node)
+        elif isinstance(node, StructDestructure):     self._compile_struct_destructure(node)
+        elif isinstance(node, ArrayDestructure):      self._compile_array_destructure(node)
+        elif isinstance(node, AssignStmt):            self._compile_assign(node)
+        elif isinstance(node, IndexAssignStmt):       self._compile_index_assign(node)
+        elif isinstance(node, ReturnStmt):            self._compile_return(node)
+        elif isinstance(node, PrintStmt):             self._compile_print(node)
+        elif isinstance(node, IfStmt):                self._compile_if(node)
+        elif isinstance(node, ForStmt):               self._compile_for(node)
+        elif isinstance(node, ForEach):               self._compile_foreach(node)
+        elif isinstance(node, WhileStmt):             self._compile_while(node)
+        elif isinstance(node, DoWhileStmt):           self._compile_do_while(node)
+        elif isinstance(node, LabeledStmt):           self._compile_labeled_stmt(node)
+        elif isinstance(node, BreakStmt):             self._compile_break()
+        elif isinstance(node, ContinueStmt):          self._compile_continue()
+        elif isinstance(node, BreakLabel):            self._compile_break_label(node)
+        elif isinstance(node, ContinueLabel):         self._compile_continue_label(node)
+        elif isinstance(node, ExprStmt):              self._compile_expr(node.expr)
+        elif isinstance(node, MatchStmt):             self._compile_match(node)
+        elif isinstance(node, AssertStmt):            self._compile_assert(node)
+        elif isinstance(node, TryCatch):              self._compile_try_catch(node)
+        elif isinstance(node, TryCatchFinally):       self._compile_try_catch_finally(node)
+        elif isinstance(node, ForEnumerate):          self._compile_for_enumerate(node)
+        elif isinstance(node, DeferStmt):             self._register_defer(node)
+        elif isinstance(node, ThrowStmt):             self._compile_throw(node)
+        elif isinstance(node, RaiseStmt):             self._compile_throw(ThrowStmt(node.value))
+        elif isinstance(node, YieldStmt):             pass   # future: generator support
+        elif isinstance(node, UnsafeBlock):
+            self._push_scope()
+            for s in node.body:
+                if self.builder.block.is_terminated: break
+                self._compile_stmt(s)
+            self._pop_scope()
+        elif isinstance(node, (PubDecl, PrivDecl)):
+            self._compile_stmt(ExprStmt(NullLiteral()))   # visibility is metadata only
+        elif isinstance(node, (EnumDecl, EnumDeclADT, ImportStmt, TypeAlias,
+                               NamespaceHint, InterfaceDecl, ImplDecl,
+                               ExternFnDecl, TestDecl, ComptimeDecl,
+                               AttributeNode)):
             pass  # handled in compile() pass or before codegen
         else:
             raise CodegenError(f"Unknown stmt: {type(node).__name__}")
@@ -841,6 +905,20 @@ class Compiler:
 
         if declared == "float" and vt == "int":
             val = self.builder.sitofp(val, F64_TY); vt = "float"
+
+        # Integer type variants: coerce i64 to smaller int types
+        _int_variants = {"i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "char"}
+        if declared in _int_variants and vt in ("int", "bool"):
+            target_ll = self._vx_to_llvm(declared)
+            if val.type != target_ll:
+                if val.type.width > target_ll.width:
+                    val = self.builder.trunc(val, target_ll)
+                else:
+                    val = self.builder.sext(val, target_ll)
+        # Coerce int variants back to i64 when assigned to "int"
+        if declared == "int" and vt in _int_variants:
+            if val.type != I64_TY:
+                val = self.builder.sext(val, I64_TY)
 
         # Interface boxing: struct → interface fat pointer
         if declared in self._interfaces and vt != declared:
@@ -928,6 +1006,7 @@ class Compiler:
 
     def _compile_return(self, node: ReturnStmt):
         ret_ty = self.current_fn.ftype.return_type
+        self._emit_defers()   # run deferred exprs before return
         if node.value is None:
             if ret_ty == VOID_TY: self.builder.ret_void()
             else:                 self.builder.ret(ir.Constant(ret_ty, 0))
@@ -1104,33 +1183,70 @@ class Compiler:
         merge_b = fn.append_basic_block("match.merge")
 
         for case in node.cases:
+            # Support MatchCaseGuard (case n if guard:) and regular MatchCase
+            is_guard_case = isinstance(case, MatchCaseGuard)
+            guard_expr = case.guard if is_guard_case else None
+            patterns   = case.patterns
+            body       = case.body
+
             case_body_b = fn.append_basic_block("match.case.body")
             next_b = fn.append_basic_block("match.case.next")
-
             loaded = self.builder.load(val_al)
 
+            # Check if pattern is a single identifier — bind variable, condition = true
+            bind_name = None
             combined_cond = None
-            for pat in case.patterns:
-                pv, pt = self._compile_expr(pat)
-                if vt == "str" or pt == "str":
-                    r = self.builder.call(self.strcmp_fn, [loaded, pv])
-                    c = self.builder.icmp_signed("==", r, ir.Constant(I32_TY, 0))
-                elif vt == "float" or pt == "float":
-                    if pt == "int": pv = self.builder.sitofp(pv, F64_TY)
-                    loaded_f = self.builder.sitofp(loaded, F64_TY) if vt == "int" else loaded
-                    c = self.builder.fcmp_ordered("==", loaded_f, pv)
-                else:
-                    c = self.builder.icmp_signed("==", loaded, pv)
-                combined_cond = c if combined_cond is None else self.builder.or_(combined_cond, c)
+
+            if (len(patterns) == 1 and isinstance(patterns[0], Identifier)
+                    and patterns[0].name not in self._globals
+                    and self._lookup(patterns[0].name) is None):
+                # Wildcard variable binding: case n: ... (always matches)
+                bind_name = patterns[0].name
+                combined_cond = ir.Constant(I1_TY, 1)
+            else:
+                for pat in patterns:
+                    pv, pt = self._compile_expr(pat)
+                    if vt == "str" or pt == "str":
+                        r = self.builder.call(self.strcmp_fn, [loaded, pv])
+                        c = self.builder.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+                    elif vt == "float" or pt == "float":
+                        if pt == "int": pv = self.builder.sitofp(pv, F64_TY)
+                        loaded_f = self.builder.sitofp(loaded, F64_TY) if vt == "int" else loaded
+                        c = self.builder.fcmp_ordered("==", loaded_f, pv)
+                    else:
+                        c = self.builder.icmp_signed("==", loaded, pv)
+                    combined_cond = c if combined_cond is None else self.builder.or_(combined_cond, c)
 
             if combined_cond is None:
                 combined_cond = ir.Constant(I1_TY, 0)
 
-            self.builder.cbranch(combined_cond, case_body_b, next_b)
+            # If there's a guard, evaluate it after binding (in a side-block)
+            if guard_expr is not None:
+                guard_check_b = fn.append_basic_block("match.guard")
+                self.builder.cbranch(combined_cond, guard_check_b, next_b)
+                self.builder.position_at_end(guard_check_b)
+                # Bind match variable for the guard
+                self._push_scope()
+                if bind_name:
+                    bind_al = self.builder.alloca(val_al.type.pointee, name=bind_name)
+                    self.builder.store(loaded, bind_al)
+                    self._declare(bind_name, bind_al, vt)
+                guard_v, _ = self._compile_expr(guard_expr)
+                if guard_v.type != I1_TY:
+                    guard_v = self.builder.trunc(guard_v, I1_TY)
+                self._pop_scope()
+                self.builder.cbranch(guard_v, case_body_b, next_b)
+            else:
+                self.builder.cbranch(combined_cond, case_body_b, next_b)
 
             self.builder.position_at_end(case_body_b)
             self._push_scope()
-            for s in case.body:
+            # Bind match variable in case body
+            if bind_name:
+                bind_al2 = self.builder.alloca(val_al.type.pointee, name=bind_name)
+                self.builder.store(loaded, bind_al2)
+                self._declare(bind_name, bind_al2, vt)
+            for s in body:
                 if self.builder.block.is_terminated: break
                 self._compile_stmt(s)
             self._pop_scope()
@@ -1416,6 +1532,204 @@ class Compiler:
             raise CodegenError("continue outside loop")
         self.builder.branch(self._continue_targets[-1])
 
+    def _compile_break_label(self, node):
+        target = self._label_break_targets.get(node.label)
+        if target is None:
+            raise CodegenError(f"Unknown label '{node.label}'")
+        self.builder.branch(target)
+
+    def _compile_continue_label(self, node):
+        target = self._label_continue_targets.get(node.label)
+        if target is None:
+            raise CodegenError(f"Unknown label '{node.label}'")
+        self.builder.branch(target)
+
+    def _compile_do_while(self, node: 'DoWhileStmt'):
+        fn  = self.current_fn
+        bdy = fn.append_basic_block("dowhile.body")
+        chk = fn.append_basic_block("dowhile.check")
+        ext = fn.append_basic_block("dowhile.exit")
+
+        self.builder.branch(bdy)
+        self.builder.position_at_end(bdy)
+        self._push_scope()
+        self._break_targets.append(ext)
+        self._continue_targets.append(chk)
+        for s in node.body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(s)
+        self._break_targets.pop()
+        self._continue_targets.pop()
+        self._pop_scope()
+        if not self.builder.block.is_terminated:
+            self.builder.branch(chk)
+
+        self.builder.position_at_end(chk)
+        cv, _ = self._compile_expr(node.condition)
+        self.builder.cbranch(cv, bdy, ext)
+        self.builder.position_at_end(ext)
+
+    def _compile_labeled_stmt(self, node: 'LabeledStmt'):
+        fn  = self.current_fn
+        ext = fn.append_basic_block(f"label.{node.label}.exit")
+        chk = fn.append_basic_block(f"label.{node.label}.chk")
+
+        # Register label targets before compiling body
+        self._label_break_targets[node.label]    = ext
+        self._label_continue_targets[node.label] = chk
+
+        # Emit the loop with label targets also pushed as normal targets
+        self._break_targets.append(ext)
+        self._continue_targets.append(chk)
+        self._compile_stmt(node.stmt)
+        self._break_targets.pop()
+        self._continue_targets.pop()
+
+        del self._label_break_targets[node.label]
+        del self._label_continue_targets[node.label]
+
+        if not self.builder.block.is_terminated:
+            self.builder.branch(ext)
+        self.builder.position_at_end(ext)
+
+    def _register_defer(self, node: 'DeferStmt'):
+        """Queue a deferred statement/expression to run before each return."""
+        self._defer_stack[-1].append(node.expr)
+
+    def _emit_defers(self):
+        """Emit all queued defer expressions/stmts (LIFO order)."""
+        if not self._defer_stack:
+            return
+        for item in reversed(self._defer_stack[-1]):
+            # If it's a statement node (e.g. PrintStmt), compile as stmt
+            if isinstance(item, (PrintStmt, IfStmt, ForStmt, WhileStmt,
+                                 AssignStmt, LetStmt, ExprStmt)):
+                self._compile_stmt(item)
+            else:
+                self._compile_expr(item)
+
+    def _compile_throw(self, node: 'ThrowStmt'):
+        """throw expr — set global error buffer and return zero."""
+        val, vt = self._compile_expr(node.value)
+        if vt != "str":
+            val = self._val_to_str(val, vt)
+        # Store message into error buffer via sprintf
+        ep0 = self.builder.gep(self._vx_error_buf,
+                               [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                               inbounds=True)
+        fmt = self._global_str("%s")
+        self.builder.call(self.sprintf_fn, [ep0, self._gstr_ptr(fmt), val])
+        # Return zero / void from current function
+        ret_ty = self.current_fn.ftype.return_type
+        if ret_ty == VOID_TY:
+            self.builder.ret_void()
+        else:
+            self.builder.ret(ir.Constant(ret_ty, 0))
+
+    def _compile_try_catch_finally(self, node: 'TryCatchFinally'):
+        fn = self.current_fn
+
+        # Clear error buffer
+        ep0 = self.builder.gep(self._vx_error_buf,
+                               [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                               inbounds=True)
+        self.builder.store(ir.Constant(I8_TY, 0), ep0)
+
+        # Compile try body
+        self._push_scope()
+        for s in node.try_body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(s)
+        self._pop_scope()
+
+        if self.builder.block.is_terminated:
+            return
+
+        # Check for error
+        first = self.builder.load(ep0)
+        has_err = self.builder.icmp_unsigned("!=", first, ir.Constant(I8_TY, 0))
+
+        after_b = fn.append_basic_block("try.after")
+
+        if node.catches:
+            catch_b = fn.append_basic_block("try.catch")
+            self.builder.cbranch(has_err, catch_b, after_b)
+            self.builder.position_at_end(catch_b)
+            err_ptr = ep0
+            for clause in node.catches:
+                self._push_scope()
+                al = self.builder.alloca(I8PTR, name=clause.var)
+                self.builder.store(err_ptr, al)
+                self._declare(clause.var, al, "str")
+                for s in clause.body:
+                    if self.builder.block.is_terminated: break
+                    self._compile_stmt(s)
+                self._pop_scope()
+                if not self.builder.block.is_terminated:
+                    break
+            if not self.builder.block.is_terminated:
+                self.builder.branch(after_b)
+        else:
+            self.builder.branch(after_b)
+
+        self.builder.position_at_end(after_b)
+
+        # Finally block always runs
+        if node.finally_body:
+            self._push_scope()
+            for s in node.finally_body:
+                if self.builder.block.is_terminated: break
+                self._compile_stmt(s)
+            self._pop_scope()
+
+    def _compile_struct_destructure(self, node: 'StructDestructure'):
+        val, vt = self._compile_expr(node.value)
+        struct_info = self._structs.get(vt)
+        if struct_info is None:
+            raise CodegenError(f"Cannot destructure non-struct type '{vt}'")
+        z = ir.Constant(I32_TY, 0)
+        for i, fname in enumerate(node.fields):
+            alias = node.aliases[i] if i < len(node.aliases) else None
+            bind_name = alias if alias else fname
+            field_idx = next((j for j, (fn, _) in enumerate(struct_info["fields"])
+                              if fn == fname), None)
+            if field_idx is None:
+                raise CodegenError(f"Struct '{vt}' has no field '{fname}'")
+            _, ftype = struct_info["fields"][field_idx]
+            fl_ty = self._vx_to_llvm(ftype)
+            fp = self.builder.gep(val, [z, ir.Constant(I32_TY, field_idx)], inbounds=True)
+            fval = self.builder.load(fp)
+            al = self.builder.alloca(fl_ty, name=bind_name)
+            self.builder.store(fval, al)
+            self._declare(bind_name, al, ftype)
+
+    def _compile_array_destructure(self, node: 'ArrayDestructure'):
+        arr_v, avt = self._compile_expr(node.value)
+        elem_vt = avt[:-2] if avt.endswith("[]") else "int"
+        elem_lt = self._vx_to_llvm(elem_vt)
+        dp = self._arr_data_ptr(arr_v, elem_lt)
+        for i, name in enumerate(node.names):
+            idx = ir.Constant(I64_TY, i)
+            ep  = self.builder.gep(dp, [idx], inbounds=True)
+            val = self.builder.load(ep)
+            al  = self.builder.alloca(elem_lt, name=name)
+            self.builder.store(val, al)
+            self._declare(name, al, elem_vt)
+        if node.rest_name:
+            # Create a new array containing elements from len(names) onwards
+            start_idx = len(node.names)
+            lp  = self.builder.gep(arr_v, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+            ln  = self.builder.load(lp)
+            rest_len = self.builder.sub(ln, ir.Constant(I64_TY, start_idx))
+            fn_h = self._get_helper("__vx_array_slice")
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            esz = ir.Constant(I64_TY, _elem_size(elem_vt))
+            sliced = self.builder.call(fn_h, [arr_raw, ir.Constant(I64_TY, start_idx), ln, esz])
+            sl_ptr = self.builder.bitcast(sliced, self.arr_ptr_type)
+            al = self.builder.alloca(self.arr_ptr_type, name=node.rest_name)
+            self.builder.store(sl_ptr, al)
+            self._declare(node.rest_name, al, avt)
+
     # ------------------------------------------------------------------ #
     #  Expressions                                                         #
     # ------------------------------------------------------------------ #
@@ -1453,10 +1767,27 @@ class Compiler:
             vx_t = self._resolve_type(info["vx_type"])
             return self.builder.load(info["ptr"], name=node.name), vx_t
 
-        if isinstance(node, BinOp):    return self._compile_binop(node)
-        if isinstance(node, UnaryOp):  return self._compile_unary(node)
-        if isinstance(node, Call):     return self._compile_call(node)
+        if isinstance(node, CharLiteral):
+            return ir.Constant(I64_TY, ord(node.value)), "int"
+
+        if isinstance(node, BinOp):      return self._compile_binop(node)
+        if isinstance(node, UnaryOp):    return self._compile_unary(node)
+        if isinstance(node, Call):       return self._compile_call(node)
         if isinstance(node, MethodCall): return self._compile_method_call(node)
+        if isinstance(node, NamedArg):   return self._compile_expr(node.value)
+        if isinstance(node, AwaitExpr):  return self._compile_expr(node.expr)
+
+        if isinstance(node, NullCoalesceExpr):
+            return self._compile_null_coalesce(node)
+
+        if isinstance(node, OptionalChainExpr):
+            return self._compile_optional_chain(node)
+
+        if isinstance(node, SliceExpr):
+            return self._compile_slice(node)
+
+        if isinstance(node, ListComp):
+            return self._compile_list_comp(node)
 
         if isinstance(node, TernaryExpr):
             return self._compile_ternary(node)
@@ -1540,6 +1871,196 @@ class Compiler:
     # ------------------------------------------------------------------ #
     #  Method calls                                                        #
     # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    #  Null coalesce / optional chain / slice / list comp                 #
+    # ------------------------------------------------------------------ #
+
+    def _compile_null_coalesce(self, node: 'NullCoalesceExpr') -> tuple[ir.Value, str]:
+        fn = self.current_fn
+        lv, lt = self._compile_expr(node.left)
+
+        not_null_b = fn.append_basic_block("nc.notnull")
+        null_b     = fn.append_basic_block("nc.null")
+        merge_b    = fn.append_basic_block("nc.merge")
+
+        li = self.builder.ptrtoint(lv, I64_TY) if lv.type == I8PTR.pointee or \
+             lv.type.is_pointer else self.builder.zext(lv, I64_TY)
+        # Simpler: use ptrtoint unconditionally via bitcast trick
+        lcast = self.builder.bitcast(lv, I8PTR) if lv.type != I8PTR else lv
+        li = self.builder.ptrtoint(lcast, I64_TY)
+        is_null = self.builder.icmp_unsigned("==", li, ir.Constant(I64_TY, 0))
+        self.builder.cbranch(is_null, null_b, not_null_b)
+
+        self.builder.position_at_end(not_null_b)
+        left_block = self.builder.block
+        left_val = lv
+        self.builder.branch(merge_b)
+
+        self.builder.position_at_end(null_b)
+        rv, rt = self._compile_expr(node.right)
+        right_block = self.builder.block
+        self.builder.branch(merge_b)
+
+        self.builder.position_at_end(merge_b)
+        result_t = rt if lt.endswith("?") else lt
+        ll_ty = self._vx_to_llvm(result_t)
+        phi = self.builder.phi(ll_ty)
+        phi.add_incoming(left_val, left_block)
+        phi.add_incoming(rv, right_block)
+        return phi, result_t
+
+    def _compile_optional_chain(self, node: 'OptionalChainExpr') -> tuple[ir.Value, str]:
+        fn = self.current_fn
+        obj_v, obj_t = self._compile_expr(node.obj)
+
+        null_b   = fn.append_basic_block("opt.null")
+        val_b    = fn.append_basic_block("opt.val")
+        merge_b  = fn.append_basic_block("opt.merge")
+
+        obj_i = self.builder.ptrtoint(obj_v, I64_TY)
+        is_null = self.builder.icmp_unsigned("==", obj_i, ir.Constant(I64_TY, 0))
+        self.builder.cbranch(is_null, null_b, val_b)
+
+        self.builder.position_at_end(null_b)
+        null_block = self.builder.block
+        self.builder.branch(merge_b)
+
+        self.builder.position_at_end(val_b)
+        base_t = obj_t[:-1] if obj_t.endswith("?") else obj_t
+        struct_info = self._structs.get(base_t)
+        if struct_info:
+            z = ir.Constant(I32_TY, 0)
+            fi = next((i for i,(fn2,_) in enumerate(struct_info["fields"]) if fn2==node.field), 0)
+            _, ftype = struct_info["fields"][fi]
+            fl_ty = self._vx_to_llvm(ftype)
+            fp = self.builder.gep(obj_v, [z, ir.Constant(I32_TY, fi)], inbounds=True)
+            fval = self.builder.load(fp)
+            result_t = ftype + "?"
+        else:
+            fval = obj_v
+            result_t = "int?"
+        val_block = self.builder.block
+        self.builder.branch(merge_b)
+
+        self.builder.position_at_end(merge_b)
+        phi = self.builder.phi(I8PTR)
+        phi.add_incoming(ir.Constant(I8PTR, None), null_block)
+        # Box the field value
+        if result_t != "int?":
+            box = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 8)])
+        else:
+            box = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 8)])
+        phi.add_incoming(box, val_block)
+        return phi, result_t
+
+    def _compile_slice(self, node: 'SliceExpr') -> tuple[ir.Value, str]:
+        obj_v, obj_t = self._compile_expr(node.obj)
+        start_v = ir.Constant(I64_TY, 0) if node.start is None else self._compile_expr(node.start)[0]
+        if obj_t == "str":
+            end_v = self.builder.call(self.strlen_fn, [obj_v]) if node.end is None \
+                    else self._compile_expr(node.end)[0]
+            if node.inclusive:
+                end_v = self.builder.add(end_v, ir.Constant(I64_TY, 1))
+            length = self.builder.sub(end_v, start_v)
+            buf = self.builder.call(self.malloc_fn, [self.builder.add(length, ir.Constant(I64_TY, 1))])
+            src = self.builder.gep(obj_v, [start_v], inbounds=False)
+            self.builder.call(self.memcpy_fn, [buf, src, length])
+            null_p = self.builder.gep(buf, [length], inbounds=False)
+            self.builder.store(ir.Constant(I8_TY, 0), null_p)
+            return buf, "str"
+        else:
+            # Array slice
+            lp  = self.builder.gep(obj_v, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+            arr_len = self.builder.load(lp)
+            end_v = arr_len if node.end is None else self._compile_expr(node.end)[0]
+            if node.inclusive:
+                end_v = self.builder.add(end_v, ir.Constant(I64_TY, 1))
+            elem_vt = obj_t[:-2] if obj_t.endswith("[]") else "int"
+            esz = ir.Constant(I64_TY, _elem_size(elem_vt))
+            fn_h = self._get_helper("__vx_array_slice")
+            arr_raw = self.builder.bitcast(obj_v, I8PTR)
+            sliced = self.builder.call(fn_h, [arr_raw, start_v, end_v, esz])
+            sl_ptr = self.builder.bitcast(sliced, self.arr_ptr_type)
+            return sl_ptr, obj_t
+
+    def _compile_list_comp(self, node: 'ListComp') -> tuple[ir.Value, str]:
+        """[expr for var in iterable if cond]  →  build new array."""
+        fn = self.current_fn
+        arr_v, avt = self._compile_expr(node.iterable)
+        elem_vt = avt[:-2] if avt.endswith("[]") else "int"
+        elem_lt = self._vx_to_llvm(elem_vt)
+        esz     = ir.Constant(I64_TY, _elem_size(elem_vt))
+
+        # Infer result element type from the map expression
+        # We'll build an array with same capacity as input
+        cap_sz = ir.Constant(I64_TY, 8)
+        result_arr_raw = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        result_arr = self.builder.bitcast(result_arr_raw, self.arr_ptr_type)
+
+        # Init result array: data=malloc(8*8), len=0, cap=8
+        init_data = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        z = ir.Constant(I32_TY, 0)
+        dp_sl = self.builder.gep(result_arr, [z, z], inbounds=True)
+        self.builder.store(init_data, dp_sl)
+        lp_sl = self.builder.gep(result_arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, 0), lp_sl)
+        cp_sl = self.builder.gep(result_arr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, 8), cp_sl)
+
+        # Loop over input array
+        src_lp   = self.builder.gep(arr_v, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        src_len  = self.builder.load(src_lp)
+        i_al = self.builder.alloca(I64_TY, name="_lc_i")
+        self.builder.store(ir.Constant(I64_TY, 0), i_al)
+
+        chk = fn.append_basic_block("lc.check")
+        bdy = fn.append_basic_block("lc.body")
+        ext = fn.append_basic_block("lc.exit")
+
+        self.builder.branch(chk)
+        self.builder.position_at_end(chk)
+        iv = self.builder.load(i_al)
+        cond = self.builder.icmp_signed("<", iv, src_len)
+        self.builder.cbranch(cond, bdy, ext)
+
+        self.builder.position_at_end(bdy)
+        self._push_scope()
+        src_dp = self._arr_data_ptr(arr_v, elem_lt)
+        ep     = self.builder.gep(src_dp, [iv], inbounds=True)
+        item   = self.builder.load(ep)
+        item_al = self.builder.alloca(elem_lt, name=node.var)
+        self.builder.store(item, item_al)
+        self._declare(node.var, item_al, elem_vt)
+
+        do_push = fn.append_basic_block("lc.push")
+        skip_b  = fn.append_basic_block("lc.skip")
+
+        if node.condition:
+            cv, _ = self._compile_expr(node.condition)
+            self.builder.cbranch(cv, do_push, skip_b)
+        else:
+            self.builder.branch(do_push)
+
+        self.builder.position_at_end(do_push)
+        map_val, _ = self._compile_expr(node.expr)
+        map_al  = self.builder.alloca(elem_lt)
+        self.builder.store(map_val, map_al)
+        map_raw = self.builder.bitcast(map_al, I8PTR)
+        res_raw = self.builder.bitcast(result_arr, I8PTR)
+        fn_h = self._get_helper("__vx_array_push")
+        self.builder.call(fn_h, [res_raw, map_raw, esz])
+        self.builder.branch(skip_b)
+
+        self.builder.position_at_end(skip_b)
+        self._pop_scope()
+        ic   = self.builder.load(i_al)
+        inxt = self.builder.add(ic, ir.Constant(I64_TY, 1))
+        self.builder.store(inxt, i_al)
+        self.builder.branch(chk)
+
+        self.builder.position_at_end(ext)
+        return result_arr, elem_vt + "[]"
 
     def _compile_method_call(self, node: MethodCall) -> tuple[ir.Value, str]:
         # Namespace call: ns.func(args) where ns is a known namespace alias
@@ -1638,6 +2159,34 @@ class Compiler:
             arr_ptr = self.builder.bitcast(raw, self.arr_ptr_type)
             return arr_ptr, "str[]"
 
+        if method == "find":
+            sub_v, _ = self._compile_expr(args[0])
+            fn_h = self._get_helper("__vx_str_find")
+            return self.builder.call(fn_h, [s, sub_v]), "int"
+
+        if method == "slice":
+            start_v, _ = self._compile_expr(args[0])
+            end_v, _   = self._compile_expr(args[1])
+            fn_h = self._get_helper("__vx_str_slice")
+            return self.builder.call(fn_h, [s, start_v, end_v]), "str"
+
+        if method == "repeat":
+            n_v, _ = self._compile_expr(args[0])
+            fn_h = self._get_helper("__vx_str_repeat")
+            return self.builder.call(fn_h, [s, n_v]), "str"
+
+        if method == "char_at":
+            idx_v, _ = self._compile_expr(args[0])
+            cp = self.builder.gep(s, [idx_v], inbounds=False)
+            ch = self.builder.load(cp)
+            return self.builder.zext(ch, I64_TY), "int"
+
+        if method == "to_int":
+            return self.builder.call(self.atoll_fn, [s]), "int"
+
+        if method == "to_float":
+            return self.builder.call(self.atof_fn, [s]), "float"
+
         raise CodegenError(f"Unknown string method '{method}'")
 
     def _compile_arr_method(self, arr_v: ir.Value, arr_t: str, elem_vt: str,
@@ -1688,6 +2237,51 @@ class Compiler:
             self.builder.call(fn_h, [arr_raw, esz])
             return ir.Constant(I64_TY, 0), "void"
 
+        if method == "sort":
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_sort_i64") if elem_vt == "int" \
+                   else self._get_helper("__vx_array_sort_f64")
+            self.builder.call(fn_h, [arr_raw])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if method == "index_of":
+            elem_v, ev_t = self._compile_expr(args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            if elem_vt == "int":
+                fn_h = self._get_helper("__vx_array_index_of_i64")
+                return self.builder.call(fn_h, [arr_raw, elem_v]), "int"
+            fn_h = self._get_helper("__vx_array_index_of_str")
+            return self.builder.call(fn_h, [arr_raw, elem_v]), "int"
+
+        if method == "join" and elem_vt == "str":
+            sep_v, _ = self._compile_expr(args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_join_str")
+            return self.builder.call(fn_h, [arr_raw, sep_v]), "str"
+
+        if method == "slice":
+            start_v, _ = self._compile_expr(args[0])
+            end_v, _   = self._compile_expr(args[1])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_slice")
+            sliced = self.builder.call(fn_h, [arr_raw, start_v, end_v, esz])
+            return self.builder.bitcast(sliced, self.arr_ptr_type), arr_t
+
+        if method == "map":
+            # arr.map(fn) — returns new array applying fn to each element
+            fn_v, _ = self._compile_expr(args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_map_i64")
+            result = self.builder.call(fn_h, [arr_raw, fn_v])
+            return self.builder.bitcast(result, self.arr_ptr_type), arr_t
+
+        if method == "filter":
+            fn_v, _ = self._compile_expr(args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_filter_i64")
+            result = self.builder.call(fn_h, [arr_raw, fn_v])
+            return self.builder.bitcast(result, self.arr_ptr_type), arr_t
+
         raise CodegenError(f"Unknown array method '{method}'")
 
     # ------------------------------------------------------------------ #
@@ -1709,12 +2303,23 @@ class Compiler:
             "__vx_str_ends_with":        self._build_str_ends_with,
             "__vx_str_replace":          self._build_str_replace,
             "__vx_str_split":            self._build_str_split,
+            "__vx_str_find":             self._build_str_find,
+            "__vx_str_slice":            self._build_str_slice,
+            "__vx_str_repeat":           self._build_str_repeat,
             "__vx_array_push":           self._build_array_push,
             "__vx_array_pop":            self._build_array_pop,
             "__vx_array_contains_i64":   self._build_array_contains_i64,
             "__vx_array_contains_f64":   self._build_array_contains_f64,
             "__vx_array_contains_str":   self._build_array_contains_str,
             "__vx_array_reverse":        self._build_array_reverse,
+            "__vx_array_sort_i64":       self._build_array_sort_i64,
+            "__vx_array_sort_f64":       self._build_array_sort_f64,
+            "__vx_array_index_of_i64":   self._build_array_index_of_i64,
+            "__vx_array_index_of_str":   self._build_array_index_of_str,
+            "__vx_array_join_str":       self._build_array_join_str,
+            "__vx_array_slice":          self._build_array_slice,
+            "__vx_array_map_i64":        self._build_array_map_i64,
+            "__vx_array_filter_i64":     self._build_array_filter_i64,
             "__vx_file_read":            self._build_file_read,
             "__vx_file_write":           self._build_file_write,
             "__vx_file_append":          self._build_file_append,
@@ -1731,6 +2336,31 @@ class Compiler:
             "__vx_time_format":          self._build_time_format,
             "__vx_input":                self._build_input,
             "__vx_os_list_dir":          self._build_os_list_dir,
+            # v7 helpers
+            "__vx_base64_encode":        self._build_base64_encode,
+            "__vx_base64_decode":        self._build_base64_decode,
+            "__vx_uuid_v4":              self._build_uuid_v4,
+            "__vx_sha256":               self._build_sha256,
+            "__vx_argv":                 self._build_argv,
+            "__vx_shell":                self._build_shell,
+            "__vx_csv_parse":            self._build_csv_parse,
+            "__vx_assert_eq":            self._build_assert_eq,
+            "__vx_str_join":             self._build_str_join,
+            "__vx_str_starts_with":      self._build_str_starts_with,
+            "__vx_str_char_at":          self._build_str_char_at,
+            "__vx_env_set":              self._build_env_set,
+            "__vx_thread_spawn":         self._build_thread_spawn,
+            "__vx_thread_join":          self._build_thread_join,
+            "__vx_thread_sleep":         self._build_thread_sleep,
+            "__vx_mutex_new":            self._build_mutex_new,
+            "__vx_mutex_lock":           self._build_mutex_lock,
+            "__vx_mutex_unlock":         self._build_mutex_unlock,
+            "__vx_str_char_len":         self._build_str_char_len,
+            "__vx_str_char_at_utf8":     self._build_str_char_at_utf8,
+            "__vx_json_stringify_int":   self._build_json_stringify_int,
+            "__vx_json_stringify_float": self._build_json_stringify_float,
+            "__vx_json_stringify_str":   self._build_json_stringify_str,
+            "__vx_http_get":             self._build_http_get,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -2524,6 +3154,28 @@ class Compiler:
             f_op, i_op = arith[op]
             return (f_op(lv, rv) if is_float else i_op(lv, rv)), lt
 
+        # Power operator: x ** y  → pow(x, y)
+        if op == "**":
+            if not is_float:
+                lv = self.builder.sitofp(lv, F64_TY)
+                rv = self.builder.sitofp(rv, F64_TY)
+            result = self.builder.call(self.pow_fn, [lv, rv])
+            if lt == "int":
+                return self.builder.fptosi(result, I64_TY), "int"
+            return result, "float"
+
+        # Bitwise operators (integers only)
+        if op == "&":
+            return self.builder.and_(lv, rv), lt
+        if op == "|":
+            return self.builder.or_(lv, rv), lt
+        if op == "^":
+            return self.builder.xor(lv, rv), lt
+        if op == "<<":
+            return self.builder.shl(lv, rv), lt
+        if op == ">>":
+            return self.builder.ashr(lv, rv), lt
+
         raise CodegenError(f"Unknown binary op: {op!r}")
 
     def _compile_and(self, node: BinOp):
@@ -2605,6 +3257,9 @@ class Compiler:
         if node.op == "not":
             bv = self.builder.trunc(val, I1_TY) if val.type != I1_TY else val
             return self.builder.not_(bv), "bool"
+        if node.op == "~":
+            # Bitwise NOT: XOR with all-ones
+            return self.builder.xor(val, ir.Constant(I64_TY, -1)), "int"
         raise CodegenError(f"Unknown unary op: {node.op!r}")
 
     # ------------------------------------------------------------------ #
@@ -2909,6 +3564,463 @@ class Compiler:
             raw = self.builder.call(fn_h, [path_v])
             return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
 
+        # --- v7 Environment / OS ---
+        if name == "argv":
+            fn_h = self._get_helper("__vx_argv")
+            raw = self.builder.call(fn_h, [])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
+
+        if name == "env_get":
+            key_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self.getenv_fn, [key_v]), "str"
+
+        if name == "env_set":
+            key_v, _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_env_set")
+            self.builder.call(fn_h, [key_v, val_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "shell":
+            cmd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_shell")
+            return self.builder.call(fn_h, [cmd_v]), "str"
+
+        # --- v7 Math extras ---
+        if name == "log10":
+            val, vt = self._compile_expr(node.args[0])
+            if vt == "int": val = self.builder.sitofp(val, F64_TY)
+            return self.builder.call(self.log10_fn, [val]), "float"
+
+        if name == "exp":
+            val, vt = self._compile_expr(node.args[0])
+            if vt == "int": val = self.builder.sitofp(val, F64_TY)
+            return self.builder.call(self.exp_fn, [val]), "float"
+
+        if name == "hypot":
+            av, at = self._compile_expr(node.args[0])
+            bv, bt = self._compile_expr(node.args[1])
+            if at == "int": av = self.builder.sitofp(av, F64_TY)
+            if bt == "int": bv = self.builder.sitofp(bv, F64_TY)
+            return self.builder.call(self.hypot_fn, [av, bv]), "float"
+
+        # --- v7 String methods ---
+        if name == "str_find":
+            haystack_v, _ = self._compile_expr(node.args[0])
+            needle_v,   _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_find")
+            return self.builder.call(fn_h, [haystack_v, needle_v]), "int"
+
+        if name == "str_slice":
+            s_v, _ = self._compile_expr(node.args[0])
+            start_v, _ = self._compile_expr(node.args[1])
+            end_v,   _ = self._compile_expr(node.args[2])
+            fn_h = self._get_helper("__vx_str_slice")
+            return self.builder.call(fn_h, [s_v, start_v, end_v]), "str"
+
+        if name == "str_repeat":
+            s_v, _ = self._compile_expr(node.args[0])
+            n_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_repeat")
+            return self.builder.call(fn_h, [s_v, n_v]), "str"
+
+        if name == "str_replace":
+            s_v,   _ = self._compile_expr(node.args[0])
+            old_v, _ = self._compile_expr(node.args[1])
+            new_v, _ = self._compile_expr(node.args[2])
+            fn_h = self._get_helper("__vx_str_replace")
+            return self.builder.call(fn_h, [s_v, old_v, new_v]), "str"
+
+        if name == "str_upper":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_str_upper")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "str_lower":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_str_lower")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "str_trim":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_str_trim")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "str_starts_with":
+            s_v,      _ = self._compile_expr(node.args[0])
+            prefix_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_starts_with")
+            return self.builder.call(fn_h, [s_v, prefix_v]), "bool"
+
+        if name == "str_ends_with":
+            s_v,      _ = self._compile_expr(node.args[0])
+            suffix_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_ends_with")
+            return self.builder.call(fn_h, [s_v, suffix_v]), "bool"
+
+        if name == "str_split":
+            s_v,   _ = self._compile_expr(node.args[0])
+            delim_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_split")
+            raw = self.builder.call(fn_h, [s_v, delim_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
+
+        if name == "str_contains":
+            s_v,      _ = self._compile_expr(node.args[0])
+            needle_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_find")
+            idx = self.builder.call(fn_h, [s_v, needle_v])
+            return self.builder.icmp_signed(">=", idx, ir.Constant(I64_TY, 0)), "bool"
+
+        if name == "char_at":
+            s_v, _ = self._compile_expr(node.args[0])
+            i_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_char_at")
+            return self.builder.call(fn_h, [s_v, i_v]), "str"
+
+        if name == "char_to_int":
+            s_v, _ = self._compile_expr(node.args[0])
+            # Load first byte
+            ch = self.builder.load(s_v)
+            return self.builder.zext(ch, I64_TY), "int"
+
+        if name == "int_to_char":
+            i_v, _ = self._compile_expr(node.args[0])
+            buf = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 2)])
+            ch  = self.builder.trunc(i_v, I8_TY)
+            self.builder.store(ch, buf)
+            nul_ptr = self.builder.gep(buf, [ir.Constant(I64_TY, 1)], inbounds=False)
+            self.builder.store(ir.Constant(I8_TY, 0), nul_ptr)
+            return buf, "str"
+
+        if name == "to_int":
+            s_v, vt = self._compile_expr(node.args[0])
+            if vt == "str":   return self.builder.call(self.atoll_fn, [s_v]), "int"
+            if vt == "float": return self.builder.fptosi(s_v, I64_TY), "int"
+            return s_v, "int"
+
+        if name == "to_float":
+            s_v, vt = self._compile_expr(node.args[0])
+            if vt == "str":   return self.builder.call(self.atof_fn, [s_v]), "float"
+            if vt == "int":   return self.builder.sitofp(s_v, F64_TY), "float"
+            return s_v, "float"
+
+        # --- v7 Array methods ---
+        if name == "array_sort":
+            arr_v, at = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            elem_type = at[:-2] if at.endswith("[]") else "int"
+            if elem_type == "float":
+                fn_h = self._get_helper("__vx_array_sort_f64")
+            else:
+                fn_h = self._get_helper("__vx_array_sort_i64")
+            self.builder.call(fn_h, [arr_raw])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "array_index_of":
+            arr_v, at = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            elem_v, _ = self._compile_expr(node.args[1])
+            elem_type = at[:-2] if at.endswith("[]") else "int"
+            if elem_type == "str":
+                fn_h = self._get_helper("__vx_array_index_of_str")
+            else:
+                fn_h = self._get_helper("__vx_array_index_of_i64")
+            return self.builder.call(fn_h, [arr_raw, elem_v]), "int"
+
+        if name == "array_join":
+            arr_v, _ = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            sep_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_array_join_str")
+            return self.builder.call(fn_h, [arr_raw, sep_v]), "str"
+
+        if name == "array_reverse":
+            arr_v, at = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            fn_h = self._get_helper("__vx_array_reverse")
+            self.builder.call(fn_h, [arr_raw])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "array_contains":
+            arr_v, at = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            elem_v, _ = self._compile_expr(node.args[1])
+            elem_type = at[:-2] if at.endswith("[]") else "int"
+            if elem_type == "str":
+                fn_h = self._get_helper("__vx_array_index_of_str")
+            else:
+                fn_h = self._get_helper("__vx_array_index_of_i64")
+            idx = self.builder.call(fn_h, [arr_raw, elem_v])
+            return self.builder.icmp_signed(">=", idx, ir.Constant(I64_TY, 0)), "bool"
+
+        if name == "array_slice":
+            arr_v, at = self._compile_expr(node.args[0])
+            arr_raw = self.builder.bitcast(arr_v, I8PTR)
+            start_v,  _ = self._compile_expr(node.args[1])
+            end_v,    _ = self._compile_expr(node.args[2])
+            elem_type = at[:-2] if at.endswith("[]") else "int"
+            esz = ir.Constant(I64_TY, _elem_size(elem_type))
+            fn_h = self._get_helper("__vx_array_slice")
+            raw = self.builder.call(fn_h, [arr_raw, start_v, end_v, esz])
+            return self.builder.bitcast(raw, self.arr_ptr_type), at
+
+        # --- v7 Base64 ---
+        if name == "base64_encode":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_base64_encode")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "base64_decode":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_base64_decode")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        # --- v7 UUID ---
+        if name == "uuid_v4":
+            fn_h = self._get_helper("__vx_uuid_v4")
+            return self.builder.call(fn_h, []), "str"
+
+        # --- v7 Hashing ---
+        if name == "sha256":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_sha256")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        # --- v7 CSV ---
+        if name == "csv_parse":
+            s_v,   _ = self._compile_expr(node.args[0])
+            delim_v, _ = (self._compile_expr(node.args[1])
+                          if len(node.args) > 1
+                          else (self._gstr_ptr(self._global_str(",")), "str"))
+            fn_h = self._get_helper("__vx_csv_parse")
+            raw = self.builder.call(fn_h, [s_v, delim_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[][]"
+
+        # --- v7 Test assertions ---
+        if name == "assert_eq":
+            av, at = self._compile_expr(node.args[0])
+            bv, bt = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_assert_eq")
+            self.builder.call(fn_h, [av, bv])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "assert_neq":
+            av, _ = self._compile_expr(node.args[0])
+            bv, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_assert_eq")
+            # assert_neq: invert — if equal, fail
+            cmp = self.builder.icmp_signed("==", av, bv)
+            fn_bb   = self.current_fn
+            fail_b  = fn_bb.append_basic_block("aneq.fail")
+            pass_b  = fn_bb.append_basic_block("aneq.pass")
+            self.builder.cbranch(cmp, fail_b, pass_b)
+            self.builder.position_at_end(fail_b)
+            fmt_gv = self._global_str("FAIL: assert_neq values are equal\n")
+            self.builder.call(self.printf, [self._gstr_ptr(fmt_gv)])
+            self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+            self.builder.branch(pass_b)
+            self.builder.position_at_end(pass_b)
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "assert_true":
+            cond_v, _ = self._compile_expr(node.args[0])
+            if cond_v.type != I1_TY:
+                cond_v = self.builder.trunc(cond_v, I1_TY)
+            fn_bb  = self.current_fn
+            fail_b = fn_bb.append_basic_block("atrue.fail")
+            pass_b = fn_bb.append_basic_block("atrue.pass")
+            self.builder.cbranch(cond_v, pass_b, fail_b)
+            self.builder.position_at_end(fail_b)
+            fmt_gv = self._global_str("FAIL: assert_true got false\n")
+            self.builder.call(self.printf, [self._gstr_ptr(fmt_gv)])
+            self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+            self.builder.branch(pass_b)
+            self.builder.position_at_end(pass_b)
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "assert_false":
+            cond_v, _ = self._compile_expr(node.args[0])
+            if cond_v.type != I1_TY:
+                cond_v = self.builder.trunc(cond_v, I1_TY)
+            fn_bb  = self.current_fn
+            fail_b = fn_bb.append_basic_block("afalse.fail")
+            pass_b = fn_bb.append_basic_block("afalse.pass")
+            self.builder.cbranch(cond_v, fail_b, pass_b)
+            self.builder.position_at_end(fail_b)
+            fmt_gv = self._global_str("FAIL: assert_false got true\n")
+            self.builder.call(self.printf, [self._gstr_ptr(fmt_gv)])
+            self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+            self.builder.branch(pass_b)
+            self.builder.position_at_end(pass_b)
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v7 Type queries ---
+        if name == "type_of":
+            _, vt = self._compile_expr(node.args[0])
+            return self._gstr_ptr(self._global_str(vt)), "str"
+
+        if name == "is_null":
+            val, vt = self._compile_expr(node.args[0])
+            null_int = ir.Constant(I64_TY, 0)
+            ptr_int  = self.builder.ptrtoint(val, I64_TY)
+            return self.builder.icmp_unsigned("==", ptr_int, null_int), "bool"
+
+        # --- Atomic operations (#52) — lowered to LLVM atomicrmw/cmpxchg ---
+        if name == "atomic_new":
+            # atomic_new(val) — allocate an i64 on the heap and store val
+            init_v, _ = self._compile_expr(node.args[0])
+            if init_v.type != I64_TY:
+                init_v = self.builder.sext(init_v, I64_TY)
+            ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 8)])
+            i64_ptr = self.builder.bitcast(ptr, ir.PointerType(I64_TY))
+            self.builder.store(init_v, i64_ptr)
+            return ptr, "int?"   # store as i8* (opaque atomic pointer)
+
+        if name == "atomic_load":
+            ptr_v, _ = self._compile_expr(node.args[0])
+            i64_ptr  = self.builder.bitcast(ptr_v, ir.PointerType(I64_TY))
+            result   = self.builder.load(i64_ptr)
+            result.atomic = "seq_cst"
+            return result, "int"
+
+        if name == "atomic_store":
+            ptr_v, _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            if val_v.type != I64_TY:
+                val_v = self.builder.sext(val_v, I64_TY)
+            i64_ptr = self.builder.bitcast(ptr_v, ir.PointerType(I64_TY))
+            st = self.builder.store(val_v, i64_ptr)
+            st.atomic = "seq_cst"
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "atomic_add":
+            ptr_v, _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            if val_v.type != I64_TY:
+                val_v = self.builder.sext(val_v, I64_TY)
+            i64_ptr = self.builder.bitcast(ptr_v, ir.PointerType(I64_TY))
+            return self.builder.atomic_rmw("add", i64_ptr, val_v, "seq_cst"), "int"
+
+        if name == "atomic_sub":
+            ptr_v, _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            if val_v.type != I64_TY:
+                val_v = self.builder.sext(val_v, I64_TY)
+            i64_ptr = self.builder.bitcast(ptr_v, ir.PointerType(I64_TY))
+            return self.builder.atomic_rmw("sub", i64_ptr, val_v, "seq_cst"), "int"
+
+        if name == "atomic_compare_swap":
+            ptr_v,      _ = self._compile_expr(node.args[0])
+            expected_v, _ = self._compile_expr(node.args[1])
+            desired_v,  _ = self._compile_expr(node.args[2])
+            for v in [expected_v, desired_v]:
+                if v.type != I64_TY:
+                    v = self.builder.sext(v, I64_TY)
+            i64_ptr = self.builder.bitcast(ptr_v, ir.PointerType(I64_TY))
+            res = self.builder.cmpxchg(i64_ptr, expected_v, desired_v, "seq_cst", "seq_cst")
+            return self.builder.extract_value(res, 1), "bool"
+
+        # --- Threads (#49) — wrap pthreads on POSIX, _beginthread on Windows ---
+        if name == "thread_spawn":
+            fn_h = self._get_helper("__vx_thread_spawn")
+            fn_v, _ = self._compile_expr(node.args[0])
+            # fn_v should be an i8* function pointer
+            if fn_v.type != I8PTR:
+                fn_v = self.builder.bitcast(fn_v, I8PTR)
+            return self.builder.call(fn_h, [fn_v]), "int"
+
+        if name == "thread_join":
+            fn_h = self._get_helper("__vx_thread_join")
+            tid_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(fn_h, [tid_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "thread_sleep":
+            fn_h = self._get_helper("__vx_thread_sleep")
+            ms_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(fn_h, [ms_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- Mutex (#50) ---
+        if name == "mutex_new":
+            fn_h = self._get_helper("__vx_mutex_new")
+            return self.builder.call(fn_h, []), "int?"
+
+        if name == "mutex_lock":
+            fn_h = self._get_helper("__vx_mutex_lock")
+            mu_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(fn_h, [mu_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "mutex_unlock":
+            fn_h = self._get_helper("__vx_mutex_unlock")
+            mu_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(fn_h, [mu_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- str_format (printf-style, #4 stdlib) ---
+        if name == "str_format":
+            fmt_v, _ = self._compile_expr(node.args[0])
+            # Build a 1KB output buffer and use sprintf
+            buf = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 1024)])
+            # Pass remaining args variardically through sprintf
+            call_args = [buf, fmt_v]
+            for arg in node.args[1:]:
+                av, at = self._compile_expr(arg)
+                call_args.append(av)
+            self.builder.call(self.sprintf_fn, call_args)
+            return buf, "str"
+
+        # --- JSON basic support (#4 stdlib) ---
+        if name == "json_stringify_int":
+            val_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_json_stringify_int")
+            return self.builder.call(fn_h, [val_v]), "str"
+
+        if name == "json_stringify_float":
+            val_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_json_stringify_float")
+            return self.builder.call(fn_h, [val_v]), "str"
+
+        if name == "json_stringify_str":
+            val_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_json_stringify_str")
+            return self.builder.call(fn_h, [val_v]), "str"
+
+        # --- HTTP basic (#4 stdlib) ---
+        if name == "http_get":
+            url_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_http_get")
+            return self.builder.call(fn_h, [url_v]), "str"
+
+        # --- Unicode helpers (#45) ---
+        if name == "str_char_len":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_str_char_len")
+            return self.builder.call(fn_h, [s_v]), "int"
+
+        if name == "str_char_at":
+            s_v, _ = self._compile_expr(node.args[0])
+            i_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_str_char_at_utf8")
+            return self.builder.call(fn_h, [s_v, i_v]), "int"
+
+        # --- Result/Option type helpers (#14) ---
+        if name in ("Ok", "Some"):
+            # Ok(val) — return the value directly (no boxing in this impl)
+            val_v, vt = self._compile_expr(node.args[0])
+            return val_v, vt
+
+        if name in ("Err", "None_"):
+            # Err(msg) — return null/zero as error sentinel
+            if node.args:
+                val_v, vt = self._compile_expr(node.args[0])
+                return val_v, vt
+            return ir.Constant(I64_TY, 0), "null"
+
+        # --- ADT enum constructor calls: EnumName.Variant(...) handled via FieldAccess at call site ---
+
         # --- Generic function monomorphization ---
         if name in self.analysis.generic_fns:
             return self._compile_generic_call(node)
@@ -3069,7 +4181,11 @@ class Compiler:
     # ------------------------------------------------------------------ #
 
     def _compile_lambda(self, node: LambdaExpr) -> tuple[ir.Value, str]:
-        """Compile a lambda expression. Returns (fn_ptr as i8*, fn_type_str)."""
+        """Compile a lambda with closure capture.
+        Captures free variables from the outer scope into a heap env struct,
+        passes env as a hidden last parameter (i8*).
+        Returns (i8* fn_ptr, fn_type_str).
+        """
         lname = f"__lambda_{self._lambda_count}"
         self._lambda_count += 1
 
@@ -3077,30 +4193,155 @@ class Compiler:
         ret_vx = node.ret_type or "void"
         fn_type_str = f"fn({','.join(param_vx_types)})->{ret_vx}"
 
-        # Build a concrete FnDecl and compile it
-        import copy as _copy
-        decl = FnDecl(lname, node.params, node.ret_type, node.body)
+        # --- Find free variables in the lambda body ---
+        param_names = {p.name for p in node.params}
+        captures = self._find_free_vars(node.body, param_names)
+        # captures: list of (name, vx_type, alloca_ptr, ll_type)
+
+        # --- Build closure env struct type ---
+        env_fields = [(vx_t, ll_t) for (_, vx_t, _, ll_t) in captures]
+
+        # --- Allocate closure env on the heap ---
+        if captures:
+            total_sz = sum(8 for _ in captures)   # fixed 8 bytes per slot (simplification)
+            env_ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, total_sz)])
+            # Store captured values into env
+            for i, (name, vx_t, src_al, ll_t) in enumerate(captures):
+                val = self.builder.load(src_al)
+                # Store as i64/i8* for uniform size
+                slot_ptr = self.builder.gep(env_ptr, [ir.Constant(I64_TY, i * 8)], inbounds=False)
+                typed_ptr = self.builder.bitcast(slot_ptr, ir.PointerType(ll_t))
+                if ll_t.width < 64 if isinstance(ll_t, ir.IntType) else False:
+                    val = self.builder.sext(val, I64_TY)
+                    self.builder.store(val, self.builder.bitcast(slot_ptr, ir.PointerType(I64_TY)))
+                else:
+                    self.builder.store(val, typed_ptr)
+        else:
+            env_ptr = ir.Constant(I8PTR, None)
+
+        # --- Compile the lambda function with env param ---
+        # Add hidden "__env" param of type i8*
+        env_param = Param("__env", "str")  # i8* aliased as str
+        full_params = list(node.params) + [env_param]
+        decl = FnDecl(lname, full_params, node.ret_type, node.body)
+
         from compiler.analyzer import FnSig as _FnSig
         self.analysis.fn_sigs[lname] = _FnSig(
-            [(p.name, p.type_name) for p in node.params], ret_vx
+            [(p.name, p.type_name) for p in full_params], ret_vx
         )
-        self._fn_defaults[lname] = [None] * len(node.params)
+        self._fn_defaults[lname] = [None] * len(full_params)
 
-        # Compile in saved context
+        # Compile in saved context, but inject captures into scope
         saved_builder  = self.builder
         saved_fn       = self.current_fn
         saved_scopes   = self._scope_stack
+
         self._scope_stack = [{}]
         self._declare_fn(decl)
-        self._compile_fn(decl)
+
+        # Override compile to inject captured vars from env arg
+        fn_ir = self._functions[lname]["fn"]
+        old_b = self.builder
+        old_fn = self.current_fn
+        self.current_fn = fn_ir
+        entry_b = fn_ir.append_basic_block("entry")
+        self.builder = ir.IRBuilder(entry_b)
+        self._push_scope()
+        self._defer_stack.append([])
+        # Bind params
+        for i, p in enumerate(node.params):
+            al = self.builder.alloca(self._vx_to_llvm(p.type_name), name=p.name)
+            self.builder.store(fn_ir.args[i], al)
+            self._declare(p.name, al, p.type_name)
+        # Unpack captured vars from env arg (last param)
+        if captures:
+            env_arg = fn_ir.args[-1]
+            for i, (name, vx_t, _src_al, ll_t) in enumerate(captures):
+                slot_ptr = self.builder.gep(env_arg, [ir.Constant(I64_TY, i * 8)], inbounds=False)
+                typed_ptr = self.builder.bitcast(slot_ptr, ir.PointerType(ll_t))
+                cap_al = self.builder.alloca(ll_t, name=f"cap_{name}")
+                val = self.builder.load(typed_ptr)
+                self.builder.store(val, cap_al)
+                self._declare(name, cap_al, vx_t)
+        # Compile body
+        for stmt in node.body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(stmt)
+        self._emit_defers()
+        self._defer_stack.pop()
+        if not self.builder.block.is_terminated:
+            if ret_vx == "void":
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(self._vx_to_llvm(ret_vx), 0))
+        self._pop_scope()
+
         self.builder      = saved_builder
         self.current_fn   = saved_fn
         self._scope_stack = saved_scopes
 
-        # Return pointer to the function cast to i8*
-        fn_ir = self._functions[lname]["fn"]
+        # --- Build a closure struct: {fn_ptr: i8*, env: i8*} on the heap ---
+        # For now, just return the fn_ptr cast to i8* and store env separately
+        # Since we can't easily pass env through the fn(int)->int type signature,
+        # we use a trampoline approach: when no captures, return fn directly.
         fn_ptr = self.builder.bitcast(fn_ir, I8PTR)
+
+        if captures:
+            # Store closure = {fn_ptr, env_ptr} in a 16-byte heap struct
+            closure_ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
+            fn_slot = self.builder.bitcast(closure_ptr, ir.PointerType(I8PTR))
+            self.builder.store(fn_ptr, fn_slot)
+            env_slot_raw = self.builder.gep(closure_ptr, [ir.Constant(I64_TY, 8)], inbounds=False)
+            env_slot = self.builder.bitcast(env_slot_raw, ir.PointerType(I8PTR))
+            self.builder.store(env_ptr, env_slot)
+            return closure_ptr, fn_type_str
+
         return fn_ptr, fn_type_str
+
+    def _find_free_vars(self, body: list, param_names: set) -> list:
+        """
+        Find identifiers used in `body` that exist in the current outer scope
+        but are not in `param_names`.  Returns list of (name, vx_type, alloca, ll_type).
+        """
+        used = set()
+        def _walk(node):
+            if isinstance(node, Identifier):
+                used.add(node.name)
+            elif isinstance(node, (BinOp, UnaryOp)):
+                for child in ([node.left, node.right] if isinstance(node, BinOp)
+                              else [node.operand]):
+                    _walk(child)
+            elif isinstance(node, Call):
+                for a in node.args: _walk(a)
+            elif isinstance(node, LetStmt):
+                _walk(node.value)
+            elif isinstance(node, AssignStmt):
+                _walk(node.value)
+            elif isinstance(node, ReturnStmt):
+                if node.value: _walk(node.value)
+            elif isinstance(node, IfStmt):
+                _walk(node.condition)
+                for s in node.then_body: _walk(s)
+                if node.else_body:
+                    for s in node.else_body: _walk(s)
+            elif isinstance(node, ExprStmt):
+                _walk(node.expr)
+            elif isinstance(node, PrintStmt):
+                for v in node.values: _walk(v)
+        for stmt in body:
+            _walk(stmt)
+
+        captures = []
+        seen = set()
+        for name in used:
+            if name in param_names or name in seen:
+                continue
+            info = self._lookup(name)
+            if info is not None:
+                ll_t = info["ptr"].type.pointee
+                captures.append((name, info["vx_type"], info["ptr"], ll_t))
+                seen.add(name)
+        return captures
 
     # ------------------------------------------------------------------ #
     #  Tuples                                                              #
@@ -3931,6 +5172,1443 @@ class Compiler:
             b.position_at_end(done_b2)
             b.call(cd_fn, [dirp])
             b.ret(hdr_raw)
+        return fn
+
+
+    # ------------------------------------------------------------------ #
+    #  v7 new helper builders                                             #
+    # ------------------------------------------------------------------ #
+
+    def _build_str_find(self) -> ir.Function:
+        """Return index of substring in s, or -1."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_str_find")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, sub = fn.args[0], fn.args[1]
+        found = b.call(self.strstr_fn, [s, sub])
+        found_i = b.ptrtoint(found, I64_TY)
+        s_i     = b.ptrtoint(s, I64_TY)
+        is_null = b.icmp_unsigned("==", found_i, ir.Constant(I64_TY, 0))
+        offset  = b.sub(found_i, s_i)
+        result  = b.select(is_null, ir.Constant(I64_TY, -1), offset)
+        b.ret(result)
+        return fn
+
+    def _build_str_slice(self) -> ir.Function:
+        """Return s[start:end]."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I64_TY, I64_TY]),
+                         name="__vx_str_slice")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, start, end = fn.args[0], fn.args[1], fn.args[2]
+        length = b.sub(end, start)
+        buf = b.call(self.malloc_fn, [b.add(length, ir.Constant(I64_TY, 1))])
+        src = b.gep(s, [start], inbounds=False)
+        b.call(self.memcpy_fn, [buf, src, length])
+        null_p = b.gep(buf, [length], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), null_p)
+        b.ret(buf)
+        return fn
+
+    def _build_str_repeat(self) -> ir.Function:
+        """Return s repeated n times."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I64_TY]),
+                         name="__vx_str_repeat")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, n = fn.args[0], fn.args[1]
+        slen = b.call(self.strlen_fn, [s])
+        total = b.mul(slen, n)
+        buf = b.call(self.malloc_fn, [b.add(total, ir.Constant(I64_TY, 1))])
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("rep.chk")
+        bdy = fn.append_basic_block("rep.bdy")
+        ext = fn.append_basic_block("rep.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, n), bdy, ext)
+        b.position_at_end(bdy)
+        offset = b.mul(iv, slen)
+        dst = b.gep(buf, [offset], inbounds=False)
+        b.call(self.memcpy_fn, [dst, s, slen])
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        null_p = b.gep(buf, [total], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), null_p)
+        b.ret(buf)
+        return fn
+
+    def _build_str_join(self) -> ir.Function:
+        """Join str[] with separator."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_str_join")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, sep = fn.args[0], fn.args[1]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        data = b.bitcast(data_raw, ir.PointerType(I8PTR))
+        sep_len = b.call(self.strlen_fn, [sep])
+        # Compute total length
+        total_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), total_al)
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk1 = fn.append_basic_block("sj.len.chk")
+        bdy1 = fn.append_basic_block("sj.len.bdy")
+        ext1 = fn.append_basic_block("sj.len.ext")
+        b.branch(chk1)
+        b.position_at_end(chk1)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ln), bdy1, ext1)
+        b.position_at_end(bdy1)
+        sp = b.gep(data, [iv], inbounds=False)
+        sv = b.load(sp)
+        sl = b.call(self.strlen_fn, [sv])
+        tot = b.load(total_al)
+        tot2 = b.add(tot, sl)
+        # Add separator length except after last
+        is_last = b.icmp_signed("==", b.add(iv, ir.Constant(I64_TY,1)), ln)
+        sep_add = b.select(is_last, ir.Constant(I64_TY,0), sep_len)
+        b.store(b.add(tot2, sep_add), total_al)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk1)
+        b.position_at_end(ext1)
+        final_len = b.load(total_al)
+        buf = b.call(self.malloc_fn, [b.add(final_len, ir.Constant(I64_TY,1))])
+        out_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), out_al)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk2 = fn.append_basic_block("sj.write.chk")
+        bdy2 = fn.append_basic_block("sj.write.bdy")
+        ext2 = fn.append_basic_block("sj.write.ext")
+        b.branch(chk2)
+        b.position_at_end(chk2)
+        iv2 = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv2, ln), bdy2, ext2)
+        b.position_at_end(bdy2)
+        sp2 = b.gep(data, [iv2], inbounds=False)
+        sv2 = b.load(sp2)
+        sl2 = b.call(self.strlen_fn, [sv2])
+        out = b.load(out_al)
+        dst = b.gep(buf, [out], inbounds=False)
+        b.call(self.memcpy_fn, [dst, sv2, sl2])
+        out2 = b.add(out, sl2)
+        is_last2 = b.icmp_signed("==", b.add(iv2, ir.Constant(I64_TY,1)), ln)
+        sep_b = fn.append_basic_block("sj.sep")
+        next_b = fn.append_basic_block("sj.next")
+        b.cbranch(is_last2, next_b, sep_b)
+        b.position_at_end(sep_b)
+        dst2 = b.gep(buf, [out2], inbounds=False)
+        b.call(self.memcpy_fn, [dst2, sep, sep_len])
+        out3 = b.add(out2, sep_len)
+        b.store(out3, out_al)
+        b.branch(next_b)
+        b.position_at_end(next_b)
+        b.store(b.add(iv2, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk2)
+        b.position_at_end(ext2)
+        final_out = b.load(out_al)
+        np = b.gep(buf, [final_out], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), np)
+        b.ret(buf)
+        return fn
+
+    def _build_array_sort_i64(self) -> ir.Function:
+        """Bubble-sort i64 array in-place."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR]),
+                         name="__vx_array_sort_i64")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw = fn.args[0]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        data = b.bitcast(data_raw, ir.PointerType(I64_TY))
+        i_al = b.alloca(I64_TY)
+        j_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        outer = fn.append_basic_block("sort.outer")
+        inner = fn.append_basic_block("sort.inner")
+        swap  = fn.append_basic_block("sort.swap")
+        nosw  = fn.append_basic_block("sort.noswap")
+        ext   = fn.append_basic_block("sort.ext")
+        b.branch(outer)
+        b.position_at_end(outer)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.sub(ln, ir.Constant(I64_TY,1))), inner, ext)
+        b.position_at_end(inner)
+        jv = b.load(j_al)
+        lim = b.sub(b.sub(ln, ir.Constant(I64_TY,1)), iv)
+        cond_j = b.icmp_signed("<", jv, lim)
+        b.cbranch(cond_j, swap, nosw)
+        b.position_at_end(swap)
+        ep_j  = b.gep(data, [jv], inbounds=False)
+        ep_j1 = b.gep(data, [b.add(jv, ir.Constant(I64_TY,1))], inbounds=False)
+        vj  = b.load(ep_j)
+        vj1 = b.load(ep_j1)
+        do_swap = b.icmp_signed(">", vj, vj1)
+        actual_swap = fn.append_basic_block("sort.doswap")
+        cont_b = fn.append_basic_block("sort.cont")
+        b.cbranch(do_swap, actual_swap, cont_b)
+        b.position_at_end(actual_swap)
+        b.store(vj1, ep_j)
+        b.store(vj, ep_j1)
+        b.branch(cont_b)
+        b.position_at_end(cont_b)
+        b.store(b.add(jv, ir.Constant(I64_TY,1)), j_al)
+        b.branch(inner)
+        b.position_at_end(nosw)
+        b.store(ir.Constant(I64_TY, 0), j_al)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(outer)
+        b.position_at_end(ext)
+        b.ret_void()
+        return fn
+
+    def _build_array_sort_f64(self) -> ir.Function:
+        """Bubble-sort f64 array in-place."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR]),
+                         name="__vx_array_sort_f64")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw = fn.args[0]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        data = b.bitcast(data_raw, ir.PointerType(F64_TY))
+        i_al = b.alloca(I64_TY)
+        j_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        outer = fn.append_basic_block("fsort.outer")
+        inner_b = fn.append_basic_block("fsort.inner")
+        ext   = fn.append_basic_block("fsort.ext")
+        b.branch(outer)
+        b.position_at_end(outer)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, b.sub(ln, ir.Constant(I64_TY,1))), inner_b, ext)
+        b.position_at_end(inner_b)
+        jv = b.load(j_al)
+        lim = b.sub(b.sub(ln, ir.Constant(I64_TY,1)), iv)
+        ep_j  = b.gep(data, [jv], inbounds=False)
+        ep_j1 = b.gep(data, [b.add(jv, ir.Constant(I64_TY,1))], inbounds=False)
+        vj  = b.load(ep_j)
+        vj1 = b.load(ep_j1)
+        do_swap = b.fcmp_ordered(">", vj, vj1)
+        sw_b = fn.append_basic_block("fsort.sw")
+        cnt_b = fn.append_basic_block("fsort.cnt")
+        nsw_b = fn.append_basic_block("fsort.nsw")
+        b.cbranch(b.icmp_signed("<", jv, lim), sw_b, nsw_b)
+        b.position_at_end(sw_b)
+        b.cbranch(do_swap, cnt_b, cnt_b)
+        b.position_at_end(cnt_b)
+        b.store(vj1, ep_j)
+        b.store(vj, ep_j1)
+        b.store(b.add(jv, ir.Constant(I64_TY,1)), j_al)
+        b.branch(inner_b)
+        b.position_at_end(nsw_b)
+        b.store(ir.Constant(I64_TY, 0), j_al)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(outer)
+        b.position_at_end(ext)
+        b.ret_void()
+        return fn
+
+    def _build_array_index_of_i64(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I64_TY]),
+                         name="__vx_array_index_of_i64")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, target = fn.args[0], fn.args[1]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        data = b.bitcast(data_raw, ir.PointerType(I64_TY))
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("iof.chk")
+        bdy = fn.append_basic_block("iof.bdy")
+        ext = fn.append_basic_block("iof.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ln), bdy, ext)
+        b.position_at_end(bdy)
+        ep = b.gep(data, [iv], inbounds=False)
+        v = b.load(ep)
+        eq = b.icmp_signed("==", v, target)
+        found_b = fn.append_basic_block("iof.found")
+        cont_b  = fn.append_basic_block("iof.cont")
+        b.cbranch(eq, found_b, cont_b)
+        b.position_at_end(found_b)
+        b.ret(iv)
+        b.position_at_end(cont_b)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(ir.Constant(I64_TY, -1))
+        return fn
+
+    def _build_array_index_of_str(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_array_index_of_str")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, target = fn.args[0], fn.args[1]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        data = b.bitcast(data_raw, ir.PointerType(I8PTR))
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("iostr.chk")
+        bdy = fn.append_basic_block("iostr.bdy")
+        ext = fn.append_basic_block("iostr.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ln), bdy, ext)
+        b.position_at_end(bdy)
+        ep = b.gep(data, [iv], inbounds=False)
+        v = b.load(ep)
+        r = b.call(self.strcmp_fn, [v, target])
+        eq = b.icmp_signed("==", r, ir.Constant(I32_TY, 0))
+        found_b = fn.append_basic_block("iostr.found")
+        cont_b  = fn.append_basic_block("iostr.cont")
+        b.cbranch(eq, found_b, cont_b)
+        b.position_at_end(found_b)
+        b.ret(iv)
+        b.position_at_end(cont_b)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(ir.Constant(I64_TY, -1))
+        return fn
+
+    def _build_array_join_str(self) -> ir.Function:
+        """Join str[] with separator — delegate to str_join."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_array_join_str")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        helper = self._get_helper("__vx_str_join")
+        result = b.call(helper, [fn.args[0], fn.args[1]])
+        b.ret(result)
+        return fn
+
+    def _build_array_slice(self) -> ir.Function:
+        """Return new array = arr[start:end]."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I64_TY, I64_TY, I64_TY]),
+                         name="__vx_array_slice")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, start, end, esz = fn.args
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        data_raw = b.load(dp)
+        new_len = b.sub(end, start)
+        new_sz  = b.mul(new_len, esz)
+        # Build new array header
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        new_data = b.call(self.malloc_fn, [b.add(new_sz, ir.Constant(I64_TY,1))])
+        src = b.gep(data_raw, [b.mul(start, esz)], inbounds=False)
+        b.call(self.memcpy_fn, [new_data, src, new_sz])
+        dp2  = b.gep(hdr, [z, z], inbounds=True)
+        lp2  = b.gep(hdr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        cp2  = b.gep(hdr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(new_data, dp2)
+        b.store(new_len, lp2)
+        b.store(new_len, cp2)
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_array_map_i64(self) -> ir.Function:
+        """Apply fn_ptr: i8* to each i64 element, return new i64 array."""
+        fn_ty = ir.FunctionType(I8PTR, [I8PTR, I8PTR])
+        fn = ir.Function(self.module, fn_ty, name="__vx_array_map_i64")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, fn_ptr_raw = fn.args[0], fn.args[1]
+        # Cast fn_ptr to (i64)->i64
+        cb_ty = ir.FunctionType(I64_TY, [I64_TY])
+        cb_ptr = b.bitcast(fn_ptr_raw, ir.PointerType(cb_ty))
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        src_raw = b.load(dp)
+        src = b.bitcast(src_raw, ir.PointerType(I64_TY))
+        # Allocate result array
+        new_sz = b.mul(ln, ir.Constant(I64_TY, 8))
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        new_data = b.call(self.malloc_fn, [b.add(new_sz, ir.Constant(I64_TY,1))])
+        new_data_typed = b.bitcast(new_data, ir.PointerType(I64_TY))
+        dp2 = b.gep(hdr, [z, z], inbounds=True)
+        lp2 = b.gep(hdr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        cp2 = b.gep(hdr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(new_data, dp2)
+        b.store(ln, lp2)
+        b.store(ln, cp2)
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("map.chk")
+        bdy = fn.append_basic_block("map.bdy")
+        ext = fn.append_basic_block("map.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ln), bdy, ext)
+        b.position_at_end(bdy)
+        ep = b.gep(src, [iv], inbounds=False)
+        v = b.load(ep)
+        mapped = b.call(cb_ptr, [v])
+        ep2 = b.gep(new_data_typed, [iv], inbounds=False)
+        b.store(mapped, ep2)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_array_filter_i64(self) -> ir.Function:
+        """Filter i64 array using predicate fn_ptr: (i64)->bool, return new array."""
+        fn_ty = ir.FunctionType(I8PTR, [I8PTR, I8PTR])
+        fn = ir.Function(self.module, fn_ty, name="__vx_array_filter_i64")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw, fn_ptr_raw = fn.args[0], fn.args[1]
+        cb_ty = ir.FunctionType(I1_TY, [I64_TY])
+        cb_ptr = b.bitcast(fn_ptr_raw, ir.PointerType(cb_ty))
+        # Build result using push helper
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        init_data = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        dp2 = b.gep(hdr, [z, z], inbounds=True)
+        lp2 = b.gep(hdr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        cp2 = b.gep(hdr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(init_data, dp2)
+        b.store(ir.Constant(I64_TY,0), lp2)
+        b.store(ir.Constant(I64_TY,8), cp2)
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        ln = b.load(lp)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        src_raw = b.load(dp)
+        src = b.bitcast(src_raw, ir.PointerType(I64_TY))
+        push_h = self._get_helper("__vx_array_push")
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("filt.chk")
+        bdy = fn.append_basic_block("filt.bdy")
+        ext = fn.append_basic_block("filt.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ln), bdy, ext)
+        b.position_at_end(bdy)
+        ep = b.gep(src, [iv], inbounds=False)
+        v = b.load(ep)
+        keep = b.call(cb_ptr, [v])
+        push_b = fn.append_basic_block("filt.push")
+        skip_b = fn.append_basic_block("filt.skip")
+        b.cbranch(keep, push_b, skip_b)
+        b.position_at_end(push_b)
+        v_al = b.alloca(I64_TY)
+        b.store(v, v_al)
+        v_raw = b.bitcast(v_al, I8PTR)
+        b.call(push_h, [hdr_raw, v_raw, ir.Constant(I64_TY, 8)])
+        b.branch(skip_b)
+        b.position_at_end(skip_b)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_base64_encode(self) -> ir.Function:
+        """Base64-encode a string. Pure LLVM — no external dependency."""
+        TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        table_gv = self._global_str(TABLE)
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_base64_encode")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s = fn.args[0]
+        slen = b.call(self.strlen_fn, [s])
+        # Output length = ceil(slen/3)*4 + 1
+        groups = b.add(b.sdiv(slen, ir.Constant(I64_TY,3)), ir.Constant(I64_TY,1))
+        out_len = b.add(b.mul(groups, ir.Constant(I64_TY,4)), ir.Constant(I64_TY,1))
+        buf = b.call(self.malloc_fn, [out_len])
+        tbl = self._gstr_ptr_const(table_gv)
+        i_al  = b.alloca(I64_TY)   # input index
+        oi_al = b.alloca(I64_TY)   # output index
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        b.store(ir.Constant(I64_TY, 0), oi_al)
+        chk = fn.append_basic_block("b64e.chk")
+        bdy = fn.append_basic_block("b64e.bdy")
+        ext = fn.append_basic_block("b64e.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        ii = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", ii, slen), bdy, ext)
+        b.position_at_end(bdy)
+        # Read up to 3 bytes
+        def load_byte(idx_offset):
+            idx = b.add(ii, ir.Constant(I64_TY, idx_offset))
+            in_range = b.icmp_signed("<", idx, slen)
+            ep = b.gep(s, [idx], inbounds=False)
+            v  = b.load(ep)
+            return b.select(in_range, b.zext(v, I64_TY), ir.Constant(I64_TY, 0))
+        b0 = load_byte(0)
+        b1 = load_byte(1)
+        b2 = load_byte(2)
+        # Combine
+        combined = b.or_(b.or_(b.shl(b0, ir.Constant(I64_TY,16)),
+                                b.shl(b1, ir.Constant(I64_TY,8))), b2)
+        def enc_char(shift):
+            idx = b.and_(b.ashr(combined, ir.Constant(I64_TY, shift)),
+                         ir.Constant(I64_TY, 63))
+            cp = b.gep(tbl, [idx], inbounds=False)
+            return b.load(cp)
+        oi = b.load(oi_al)
+        chars = [enc_char(18), enc_char(12), enc_char(6), enc_char(0)]
+        for ci, ch in enumerate(chars):
+            outp = b.gep(buf, [b.add(oi, ir.Constant(I64_TY, ci))], inbounds=False)
+            b.store(ch, outp)
+        b.store(b.add(ii, ir.Constant(I64_TY,3)), i_al)
+        b.store(b.add(oi, ir.Constant(I64_TY,4)), oi_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        # Handle padding with '='
+        rem = b.srem(slen, ir.Constant(I64_TY, 3))
+        oi_final = b.load(oi_al)
+        pad_b1 = fn.append_basic_block("b64e.pad1")
+        pad_b2 = fn.append_basic_block("b64e.pad2")
+        done_b  = fn.append_basic_block("b64e.done")
+        is_1 = b.icmp_signed("==", rem, ir.Constant(I64_TY, 1))
+        is_2 = b.icmp_signed("==", rem, ir.Constant(I64_TY, 2))
+        pad12 = fn.append_basic_block("b64e.pad12")
+        b.cbranch(is_1, pad_b1, pad12)
+        b.position_at_end(pad12)
+        b.cbranch(is_2, pad_b2, done_b)
+        eq_ch = ir.Constant(I8_TY, ord('='))
+        b.position_at_end(pad_b1)
+        # Overwrite last 2 chars with '='
+        p2 = b.gep(buf, [b.sub(oi_final, ir.Constant(I64_TY,2))], inbounds=False)
+        p3 = b.gep(buf, [b.sub(oi_final, ir.Constant(I64_TY,1))], inbounds=False)
+        b.store(eq_ch, p2); b.store(eq_ch, p3)
+        b.branch(done_b)
+        b.position_at_end(pad_b2)
+        # Overwrite last 1 char with '='
+        p3b = b.gep(buf, [b.sub(oi_final, ir.Constant(I64_TY,1))], inbounds=False)
+        b.store(eq_ch, p3b)
+        b.branch(done_b)
+        b.position_at_end(done_b)
+        null_p = b.gep(buf, [oi_final], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), null_p)
+        b.ret(buf)
+        return fn
+
+    def _build_base64_decode(self) -> ir.Function:
+        """Base64-decode a string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_base64_decode")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s = fn.args[0]
+        slen = b.call(self.strlen_fn, [s])
+        # Output length ≈ slen * 3/4
+        out_len = b.add(b.mul(slen, ir.Constant(I64_TY,3)), ir.Constant(I64_TY,4))
+        buf = b.call(self.malloc_fn, [b.sdiv(out_len, ir.Constant(I64_TY,4))])
+        # Simple decode loop
+        i_al  = b.alloca(I64_TY)
+        oi_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        b.store(ir.Constant(I64_TY, 0), oi_al)
+
+        def decode_char(ch):
+            # A-Z=0-25, a-z=26-51, 0-9=52-61, +=62, /=63, ==0
+            c = b.zext(ch, I64_TY)
+            uc = ir.Constant(I64_TY, ord('A'))
+            lc = ir.Constant(I64_TY, ord('a'))
+            dc = ir.Constant(I64_TY, ord('0'))
+            is_upper = b.and_(b.icmp_signed(">=", c, uc), b.icmp_signed("<=", c, ir.Constant(I64_TY, ord('Z'))))
+            is_lower = b.and_(b.icmp_signed(">=", c, lc), b.icmp_signed("<=", c, ir.Constant(I64_TY, ord('z'))))
+            is_digit = b.and_(b.icmp_signed(">=", c, dc), b.icmp_signed("<=", c, ir.Constant(I64_TY, ord('9'))))
+            is_plus  = b.icmp_signed("==", c, ir.Constant(I64_TY, ord('+')))
+            v_upper  = b.sub(c, uc)
+            v_lower  = b.add(b.sub(c, lc), ir.Constant(I64_TY, 26))
+            v_digit  = b.add(b.sub(c, dc), ir.Constant(I64_TY, 52))
+            v_plus   = ir.Constant(I64_TY, 62)
+            v_slash  = ir.Constant(I64_TY, 63)
+            v0 = b.select(is_plus, v_plus, v_slash)
+            v1 = b.select(is_digit, v_digit, v0)
+            v2 = b.select(is_lower, v_lower, v1)
+            return b.select(is_upper, v_upper, v2)
+
+        chk = fn.append_basic_block("b64d.chk")
+        bdy = fn.append_basic_block("b64d.bdy")
+        ext = fn.append_basic_block("b64d.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        ii = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", ii, slen), bdy, ext)
+        b.position_at_end(bdy)
+        def get_code(offset):
+            idx = b.add(ii, ir.Constant(I64_TY, offset))
+            in_range = b.icmp_signed("<", idx, slen)
+            ep = b.gep(s, [idx], inbounds=False)
+            ch = b.load(ep)
+            return b.select(in_range, decode_char(ch), ir.Constant(I64_TY, 0))
+        c0 = get_code(0); c1 = get_code(1); c2 = get_code(2); c3 = get_code(3)
+        oi = b.load(oi_al)
+        byte0 = b.trunc(b.or_(b.shl(c0, ir.Constant(I64_TY,2)),
+                               b.ashr(c1, ir.Constant(I64_TY,4))), I8_TY)
+        byte1 = b.trunc(b.or_(b.shl(b.and_(c1, ir.Constant(I64_TY,15)), ir.Constant(I64_TY,4)),
+                               b.ashr(c2, ir.Constant(I64_TY,2))), I8_TY)
+        byte2 = b.trunc(b.or_(b.shl(b.and_(c2, ir.Constant(I64_TY,3)), ir.Constant(I64_TY,6)), c3), I8_TY)
+        b.store(byte0, b.gep(buf, [oi], inbounds=False))
+        b.store(byte1, b.gep(buf, [b.add(oi, ir.Constant(I64_TY,1))], inbounds=False))
+        b.store(byte2, b.gep(buf, [b.add(oi, ir.Constant(I64_TY,2))], inbounds=False))
+        b.store(b.add(ii, ir.Constant(I64_TY,4)), i_al)
+        b.store(b.add(oi, ir.Constant(I64_TY,3)), oi_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        oi_f = b.load(oi_al)
+        b.store(ir.Constant(I8_TY, 0), b.gep(buf, [oi_f], inbounds=False))
+        b.ret(buf)
+        return fn
+
+    def _build_uuid_v4(self) -> ir.Function:
+        """Generate UUID v4 string using platform random."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_uuid_v4")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 37)])
+        # Use rand() to fill 16 bytes — not cryptographically secure but functional
+        bytes_al = b.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("uuid.chk")
+        bdy = fn.append_basic_block("uuid.bdy")
+        ext = fn.append_basic_block("uuid.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, ir.Constant(I64_TY, 16)), bdy, ext)
+        b.position_at_end(bdy)
+        rv = b.call(self.rand_fn, [])
+        rb = b.trunc(rv, I8_TY)
+        ep = b.gep(bytes_al, [iv], inbounds=False)
+        b.store(rb, ep)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        # Set version bits
+        b6 = b.gep(bytes_al, [ir.Constant(I64_TY, 6)], inbounds=False)
+        v6 = b.load(b6)
+        b.store(b.or_(b.and_(v6, ir.Constant(I8_TY, 0x0F)), ir.Constant(I8_TY, 0x40)), b6)
+        b8 = b.gep(bytes_al, [ir.Constant(I64_TY, 8)], inbounds=False)
+        v8 = b.load(b8)
+        b.store(b.or_(b.and_(v8, ir.Constant(I8_TY, 0x3F)), ir.Constant(I8_TY, 0x80)), b8)
+        # Format as UUID string
+        fmt_gv = self._global_str("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x")
+        fmt_p = self._gstr_ptr_const(fmt_gv)
+        def lb(i): return b.zext(b.load(b.gep(bytes_al, [ir.Constant(I64_TY,i)], inbounds=False)), I32_TY)
+        b.call(self.sprintf_fn, [buf, fmt_p,
+               lb(0),lb(1),lb(2),lb(3),lb(4),lb(5),lb(6),lb(7),
+               lb(8),lb(9),lb(10),lb(11),lb(12),lb(13),lb(14),lb(15)])
+        b.ret(buf)
+        return fn
+
+    def _build_sha256(self) -> ir.Function:
+        """SHA-256 stub — returns hex placeholder. Real SHA-256 would be 200+ lines of IR.
+           For actual use, link against libcrypto and call SHA256()."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_sha256")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Return a fixed placeholder — linking against OpenSSL is the proper solution
+        placeholder = self._global_str("sha256:not-linked-call-openssl")
+        b.ret(self._gstr_ptr_const(placeholder))
+        return fn
+
+    def _build_argv(self) -> ir.Function:
+        """Return argc/argv as str[]. Requires __vx_argc/__vx_argv globals set by main."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_argv")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Build array from __vx_argc and __vx_argv globals
+        argc_gv = self._get_or_create_global("__vx_argc", I32_TY, ir.Constant(I32_TY, 0))
+        argv_gv = self._get_or_create_global("__vx_argv", ir.PointerType(I8PTR),
+                                              ir.Constant(ir.PointerType(I8PTR), None))
+        argc = b.zext(b.load(argc_gv), I64_TY)
+        argv = b.load(argv_gv)
+        # Build vx_array
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        data_sz = b.mul(argc, ir.Constant(I64_TY, 8))
+        data = b.call(self.malloc_fn, [b.add(data_sz, ir.Constant(I64_TY, 8))])
+        z = ir.Constant(I32_TY, 0)
+        dp = b.gep(hdr, [z, z], inbounds=True)
+        lp = b.gep(hdr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        cp = b.gep(hdr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(data, dp)
+        b.store(argc, lp)
+        b.store(argc, cp)
+        # Copy argv pointers
+        data_typed = b.bitcast(data, ir.PointerType(I8PTR))
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("argv.chk")
+        bdy = fn.append_basic_block("argv.bdy")
+        ext = fn.append_basic_block("argv.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, argc), bdy, ext)
+        b.position_at_end(bdy)
+        src_p = b.gep(argv, [iv], inbounds=False)
+        src_v = b.load(src_p)
+        dst_p = b.gep(data_typed, [iv], inbounds=False)
+        b.store(src_v, dst_p)
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(hdr_raw)
+        return fn
+
+    def _get_or_create_global(self, name: str, ll_ty, init) -> ir.GlobalVariable:
+        for gv in self.module.global_variables:
+            if gv.name == name:
+                return gv
+        gv = ir.GlobalVariable(self.module, ll_ty, name=name)
+        gv.linkage = "common"
+        gv.initializer = init
+        return gv
+
+    def _build_shell(self) -> ir.Function:
+        """Run shell command and return stdout as string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_shell")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cmd = fn.args[0]
+        # popen + fread loop
+        popen_ty = ir.FunctionType(I8PTR, [I8PTR, I8PTR])
+        pclose_ty = ir.FunctionType(I32_TY, [I8PTR])
+        mode_gv = self._global_str("r")
+        mode_p  = self._gstr_ptr_const(mode_gv)
+        popen_fn = self._get_or_declare_fn("popen", popen_ty)
+        pclose_fn = self._get_or_declare_fn("pclose", pclose_ty)
+        fp = b.call(popen_fn, [cmd, mode_p])
+        fp_int = b.ptrtoint(fp, I64_TY)
+        is_null = b.icmp_unsigned("==", fp_int, ir.Constant(I64_TY, 0))
+        ok_b  = fn.append_basic_block("shell.ok")
+        err_b = fn.append_basic_block("shell.err")
+        b.cbranch(is_null, err_b, ok_b)
+        b.position_at_end(err_b)
+        empty_gv = self._global_str("")
+        b.ret(self._gstr_ptr_const(empty_gv))
+        b.position_at_end(ok_b)
+        # Read 4096 bytes at a time
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 65536)])
+        out_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), out_al)
+        chunk = b.call(self.malloc_fn, [ir.Constant(I64_TY, 4097)])
+        chk = fn.append_basic_block("shell.chk")
+        bdy = fn.append_basic_block("shell.bdy")
+        ext = fn.append_basic_block("shell.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        nr = b.call(self.fread_fn, [chunk, ir.Constant(I64_TY,1),
+                                    ir.Constant(I64_TY,4096), fp])
+        b.cbranch(b.icmp_signed(">", nr, ir.Constant(I64_TY,0)), bdy, ext)
+        b.position_at_end(bdy)
+        out = b.load(out_al)
+        dst = b.gep(buf, [out], inbounds=False)
+        b.call(self.memcpy_fn, [dst, chunk, nr])
+        b.store(b.add(out, nr), out_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.call(pclose_fn, [fp])
+        out_f = b.load(out_al)
+        null_p = b.gep(buf, [out_f], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), null_p)
+        b.ret(buf)
+        return fn
+
+    def _get_or_declare_fn(self, name: str, fn_ty) -> ir.Function:
+        for f in self.module.functions:
+            if f.name == name:
+                return f
+        return ir.Function(self.module, fn_ty, name=name)
+
+    def _build_csv_parse(self) -> ir.Function:
+        """Parse CSV string into str[][] (array of str[] rows)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_csv_parse")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s = fn.args[0]
+        # Split by newlines first, then by commas
+        nl_gv = self._global_str("\n")
+        cm_gv = self._global_str(",")
+        nl_p = self._gstr_ptr_const(nl_gv)
+        cm_p = self._gstr_ptr_const(cm_gv)
+        split_h = self._get_helper("__vx_str_split")
+        lines_raw = b.call(split_h, [s, nl_p])
+        # For each line, split by comma → build outer array
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        init_data = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        dp = b.gep(hdr, [z, z], inbounds=True)
+        lp = b.gep(hdr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        cp = b.gep(hdr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(init_data, dp)
+        b.store(ir.Constant(I64_TY,0), lp)
+        b.store(ir.Constant(I64_TY,8), cp)
+        lines = b.bitcast(lines_raw, self.arr_ptr_type)
+        lines_lp = b.gep(lines, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        lines_len = b.load(lines_lp)
+        lines_dp = b.gep(lines, [z, z], inbounds=True)
+        lines_data_raw = b.load(lines_dp)
+        lines_data = b.bitcast(lines_data_raw, ir.PointerType(I8PTR))
+        push_h = self._get_helper("__vx_array_push")
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("csv.chk")
+        bdy = fn.append_basic_block("csv.bdy")
+        ext = fn.append_basic_block("csv.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, lines_len), bdy, ext)
+        b.position_at_end(bdy)
+        line_p = b.gep(lines_data, [iv], inbounds=False)
+        line = b.load(line_p)
+        row_raw = b.call(split_h, [line, cm_p])
+        row_al = b.alloca(I8PTR)
+        b.store(row_raw, row_al)
+        b.call(push_h, [hdr_raw, b.bitcast(row_al, I8PTR), ir.Constant(I64_TY, 8)])
+        b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_assert_eq(self) -> ir.Function:
+        """assert_eq(a, b) — print and exit if not equal."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_assert_eq")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        a, bv = fn.args[0], fn.args[1]
+        ok_b   = fn.append_basic_block("aeq.ok")
+        fail_b = fn.append_basic_block("aeq.fail")
+        b.cbranch(b.icmp_signed("==", a, bv), ok_b, fail_b)
+        b.position_at_end(fail_b)
+        fmt_gv = self._global_str("FAIL: assert_eq %lld != %lld\n")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv), a, bv])
+        b.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+        b.unreachable()
+        b.position_at_end(ok_b)
+        b.ret_void()
+        return fn
+
+    def _build_str_starts_with(self) -> ir.Function:
+        """str_starts_with(s, prefix) -> bool (i1)"""
+        fn = ir.Function(self.module, ir.FunctionType(I1_TY, [I8PTR, I8PTR]),
+                         name="__vx_str_starts_with")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, prefix = fn.args[0], fn.args[1]
+        plen = b.call(self.strlen_fn, [prefix])
+        # strncmp(s, prefix, plen) == 0
+        cmp = b.call(self.strncmp_fn, [s, prefix, plen])
+        result = b.icmp_signed("==", cmp, ir.Constant(I32_TY, 0))
+        b.ret(result)
+        return fn
+
+    def _build_str_char_at(self) -> ir.Function:
+        """char_at(s, i) -> str (single-char heap string)"""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I64_TY]),
+                         name="__vx_str_char_at")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, idx = fn.args[0], fn.args[1]
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 2)])
+        src_p = b.gep(s, [idx], inbounds=False)
+        ch = b.load(src_p)
+        b.store(ch, buf)
+        nul_p = b.gep(buf, [ir.Constant(I64_TY, 1)], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), nul_p)
+        b.ret(buf)
+        return fn
+
+    def _build_env_set(self) -> ir.Function:
+        """env_set(key, value) — set environment variable (putenv)"""
+        # putenv(buf) where buf = "KEY=VALUE"
+        putenv_ty = ir.FunctionType(I32_TY, [I8PTR])
+        putenv_fn = self._get_or_declare_fn("putenv", putenv_ty)
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR, I8PTR]),
+                         name="__vx_env_set")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        key, val = fn.args[0], fn.args[1]
+        klen = b.call(self.strlen_fn, [key])
+        vlen = b.call(self.strlen_fn, [val])
+        # total = klen + 1 (=) + vlen + 1 (NUL)
+        total = b.add(b.add(klen, vlen), ir.Constant(I64_TY, 2))
+        buf   = b.call(self.malloc_fn, [total])
+        # sprintf(buf, "%s=%s", key, val)
+        fmt_gv = self._global_str("%s=%s")
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), key, val])
+        b.call(putenv_fn, [buf])
+        b.ret_void()
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  Compile: compile() extension for new top-level nodes               #
+    # ------------------------------------------------------------------ #
+
+    def _compile_extern_fn(self, d: 'ExternFnDecl'):
+        """Declare an external (C) function in LLVM IR."""
+        param_tys = [self._vx_to_llvm(p.type_name) for p in d.params]
+        ret_ty = self._vx_to_llvm(d.return_type or "void")
+        fn_ty = ir.FunctionType(ret_ty, param_tys)
+        # Only declare once
+        for f in self.module.functions:
+            if f.name == d.name:
+                self._functions[d.name] = {
+                    "fn": f,
+                    "sig": __import__("compiler.analyzer", fromlist=["FnSig"]).FnSig(
+                        [(p.name, p.type_name) for p in d.params], d.return_type or "void"
+                    )
+                }
+                return
+        fn = ir.Function(self.module, fn_ty, name=d.name)
+        from compiler.analyzer import FnSig as _FnSig
+        self._functions[d.name] = {
+            "fn": fn,
+            "sig": _FnSig([(p.name, p.type_name) for p in d.params], d.return_type or "void")
+        }
+        self._fn_defaults[d.name] = [None] * len(d.params)
+
+    def _compile_test_decl(self, d: 'TestDecl'):
+        """Compile a test block as a private function __test__name()."""
+        test_fn_name = f"__test__{d.name.replace(' ', '_')}"
+        fn_ty = ir.FunctionType(VOID_TY, [])
+        fn = ir.Function(self.module, fn_ty, name=test_fn_name)
+        fn.linkage = "private"
+        old_fn   = self.current_fn
+        old_bldr = self.builder
+        self.current_fn = fn
+        entry = fn.append_basic_block("entry")
+        self.builder = ir.IRBuilder(entry)
+        self._push_scope()
+        self._defer_stack.append([])
+        for stmt in d.body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(stmt)
+        self._emit_defers()
+        self._defer_stack.pop()
+        if not self.builder.block.is_terminated:
+            self.builder.ret_void()
+        self._pop_scope()
+        self.current_fn = old_fn
+        self.builder    = old_bldr
+        self._functions[test_fn_name] = {
+            "fn": fn,
+            "sig": __import__("compiler.analyzer", fromlist=["FnSig"]).FnSig([], "void")
+        }
+
+    def _val_to_str(self, val: ir.Value, vt: str) -> ir.Value:
+        """Convert any value to an i8* string for error/print purposes."""
+        if vt == "str":
+            return val
+        buf = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        if vt == "int":
+            fmt = self._gstr_ptr(self._global_str("%lld"))
+            self.builder.call(self.sprintf_fn, [buf, fmt, val])
+        elif vt == "float":
+            fmt = self._gstr_ptr(self._global_str("%g"))
+            self.builder.call(self.sprintf_fn, [buf, fmt, val])
+        elif vt == "bool":
+            t = self._gstr_ptr(self._global_str("true"))
+            f = self._gstr_ptr(self._global_str("false"))
+            s = self.builder.select(val, t, f)
+            fmt = self._gstr_ptr(self._global_str("%s"))
+            self.builder.call(self.sprintf_fn, [buf, fmt, s])
+        else:
+            fmt = self._gstr_ptr(self._global_str("<value>"))
+            self.builder.call(self.sprintf_fn, [buf, fmt])
+        return buf
+
+    # ------------------------------------------------------------------ #
+    #  ADT Enum support                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _define_adt_enum(self, d: 'EnumDeclADT'):
+        """
+        Define an ADT enum as a tagged-union struct.
+        Each variant is represented as:
+          { i64 tag, i8* payload }   (payload is variant-specific heap alloc)
+        The enum type itself is stored as i8* (pointer to this struct).
+        """
+        # Register the enum type struct: {i64 tag, i8* payload}
+        st_name = f"__adt_{d.name}"
+        if st_name not in self._structs:
+            st = self.module.context.get_identified_type(st_name)
+            st.set_body(I64_TY, I8PTR)
+            # Register variant tags as global constants
+            for i, variant in enumerate(d.variants):
+                gname = f"{d.name}.{variant.name}"
+                gv = ir.GlobalVariable(self.module, I64_TY, name=gname)
+                gv.linkage = "internal"
+                gv.global_constant = True
+                gv.initializer = ir.Constant(I64_TY, i)
+                self._globals[gname] = {"ptr": gv, "vx_type": "int"}
+                # If variant has payload fields, define a payload struct
+                if variant.fields:
+                    payload_name = f"__adt_{d.name}_{variant.name}"
+                    payload_st = self.module.context.get_identified_type(payload_name)
+                    field_tys = [self._vx_to_llvm(f.type_name) for f in variant.fields]
+                    payload_st.set_body(*field_tys)
+                    self._structs[payload_name] = {
+                        "ll_type": payload_st,
+                        "fields": [(f.name, f.type_name) for f in variant.fields]
+                    }
+            self._structs[st_name] = {
+                "ll_type": st,
+                "fields": [("tag", "int"), ("payload", "str")]  # str ≈ i8*
+            }
+
+    def _compile_adt_constructor(self, enum_name: str, variant_name: str,
+                                  args: list) -> tuple['ir.Value', str]:
+        """Construct an ADT variant value: EnumName.Variant(args...)"""
+        st_name      = f"__adt_{enum_name}"
+        payload_name = f"__adt_{enum_name}_{variant_name}"
+        tag_gname    = f"{enum_name}.{variant_name}"
+
+        # Allocate the tagged-union struct on the heap
+        union_size = ir.Constant(I64_TY, 16)   # 8 (tag) + 8 (ptr)
+        union_ptr  = self.builder.call(self.malloc_fn, [union_size])
+        union_ty   = self._structs[st_name]["ll_type"]
+        union_cptr = self.builder.bitcast(union_ptr, ir.PointerType(union_ty))
+
+        # Store tag
+        tag_val = self.builder.load(self._globals[tag_gname]["ptr"])
+        tag_ptr = self.builder.gep(union_cptr,
+                                   [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                                   inbounds=True)
+        self.builder.store(tag_val, tag_ptr)
+
+        # Store payload (if any fields)
+        if payload_name in self._structs:
+            payload_info = self._structs[payload_name]
+            payload_ty   = payload_info["ll_type"]
+            payload_size = ir.Constant(I64_TY, len(payload_info["fields"]) * 8)
+            payload_ptr  = self.builder.call(self.malloc_fn, [payload_size])
+            payload_cptr = self.builder.bitcast(payload_ptr, ir.PointerType(payload_ty))
+            for i, (arg_node, (fname, ftype)) in enumerate(zip(args, payload_info["fields"])):
+                av, at = self._compile_expr(arg_node)
+                fp     = self.builder.gep(payload_cptr,
+                                          [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, i)],
+                                          inbounds=True)
+                if ftype == "float" and at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+                self.builder.store(av, fp)
+            # Store payload pointer into union
+            pay_field_ptr = self.builder.gep(union_cptr,
+                                              [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)],
+                                              inbounds=True)
+            self.builder.store(payload_ptr, pay_field_ptr)
+        else:
+            # No payload — store null
+            pay_field_ptr = self.builder.gep(union_cptr,
+                                              [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)],
+                                              inbounds=True)
+            self.builder.store(ir.Constant(I8PTR, None), pay_field_ptr)
+
+        return union_ptr, enum_name
+
+    # ------------------------------------------------------------------ #
+    #  Comptime constants                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _compile_comptime(self, d: 'ComptimeDecl'):
+        """Evaluate a comptime constant and register it as an LLVM global."""
+        # Evaluate as a constant expression (literals only in this impl)
+        val_node = d.value
+        if isinstance(val_node, IntLiteral):
+            gv = ir.GlobalVariable(self.module, I64_TY, name=d.name)
+            gv.linkage = "internal"
+            gv.global_constant = True
+            gv.initializer = ir.Constant(I64_TY, val_node.value)
+            self._globals[d.name] = {"ptr": gv, "vx_type": "int"}
+        elif isinstance(val_node, FloatLiteral):
+            gv = ir.GlobalVariable(self.module, F64_TY, name=d.name)
+            gv.linkage = "internal"
+            gv.global_constant = True
+            gv.initializer = ir.Constant(F64_TY, val_node.value)
+            self._globals[d.name] = {"ptr": gv, "vx_type": "float"}
+        elif isinstance(val_node, BoolLiteral):
+            gv = ir.GlobalVariable(self.module, I1_TY, name=d.name)
+            gv.linkage = "internal"
+            gv.global_constant = True
+            gv.initializer = ir.Constant(I1_TY, int(val_node.value))
+            self._globals[d.name] = {"ptr": gv, "vx_type": "bool"}
+        elif isinstance(val_node, StringLiteral):
+            # Store as a global string constant pointer
+            gstr = self._global_str(val_node.value)
+            gv   = ir.GlobalVariable(self.module, I8PTR, name=d.name)
+            gv.linkage = "internal"
+            gv.global_constant = True
+            gv.initializer = ir.Constant(I8PTR, None)  # placeholder
+            self._globals[d.name] = {"ptr": gv, "vx_type": "str", "_gstr": gstr}
+        # Arithmetic BinOp on literals — evaluate at compile time
+        elif isinstance(val_node, BinOp):
+            result = self._eval_const_binop(val_node)
+            if isinstance(result, int):
+                gv = ir.GlobalVariable(self.module, I64_TY, name=d.name)
+                gv.linkage = "internal"
+                gv.global_constant = True
+                gv.initializer = ir.Constant(I64_TY, result)
+                self._globals[d.name] = {"ptr": gv, "vx_type": "int"}
+            elif isinstance(result, float):
+                gv = ir.GlobalVariable(self.module, F64_TY, name=d.name)
+                gv.linkage = "internal"
+                gv.global_constant = True
+                gv.initializer = ir.Constant(F64_TY, result)
+                self._globals[d.name] = {"ptr": gv, "vx_type": "float"}
+
+    def _eval_const_binop(self, node: 'BinOp'):
+        """Recursively evaluate a BinOp of literals at compile time."""
+        def _eval(n):
+            if isinstance(n, IntLiteral):   return n.value
+            if isinstance(n, FloatLiteral): return n.value
+            if isinstance(n, BinOp):
+                lv = _eval(n.left)
+                rv = _eval(n.right)
+                if n.op == "+":  return lv + rv
+                if n.op == "-":  return lv - rv
+                if n.op == "*":  return lv * rv
+                if n.op == "/":  return lv / rv
+                if n.op == "%":  return lv % rv
+                if n.op == "**": return lv ** rv
+                if n.op == "<<": return int(lv) << int(rv)
+                if n.op == ">>": return int(lv) >> int(rv)
+                if n.op == "&":  return int(lv) & int(rv)
+                if n.op == "|":  return int(lv) | int(rv)
+                if n.op == "^":  return int(lv) ^ int(rv)
+            raise CodegenError(f"Cannot evaluate comptime expr: {type(n).__name__}")
+        return _eval(node)
+
+    # ------------------------------------------------------------------ #
+    #  Thread / Mutex helpers (#49, #50)                                   #
+    # ------------------------------------------------------------------ #
+
+    def _build_thread_spawn(self) -> ir.Function:
+        """thread_spawn(fn_ptr: i8*) -> i64 thread_id"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_thread_spawn")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fn_ptr = fn.args[0]
+        if _sys.platform == "win32":
+            # HANDLE CreateThread(NULL, 0, fn, NULL, 0, NULL)
+            create_thread_ty = ir.FunctionType(I8PTR, [I8PTR, I64_TY, I8PTR, I8PTR, I32_TY, I8PTR])
+            create_thread = self._get_or_declare_fn("CreateThread", create_thread_ty)
+            null = ir.Constant(I8PTR, None)
+            handle = b.call(create_thread, [null, ir.Constant(I64_TY, 0), fn_ptr, null,
+                                            ir.Constant(I32_TY, 0), null])
+            tid = b.ptrtoint(handle, I64_TY)
+        else:
+            # pthread_create(&tid, NULL, fn, NULL)
+            tid_storage = b.alloca(I64_TY)
+            pthread_create_ty = ir.FunctionType(I32_TY, [ir.PointerType(I64_TY), I8PTR, I8PTR, I8PTR])
+            pthread_create = self._get_or_declare_fn("pthread_create", pthread_create_ty)
+            null = ir.Constant(I8PTR, None)
+            b.call(pthread_create, [tid_storage, null, fn_ptr, null])
+            tid = b.load(tid_storage)
+        b.ret(tid)
+        return fn
+
+    def _build_thread_join(self) -> ir.Function:
+        """thread_join(tid: i64) — wait for thread to finish"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_thread_join")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tid = fn.args[0]
+        if _sys.platform == "win32":
+            wait_ty = ir.FunctionType(I32_TY, [I8PTR, I32_TY])
+            wait_fn = self._get_or_declare_fn("WaitForSingleObject", wait_ty)
+            handle = b.inttoptr(tid, I8PTR)
+            b.call(wait_fn, [handle, ir.Constant(I32_TY, -1)])  # INFINITE
+        else:
+            pthread_join_ty = ir.FunctionType(I32_TY, [I64_TY, ir.PointerType(I8PTR)])
+            pthread_join = self._get_or_declare_fn("pthread_join", pthread_join_ty)
+            null = ir.Constant(ir.PointerType(I8PTR), None)
+            b.call(pthread_join, [tid, null])
+        b.ret_void()
+        return fn
+
+    def _build_thread_sleep(self) -> ir.Function:
+        """thread_sleep(ms: i64) — sleep for N milliseconds"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_thread_sleep")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ms = fn.args[0]
+        if _sys.platform == "win32":
+            sleep_ty = ir.FunctionType(VOID_TY, [I32_TY])
+            sleep_fn = self._get_or_declare_fn("Sleep", sleep_ty)
+            ms32 = b.trunc(ms, I32_TY)
+            b.call(sleep_fn, [ms32])
+        else:
+            usleep_ty = ir.FunctionType(I32_TY, [I32_TY])
+            usleep_fn = self._get_or_declare_fn("usleep", usleep_ty)
+            us = b.mul(ms, ir.Constant(I64_TY, 1000))
+            us32 = b.trunc(us, I32_TY)
+            b.call(usleep_fn, [us32])
+        b.ret_void()
+        return fn
+
+    def _build_mutex_new(self) -> ir.Function:
+        """mutex_new() -> i8* (opaque mutex pointer)"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_mutex_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        if _sys.platform == "win32":
+            # CRITICAL_SECTION is 40 bytes on 64-bit Windows
+            cs = b.call(self.malloc_fn, [ir.Constant(I64_TY, 48)])
+            init_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            init_fn = self._get_or_declare_fn("InitializeCriticalSection", init_ty)
+            b.call(init_fn, [cs])
+            b.ret(cs)
+        else:
+            # pthread_mutex_t is ~40 bytes; malloc and pthread_mutex_init
+            mu = b.call(self.malloc_fn, [ir.Constant(I64_TY, 48)])
+            init_ty = ir.FunctionType(I32_TY, [I8PTR, I8PTR])
+            init_fn = self._get_or_declare_fn("pthread_mutex_init", init_ty)
+            null = ir.Constant(I8PTR, None)
+            b.call(init_fn, [mu, null])
+            b.ret(mu)
+        return fn
+
+    def _build_mutex_lock(self) -> ir.Function:
+        """mutex_lock(mu: i8*)"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR]),
+                         name="__vx_mutex_lock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        mu = fn.args[0]
+        if _sys.platform == "win32":
+            lock_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            lock_fn = self._get_or_declare_fn("EnterCriticalSection", lock_ty)
+            b.call(lock_fn, [mu])
+        else:
+            lock_ty = ir.FunctionType(I32_TY, [I8PTR])
+            lock_fn = self._get_or_declare_fn("pthread_mutex_lock", lock_ty)
+            b.call(lock_fn, [mu])
+        b.ret_void()
+        return fn
+
+    def _build_mutex_unlock(self) -> ir.Function:
+        """mutex_unlock(mu: i8*)"""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR]),
+                         name="__vx_mutex_unlock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        mu = fn.args[0]
+        if _sys.platform == "win32":
+            unlock_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            unlock_fn = self._get_or_declare_fn("LeaveCriticalSection", unlock_ty)
+            b.call(unlock_fn, [mu])
+        else:
+            unlock_ty = ir.FunctionType(I32_TY, [I8PTR])
+            unlock_fn = self._get_or_declare_fn("pthread_mutex_unlock", unlock_ty)
+            b.call(unlock_fn, [mu])
+        b.ret_void()
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  Unicode helpers (#45)                                               #
+    # ------------------------------------------------------------------ #
+
+    def _build_str_char_len(self) -> ir.Function:
+        """str_char_len(s) -> int  — count UTF-8 codepoints (chars, not bytes)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_str_char_len")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s = fn.args[0]
+        # Count codepoints: any byte with bits 10xxxxxx (0x80..0xBF) is a continuation byte
+        cnt_al = b.alloca(I64_TY)
+        i_al   = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), cnt_al)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        slen = b.call(self.strlen_fn, [s])
+        chk = fn.append_basic_block("chk")
+        bdy = fn.append_basic_block("bdy")
+        ext = fn.append_basic_block("ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        i = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<", i, slen), bdy, ext)
+        b.position_at_end(bdy)
+        ch = b.load(b.gep(s, [i], inbounds=False))
+        ch32 = b.zext(ch, I32_TY)
+        mask = ir.Constant(I32_TY, 0xC0)
+        cont = ir.Constant(I32_TY, 0x80)
+        is_cont = b.icmp_unsigned("==", b.and_(ch32, mask), cont)
+        cnt = b.load(cnt_al)
+        new_cnt = b.select(is_cont, cnt, b.add(cnt, ir.Constant(I64_TY, 1)))
+        b.store(new_cnt, cnt_al)
+        b.store(b.add(i, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(b.load(cnt_al))
+        return fn
+
+    def _build_str_char_at_utf8(self) -> ir.Function:
+        """str_char_at_utf8(s, i) -> int (Unicode codepoint at position i)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I64_TY]),
+                         name="__vx_str_char_at_utf8")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s, idx = fn.args[0], fn.args[1]
+        # Walk codepoints until we hit the idx-th one
+        i_al   = b.alloca(I64_TY)   # byte index
+        cnt_al = b.alloca(I64_TY)   # codepoint count
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        b.store(ir.Constant(I64_TY, 0), cnt_al)
+        slen = b.call(self.strlen_fn, [s])
+        chk = fn.append_basic_block("chk")
+        bdy = fn.append_basic_block("bdy")
+        found = fn.append_basic_block("found")
+        ext   = fn.append_basic_block("ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        i = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<", i, slen), bdy, ext)
+        b.position_at_end(bdy)
+        ch = b.zext(b.load(b.gep(s, [i], inbounds=False)), I32_TY)
+        mask = ir.Constant(I32_TY, 0xC0)
+        cont = ir.Constant(I32_TY, 0x80)
+        is_cont = b.icmp_unsigned("==", b.and_(ch, mask), cont)
+        cnt = b.load(cnt_al)
+        b.cbranch(is_cont, chk, found)   # skip continuation bytes
+        b.position_at_end(found)
+        b.store(b.add(i, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(b.icmp_signed("==", cnt, idx),
+                  ext,
+                  fn.append_basic_block("next"))
+        next_b = list(fn.blocks)[-1]
+        b.position_at_end(next_b)
+        b.store(b.add(cnt, ir.Constant(I64_TY, 1)), cnt_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        # Return codepoint at current byte — simplified (ASCII + single-byte)
+        final_i = b.load(i_al)
+        final_ch = b.zext(b.load(b.gep(s, [b.sub(final_i, ir.Constant(I64_TY, 1))],
+                                        inbounds=False)), I64_TY)
+        b.ret(final_ch)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  JSON / HTTP helpers (#4 stdlib)                                     #
+    # ------------------------------------------------------------------ #
+
+    def _build_json_stringify_int(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_json_stringify_int")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 32)])
+        fmt_gv = self._global_str("%lld")
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), fn.args[0]])
+        b.ret(buf)
+        return fn
+
+    def _build_json_stringify_float(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [F64_TY]),
+                         name="__vx_json_stringify_float")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        fmt_gv = self._global_str("%g")
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), fn.args[0]])
+        b.ret(buf)
+        return fn
+
+    def _build_json_stringify_str(self) -> ir.Function:
+        """Wrap a string in JSON quotes: hello → \"hello\" """
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_json_stringify_str")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s = fn.args[0]
+        slen = b.call(self.strlen_fn, [s])
+        total = b.add(slen, ir.Constant(I64_TY, 3))   # 2 quotes + NUL
+        buf   = b.call(self.malloc_fn, [total])
+        fmt_gv = self._global_str("\"%s\"")
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), s])
+        b.ret(buf)
+        return fn
+
+    def _build_http_get(self) -> ir.Function:
+        """http_get(url) -> str — uses curl CLI if available; returns empty on failure."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_http_get")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        url = fn.args[0]
+        # Build command: "curl -s URL"
+        cmd_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 4096)])
+        fmt_gv  = self._global_str("curl -s %s")
+        b.call(self.sprintf_fn, [cmd_buf, self._gstr_ptr_const(fmt_gv), url])
+        # Use __vx_shell to run it
+        shell_fn = self._get_helper("__vx_shell")
+        result = b.call(shell_fn, [cmd_buf])
+        b.ret(result)
         return fn
 
 

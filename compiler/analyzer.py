@@ -68,6 +68,88 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "time_now":     ([],                          VX_INT),
     "time_format":  (["int"],                     VX_STR),
     "input":        (["str"],                     VX_STR),
+    # v7 additions — system
+    "argv":         ([],                          "str[]"),
+    "env_get":      (["str"],                     VX_STR),
+    "env_set":      (["str", "str"],              VX_VOID),
+    "env_unset":    (["str"],                     VX_VOID),
+    "shell":        (["str"],                     VX_STR),
+    "run":          (["str", "str[]"],            VX_INT),
+    # v7 — string extras
+    "str_find":     (["str", "str"],              VX_INT),
+    "str_slice":    (["str", "int", "int"],       VX_STR),
+    "str_repeat":   (["str", "int"],              VX_STR),
+    "str_join":     (["str[]", "str"],            VX_STR),
+    "str_char_at":  (["str", "int"],              VX_INT),
+    "str_len_utf8": (["str"],                     VX_INT),
+    "char_to_int":  (["str"],                     VX_INT),
+    "int_to_char":  (["int"],                     VX_STR),
+    # v7 — array extras
+    "array_sort":   (["any[]"],                   VX_VOID),
+    "array_sort_by":  (["any[]", "any"],          VX_VOID),
+    "array_map":    (["any[]", "any"],            "any[]"),
+    "array_filter": (["any[]", "any"],            "any[]"),
+    "array_reduce": (["any[]", "any", "any"],     "any"),
+    "array_index_of": (["any[]", "any"],          VX_INT),
+    "array_join":   (["str[]", "str"],            VX_STR),
+    # v7 — math
+    "pi":           ([],                          VX_FLOAT),
+    "tau":          ([],                          VX_FLOAT),
+    "inf":          ([],                          VX_FLOAT),
+    "nan":          ([],                          VX_FLOAT),
+    "is_nan":       (["float"],                   VX_BOOL),
+    "is_inf":       (["float"],                   VX_BOOL),
+    "hypot":        (["float", "float"],          VX_FLOAT),
+    "log10":        (["float"],                   VX_FLOAT),
+    "exp":          (["float"],                   VX_FLOAT),
+    "trunc":        (["float"],                   VX_FLOAT),
+    "sign":         (["float"],                   VX_INT),
+    # v7 — base64 / uuid / hash
+    "base64_encode": (["str"],                    VX_STR),
+    "base64_decode": (["str"],                    VX_STR),
+    "uuid_v4":      ([],                          VX_STR),
+    "sha256":       (["str"],                     VX_STR),
+    "md5":          (["str"],                     VX_STR),
+    # v7 — regex
+    "regex_match":  (["str", "str"],              VX_STR),
+    "regex_test":   (["str", "str"],              VX_BOOL),
+    "regex_find_all": (["str", "str"],            "str[]"),
+    "regex_replace": (["str", "str", "str"],      VX_STR),
+    # v7 — csv
+    "csv_parse":    (["str"],                     "str[][]"),
+    "csv_stringify":  (["str[][]"],               VX_STR),
+    # v7 — threading (basic)
+    "thread_spawn": (["any"],                     VX_INT),
+    "thread_join":  (["int"],                     VX_VOID),
+    "mutex_new":    ([],                          VX_INT),
+    "mutex_lock":   (["int"],                     VX_VOID),
+    "mutex_unlock": (["int"],                     VX_VOID),
+    "mutex_try_lock": (["int"],                   VX_BOOL),
+    # v7 — atomics
+    "atomic_new":   (["int"],                     VX_INT),
+    "atomic_load":  (["int"],                     VX_INT),
+    "atomic_store": (["int", "int"],              VX_VOID),
+    "atomic_add":   (["int", "int"],              VX_INT),
+    "atomic_sub":   (["int", "int"],              VX_INT),
+    "atomic_cas":   (["int", "int", "int"],       VX_BOOL),
+    # v7 — file I/O expansion
+    "file_open":    (["str", "str"],              VX_INT),
+    "file_close":   (["int"],                     VX_VOID),
+    "file_read_bytes": (["int", "int"],           VX_STR),
+    "file_write_bytes": (["int", "str"],          VX_INT),
+    "file_seek":    (["int", "int"],              VX_VOID),
+    "file_tell":    (["int"],                     VX_INT),
+    "file_size":    (["str"],                     VX_INT),
+    # v7 — test helpers
+    "assert_eq":    (["any", "any"],              VX_VOID),
+    "assert_neq":   (["any", "any"],              VX_VOID),
+    "assert_true":  (["bool"],                    VX_VOID),
+    "assert_false": (["bool"],                    VX_VOID),
+    # v7 — sqlite
+    "db_open":      (["str"],                     VX_INT),
+    "db_exec":      (["int", "str"],              VX_VOID),
+    "db_query":     (["int", "str"],              "str[][]"),
+    "db_close":     (["int"],                     VX_VOID),
 }
 
 
@@ -130,6 +212,13 @@ class Analyzer:
                     self._register_fn(decl)
             elif isinstance(decl, StructDecl):
                 self._register_struct(decl)
+                # Register methods defined inside the struct body
+                for m in getattr(decl, 'methods', []):
+                    mn = f"{decl.name}__{m.name}"
+                    self._fn_sigs[mn] = FnSig(
+                        [(p.name, p.type_name) for p in m.params],
+                        m.return_type or VX_VOID,
+                    )
             elif isinstance(decl, (GlobalLet, GlobalConst)):
                 self._register_global(decl)
             elif isinstance(decl, EnumDecl):
@@ -151,6 +240,46 @@ class Analyzer:
                     fn_key = f"{decl.struct_name}__{m.name}__impl_{decl.interface_name}"
                     params = [(p.name, p.type_name) for p in m.params]
                     self._fn_sigs[fn_key] = FnSig(params, m.return_type or VX_VOID)
+            elif isinstance(decl, (PubDecl, PrivDecl)):
+                # Recurse into visibility wrappers
+                inner = decl.inner
+                if isinstance(inner, FnDecl):
+                    if inner.type_params:
+                        self._generic_fns[inner.name] = inner
+                        self._fn_sigs[inner.name] = FnSig(
+                            [(p.name, p.type_name) for p in inner.params],
+                            inner.return_type or VX_VOID,
+                        )
+                    else:
+                        self._register_fn(inner)
+                elif isinstance(inner, StructDecl):
+                    self._register_struct(inner)
+                    # Register struct methods
+                    for m in getattr(inner, 'methods', []):
+                        mn = f"{inner.name}__{m.name}"
+                        self._fn_sigs[mn] = FnSig(
+                            [(p.name, p.type_name) for p in m.params],
+                            m.return_type or VX_VOID,
+                        )
+            elif isinstance(decl, ExternFnDecl):
+                params = [(p.name, p.type_name) for p in decl.params]
+                self._fn_sigs[decl.name] = FnSig(params, decl.return_type or VX_VOID)
+            elif isinstance(decl, TestDecl):
+                test_fn_name = f"__test__{decl.name.replace(' ', '_')}"
+                self._fn_sigs[test_fn_name] = FnSig([], VX_VOID)
+            elif isinstance(decl, ComptimeDecl):
+                # Treat as a global constant
+                t = self._infer_expr(decl.value)
+                self._global_types[decl.name] = t
+                self._scopes[0][decl.name] = t
+            elif isinstance(decl, EnumDeclADT):
+                # Register ADT variants as struct-like types
+                for variant in decl.variants:
+                    vkey = f"{decl.name}.{variant.name}"
+                    self._global_types[vkey] = decl.name
+                    self._scopes[0][vkey] = decl.name
+                    if variant.fields:
+                        self._struct_fields[variant.name] = [(f.name, f.type_name) for f in variant.fields]
 
         # Pass 2 — analyze function bodies
         for decl in program.declarations:
@@ -349,6 +478,75 @@ class Analyzer:
             for s in node.body: self._analyze_stmt(s, ret_type)
             self._loop_depth -= 1; self._pop()
 
+        elif isinstance(node, DoWhileStmt):
+            self._push(); self._loop_depth += 1
+            for s in node.body: self._analyze_stmt(s, ret_type)
+            self._loop_depth -= 1; self._pop()
+            self._infer_expr(node.condition)
+
+        elif isinstance(node, LabeledStmt):
+            self._analyze_stmt(node.stmt, ret_type)
+
+        elif isinstance(node, (BreakLabel, ContinueLabel)):
+            pass  # label validation is optional for now
+
+        elif isinstance(node, DeferStmt):
+            self._infer_expr(node.expr)
+
+        elif isinstance(node, YieldStmt):
+            if node.value: self._infer_expr(node.value)
+
+        elif isinstance(node, ThrowStmt):
+            self._infer_expr(node.value)
+
+        elif isinstance(node, RaiseStmt):
+            self._infer_expr(node.value)
+
+        elif isinstance(node, UnsafeBlock):
+            self._push()
+            for s in node.body: self._analyze_stmt(s, ret_type)
+            self._pop()
+
+        elif isinstance(node, TryCatchFinally):
+            self._push()
+            for s in node.try_body: self._analyze_stmt(s, ret_type)
+            self._pop()
+            for clause in node.catches:
+                self._push()
+                self._declare(clause.var, VX_STR)
+                for s in clause.body: self._analyze_stmt(s, ret_type)
+                self._pop()
+            if node.finally_body:
+                self._push()
+                for s in node.finally_body: self._analyze_stmt(s, ret_type)
+                self._pop()
+
+        elif isinstance(node, StructDestructure):
+            t = self._infer_expr(node.value)
+            fields = self._struct_fields.get(t, [])
+            field_map = {fn: ft for fn, ft in fields}
+            for i, fname in enumerate(node.fields):
+                alias = node.aliases[i] if i < len(node.aliases) else None
+                bind_name = alias if alias else fname
+                ft = field_map.get(fname, VX_INT)
+                self._declare(bind_name, ft)
+
+        elif isinstance(node, ArrayDestructure):
+            arr_t = self._infer_expr(node.value)
+            elem_t = arr_t[:-2] if arr_t.endswith("[]") else VX_INT
+            for name in node.names:
+                self._declare(name, elem_t)
+            if node.rest_name:
+                self._declare(node.rest_name, arr_t)
+
+        elif isinstance(node, MatchCaseGuard):
+            # handled inside MatchStmt analysis — shouldn't arrive here alone
+            pass
+
+        elif isinstance(node, (TestDecl, ExternFnDecl, ComptimeDecl,
+                               EnumDeclADT, PubDecl, PrivDecl)):
+            pass  # handled in pass 1 or structure pass
+
         elif isinstance(node, (EnumDecl, ImportStmt, TypeAlias, NamespaceHint,
                                InterfaceDecl, ImplDecl)):
             pass  # handled in pass 1 or before analysis
@@ -384,7 +582,30 @@ class Analyzer:
     # ------------------------------------------------------------------ #
 
     def _infer_expr(self, node: Node) -> str:
-        if isinstance(node, TypePattern):   return VX_BOOL  # type checks are boolean
+        if isinstance(node, TypePattern):       return VX_BOOL
+        if isinstance(node, IntLiteral):        return VX_INT
+        if isinstance(node, CharLiteral):       return VX_INT   # char is an int code point
+        if isinstance(node, NullCoalesceExpr):
+            lt = self._infer_expr(node.left)
+            return lt[:-1] if lt.endswith("?") else lt
+        if isinstance(node, OptionalChainExpr):
+            # Return the field type with ? appended
+            ot = self._infer_expr(node.obj)
+            base = ot[:-1] if ot.endswith("?") else ot
+            fields = self._struct_fields.get(base, [])
+            for fn, ft in fields:
+                if fn == node.field: return ft + "?"
+            return VX_INT
+        if isinstance(node, SliceExpr):
+            ot = self._infer_expr(node.obj)
+            return ot   # slice of str→str, arr→arr
+        if isinstance(node, ListComp):
+            et = self._infer_expr(node.expr)
+            return et + "[]"
+        if isinstance(node, AwaitExpr):
+            return self._infer_expr(node.expr)
+        if isinstance(node, NamedArg):
+            return self._infer_expr(node.value)
         if isinstance(node, IntLiteral):    return VX_INT
         if isinstance(node, FloatLiteral):  return VX_FLOAT
         if isinstance(node, BoolLiteral):   return VX_BOOL

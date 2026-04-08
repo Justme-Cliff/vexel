@@ -19,6 +19,7 @@ class TT(Enum):
     INT          = auto()
     FLOAT        = auto()
     STRING       = auto()
+    CHAR         = auto()   # 'a'  character literal
 
     # Identifiers & keywords
     IDENT        = auto()
@@ -32,6 +33,7 @@ class TT(Enum):
     FOR          = auto()
     IN           = auto()
     WHILE        = auto()
+    DO           = auto()
     BREAK        = auto()
     CONTINUE     = auto()
     STRUCT       = auto()
@@ -51,10 +53,24 @@ class TT(Enum):
     ASSERT       = auto()
     TRY          = auto()
     CATCH        = auto()
+    FINALLY      = auto()
+    THROW        = auto()
     TYPE         = auto()
     AS           = auto()
     INTERFACE    = auto()
     IMPL         = auto()
+    DEFER        = auto()
+    ASYNC        = auto()
+    AWAIT        = auto()
+    YIELD        = auto()
+    PUB          = auto()
+    PRIV         = auto()
+    TEST         = auto()
+    COMPTIME     = auto()
+    EXTERN       = auto()
+    UNSAFE       = auto()
+    WHERE        = auto()
+    RAISE        = auto()
 
     # Arithmetic operators
     PLUS         = auto()
@@ -62,12 +78,25 @@ class TT(Enum):
     STAR         = auto()
     SLASH        = auto()
     PERCENT      = auto()
+    STAR_STAR    = auto()   # **  exponent
 
     # Compound assignment
     PLUS_ASSIGN  = auto()   # +=
     MINUS_ASSIGN = auto()   # -=
     STAR_ASSIGN  = auto()   # *=
     SLASH_ASSIGN = auto()   # /=
+    PERCENT_ASSIGN = auto() # %=
+    AMP_ASSIGN   = auto()   # &=
+    PIPE_ASSIGN  = auto()   # |=
+    CARET_ASSIGN = auto()   # ^=
+
+    # Bitwise operators
+    AMPERSAND    = auto()   # &
+    PIPE         = auto()   # |
+    CARET        = auto()   # ^
+    TILDE        = auto()   # ~
+    LSHIFT       = auto()   # <<
+    RSHIFT       = auto()   # >>
 
     # Comparison
     EQ           = auto()   # ==
@@ -82,7 +111,10 @@ class TT(Enum):
     ARROW        = auto()   # ->
     ELLIPSIS     = auto()   # ...
     DOTDOT       = auto()   # ..
+    DOTDOT_EQ    = auto()   # ..=  inclusive range
     QUESTION     = auto()   # ?
+    NULL_COALESCE = auto()  # ??
+    AT           = auto()   # @   for attributes
 
     # Punctuation
     LPAREN       = auto()   # (
@@ -94,6 +126,7 @@ class TT(Enum):
     COLON        = auto()   # :
     COMMA        = auto()   # ,
     DOT          = auto()   # .
+    SEMICOLON    = auto()   # ;
 
     # Structure
     NEWLINE      = auto()
@@ -103,39 +136,54 @@ class TT(Enum):
 
 
 KEYWORDS: dict[str, TT] = {
-    "fn":       TT.FN,
-    "let":      TT.LET,
-    "const":    TT.CONST,
-    "return":   TT.RETURN,
-    "if":       TT.IF,
-    "elif":     TT.ELIF,
-    "else":     TT.ELSE,
-    "for":      TT.FOR,
-    "in":       TT.IN,
-    "while":    TT.WHILE,
-    "break":    TT.BREAK,
-    "continue": TT.CONTINUE,
-    "struct":   TT.STRUCT,
-    "true":     TT.TRUE,
-    "false":    TT.FALSE,
-    "null":     TT.NULL,
-    "new":      TT.NEW,
-    "print":    TT.PRINT,
-    "and":      TT.AND,
-    "or":       TT.OR,
-    "not":      TT.NOT,
-    "enum":     TT.ENUM,
-    "match":    TT.MATCH,
-    "case":     TT.CASE,
-    "default":  TT.DEFAULT,
-    "import":   TT.IMPORT,
-    "assert":   TT.ASSERT,
-    "try":      TT.TRY,
-    "catch":    TT.CATCH,
-    "type":     TT.TYPE,
-    "as":       TT.AS,
+    "fn":        TT.FN,
+    "let":       TT.LET,
+    "const":     TT.CONST,
+    "return":    TT.RETURN,
+    "if":        TT.IF,
+    "elif":      TT.ELIF,
+    "else":      TT.ELSE,
+    "for":       TT.FOR,
+    "in":        TT.IN,
+    "while":     TT.WHILE,
+    "do":        TT.DO,
+    "break":     TT.BREAK,
+    "continue":  TT.CONTINUE,
+    "struct":    TT.STRUCT,
+    "true":      TT.TRUE,
+    "false":     TT.FALSE,
+    "null":      TT.NULL,
+    "new":       TT.NEW,
+    "print":     TT.PRINT,
+    "and":       TT.AND,
+    "or":        TT.OR,
+    "not":       TT.NOT,
+    "enum":      TT.ENUM,
+    "match":     TT.MATCH,
+    "case":      TT.CASE,
+    "default":   TT.DEFAULT,
+    "import":    TT.IMPORT,
+    "assert":    TT.ASSERT,
+    "try":       TT.TRY,
+    "catch":     TT.CATCH,
+    "finally":   TT.FINALLY,
+    "throw":     TT.THROW,
+    "raise":     TT.RAISE,
+    "type":      TT.TYPE,
+    "as":        TT.AS,
     "interface": TT.INTERFACE,
     "impl":      TT.IMPL,
+    "defer":     TT.DEFER,
+    "async":     TT.ASYNC,
+    "await":     TT.AWAIT,
+    "yield":     TT.YIELD,
+    "pub":       TT.PUB,
+    "priv":      TT.PRIV,
+    "test":      TT.TEST,
+    "comptime":  TT.COMPTIME,
+    "extern":    TT.EXTERN,
+    "unsafe":    TT.UNSAFE,
+    "where":     TT.WHERE,
 }
 
 
@@ -320,6 +368,21 @@ class Lexer:
 
         ch = s[pos]
 
+        # Char literals: 'a'  '\n'  '\t'  '\\'  '\''
+        if ch == "'":
+            i = pos + 1
+            if i < len(s):
+                if s[i] == '\\' and i + 1 < len(s):
+                    esc = s[i + 1]
+                    val = {'n': '\n', 't': '\t', '\\': '\\', "'": "'"}.get(esc, esc)
+                    i += 2
+                else:
+                    val = s[i]
+                    i += 1
+                if i < len(s) and s[i] == "'":
+                    return Token(TT.CHAR, val, self.line), i + 1
+            raise LexError(f"Line {self.line}: unterminated char literal")
+
         # String literals (double-quoted)
         if ch == '"':
             i = pos + 1
@@ -328,7 +391,8 @@ class Lexer:
                 c = s[i]
                 if c == '\\' and i + 1 < len(s):
                     esc = s[i + 1]
-                    buf.append({'n': '\n', 't': '\t', '\\': '\\', '"': '"'}.get(esc, esc))
+                    buf.append({'n': '\n', 't': '\t', 'r': '\r', '\\': '\\',
+                                '"': '"', '0': '\0'}.get(esc, esc))
                     i += 2
                 elif c == '"':
                     break
@@ -337,15 +401,34 @@ class Lexer:
                     i += 1
             return Token(TT.STRING, ''.join(buf), self.line), i + 1
 
-        # Float
-        m = re.match(r"\d+\.\d+", s[pos:])
-        if m:
-            return Token(TT.FLOAT, float(m.group()), self.line), pos + m.end()
-
-        # Int
-        m = re.match(r"\d+", s[pos:])
-        if m:
-            return Token(TT.INT, int(m.group()), self.line), pos + m.end()
+        # Numeric literals — hex, binary, octal, float, decimal (with _ separators)
+        if ch.isdigit() or (ch == '0' and pos + 1 < len(s) and s[pos + 1] in 'xXbBoO'):
+            rest = s[pos:]
+            # Hex: 0x...
+            m = re.match(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*", rest)
+            if m:
+                raw = m.group().replace('_', '')
+                return Token(TT.INT, int(raw, 16), self.line), pos + m.end()
+            # Binary: 0b...
+            m = re.match(r"0[bB][01][01_]*", rest)
+            if m:
+                raw = m.group().replace('_', '')
+                return Token(TT.INT, int(raw, 2), self.line), pos + m.end()
+            # Octal: 0o...
+            m = re.match(r"0[oO][0-7][0-7_]*", rest)
+            if m:
+                raw = m.group().replace('_', '')
+                return Token(TT.INT, int(raw, 8), self.line), pos + m.end()
+            # Float with underscore separators
+            m = re.match(r"[\d_]+\.[\d_]+", rest)
+            if m and re.match(r"\d", m.group()):
+                raw = m.group().replace('_', '')
+                return Token(TT.FLOAT, float(raw), self.line), pos + m.end()
+            # Int with underscore separators
+            m = re.match(r"[\d_]+", rest)
+            if m and re.match(r"\d", m.group()):
+                raw = m.group().replace('_', '')
+                return Token(TT.INT, int(raw), self.line), pos + m.end()
 
         # Identifiers / keywords
         m = re.match(r"[A-Za-z_]\w*", s[pos:])
@@ -354,30 +437,44 @@ class Lexer:
             tt   = KEYWORDS.get(word, TT.IDENT)
             return Token(tt, word, self.line), pos + m.end()
 
-        # Three-char — ELLIPSIS must be checked before DOTDOT
+        # Three-char operators (check before two-char)
         three = s[pos:pos + 3]
         if three == "...":
             return Token(TT.ELLIPSIS, "...", self.line), pos + 3
+        if three == "..=":
+            return Token(TT.DOTDOT_EQ, "..=", self.line), pos + 3
+        if three == "<<=":
+            return Token(TT.AMP_ASSIGN, "<<=", self.line), pos + 3   # reuse slot
+        if three == ">>=":
+            return Token(TT.PIPE_ASSIGN, ">>=", self.line), pos + 3  # reuse slot
 
-        # Two-char operators — check BEFORE single-char
+        # Two-char operators
         two = s[pos:pos + 2]
         two_map = {
-            "==": TT.EQ,          "!=": TT.NEQ,
-            "<=": TT.LTE,         ">=": TT.GTE,
-            "->": TT.ARROW,       "..": TT.DOTDOT,
-            "+=": TT.PLUS_ASSIGN, "-=": TT.MINUS_ASSIGN,
-            "*=": TT.STAR_ASSIGN, "/=": TT.SLASH_ASSIGN,
+            "==": TT.EQ,           "!=": TT.NEQ,
+            "<=": TT.LTE,          ">=": TT.GTE,
+            "->": TT.ARROW,        "..": TT.DOTDOT,
+            "+=": TT.PLUS_ASSIGN,  "-=": TT.MINUS_ASSIGN,
+            "*=": TT.STAR_ASSIGN,  "/=": TT.SLASH_ASSIGN,
+            "%=": TT.PERCENT_ASSIGN,
+            "&=": TT.AMP_ASSIGN,   "|=": TT.PIPE_ASSIGN,
+            "^=": TT.CARET_ASSIGN,
+            "<<": TT.LSHIFT,       ">>": TT.RSHIFT,
+            "**": TT.STAR_STAR,
+            "??": TT.NULL_COALESCE,
         }
         if two in two_map:
             return Token(two_map[two], two, self.line), pos + 2
 
         # Single-char tokens
         one_map = {
-            "+": TT.PLUS,    "-": TT.MINUS,    "*": TT.STAR,   "/": TT.SLASH,
-            "%": TT.PERCENT, "=": TT.ASSIGN,   "<": TT.LT,     ">": TT.GT,
-            "(": TT.LPAREN,  ")": TT.RPAREN,   "{": TT.LBRACE, "}": TT.RBRACE,
-            "[": TT.LBRACKET,"]": TT.RBRACKET,
-            ":": TT.COLON,   ",": TT.COMMA,    ".": TT.DOT,    "?": TT.QUESTION,
+            "+": TT.PLUS,     "-": TT.MINUS,    "*": TT.STAR,    "/": TT.SLASH,
+            "%": TT.PERCENT,  "=": TT.ASSIGN,   "<": TT.LT,      ">": TT.GT,
+            "(": TT.LPAREN,   ")": TT.RPAREN,   "{": TT.LBRACE,  "}": TT.RBRACE,
+            "[": TT.LBRACKET, "]": TT.RBRACKET,
+            ":": TT.COLON,    ",": TT.COMMA,    ".": TT.DOT,     "?": TT.QUESTION,
+            "&": TT.AMPERSAND, "|": TT.PIPE,    "^": TT.CARET,   "~": TT.TILDE,
+            "@": TT.AT,        ";": TT.SEMICOLON,
         }
         if ch in one_map:
             tt = one_map[ch]

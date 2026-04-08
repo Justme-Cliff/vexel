@@ -2,31 +2,48 @@
 
 A compiled programming language with Python-like syntax that compiles to native machine code via LLVM.
 
-Write code that reads like English. Run it at native speed.
+Write code that reads like Python. Run it at native speed.
 
 ```vexel
 fn main():
     let name: str = "World"
-    print(f"Hello, {name}!")
+    print("Hello, " + name + "!")
 
     let nums: int[] = [1, 2, 3, 4, 5]
-    nums.push(6)
+    let doubled: int[] = [x * 2 for x in nums if x > 2]
+    print(doubled)
 
-    for i, n in nums:
-        print(f"{i}: {n * n}")
+    let uid: str = uuid_v4()
+    print(uid)
 ```
 
 ## Features
 
-- **Clean, readable syntax** — indentation-based blocks, no braces or semicolons
-- **Static types** — `int`, `float`, `bool`, `str`, arrays, dicts, tuples, structs, enums
+- **Clean syntax** — indentation-based blocks, no braces or semicolons
+- **Static types** — `int`, `float`, `bool`, `str`, `char`, arrays, dicts, tuples, structs, enums
+- **Integer variants** — `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`
 - **Interfaces** — vtable-based polymorphism with `interface` / `impl`
 - **Generics** — monomorphized generic functions `fn first[T](arr: T[]) -> T`
-- **Closures** — first-class functions and lambdas `fn(x: int) -> int`
-- **Null safety** — nullable types `T?`, null checks
-- **Modules** — namespace imports `import "lib.vx" as math`
+- **Closures with capture** — lambdas close over outer variables
+- **Algebraic data types** — ADT enums with per-variant payload fields
+- **Match guards** — `case n if n > 0:`
+- **Null safety** — nullable types `T?`, null coalescing `??`, optional chaining `?.`
+- **Defer** — guaranteed cleanup on scope exit (like Go)
+- **Labeled loops** — `break outer` / `continue outer` for nested loops
+- **do-while** — body runs at least once
+- **Destructuring** — `let {x, y} = point` and `let [a, b, ...rest] = arr`
+- **List comprehensions** — `[x * 2 for x in arr if x > 0]`
+- **Comptime constants** — `comptime let N = 1024 * 1024`
+- **Extern fn** — declare C functions directly
+- **pub / priv** — visibility modifiers
+- **Unsafe blocks** — escape hatch for low-level code
+- **Test framework** — `test "name": body` blocks with `assert_eq`, `assert_true`, etc.
+- **Threads** — `thread_spawn` / `thread_join` / `thread_sleep`
+- **Mutexes** — `mutex_new` / `mutex_lock` / `mutex_unlock`
+- **Atomic operations** — `atomic_new`, `atomic_add`, `atomic_load`, `atomic_compare_swap`
+- **Rich stdlib** — base64, UUID, SHA-256, CSV, JSON, HTTP, regex-ready
 - **Compiles to native binaries** — via LLVM + gcc
-- **Fast JIT mode** — `vexel run` executes instantly without a separate compile step
+- **Fast JIT mode** — `vexel run` executes instantly
 - **VS Code syntax highlighting** — included in `vexel-vscode/`
 
 ## Installation
@@ -38,75 +55,60 @@ fn main():
 
 **Setup:**
 ```
-git clone https://github.com/Justme-Cliff/vexel
-cd vexel
+git clone https://github.com/Justme-Cliff/vexel-lang
+cd vexel-lang
 ```
 
-Add the `vexel` folder to your PATH, or run directly with `python main.py`.
+Add the project folder to your PATH, or run directly with `python main.py`.
 
 On Windows a `vexel.bat` is included — add the project folder to PATH and run `vexel` from anywhere.
 
 **VS Code syntax highlighting:**
 
-1. Download the file `vexel-vscode/vexel-1.0.0.vsix` from this repo
-2. Open VS Code
-3. Press `Ctrl+Shift+P` and type `Extensions: Install from VSIX...`
-4. Select the downloaded `vexel-1.0.0.vsix` file
-5. Reload VS Code when prompted
-
-Your `.vx` files will now have syntax highlighting.
+1. Download `vexel-vscode/vexel-1.0.0.vsix` from this repo
+2. Open VS Code → `Ctrl+Shift+P` → `Extensions: Install from VSIX...`
+3. Select the `.vsix` file and reload VS Code
 
 ## Usage
 
 ```bash
-vexel run   hello.vx           # JIT compile and run immediately
-vexel compile hello.vx         # compile to hello.exe / hello
-vexel compile hello.vx --sdl2  # compile with SDL2 for graphics
-vexel ir    hello.vx           # print LLVM IR
-vexel parse hello.vx           # print AST
-vexel lex   hello.vx           # print tokens
+vexel run     hello.vx        # JIT compile and run immediately
+vexel compile hello.vx        # compile to hello.exe / hello
+vexel ir      hello.vx        # print LLVM IR
+vexel parse   hello.vx        # print AST
+vexel lex     hello.vx        # print tokens
 ```
 
-## Language reference
+## Language Reference
 
 ### Types
 
 | Type | Description | Example |
 |------|-------------|---------|
 | `int` | 64-bit integer | `42` |
+| `i8` `u8` `i32` `u32` | sized integers | `let b: u8 = 255` |
 | `float` | 64-bit double | `3.14` |
 | `bool` | boolean | `true` / `false` |
-| `str` | UTF-8 string | `"hello"` |
+| `char` | 8-bit character | `let c: char = 65` |
+| `str` | null-terminated string | `"hello"` |
 | `T[]` | array of T | `int[]`, `str[]` |
 | `dict[K, V]` | hash map | `dict[str, int]` |
 | `(T1, T2)` | tuple | `(int, float)` |
 | `T?` | nullable T | `int?`, `str?` |
 | `fn(T) -> R` | function type | `fn(int) -> bool` |
-| `MyStruct` | user-defined struct | — |
-| `MyInterface` | interface type | — |
 
 ### Variables
 
 ```vexel
 let x: int = 10
 let name: str = "Vexel"
-let nums: int[] = [1, 2, 3]
-let ratio: float = 3.14
+let big: int = 1_000_000        # numeric separator
+let hex: int = 0xFF             # hex literal
+let bin: int = 0b1010_1010      # binary literal
+let oct: int = 0o755            # octal literal
 const MAX: int = 100            # top-level constant
+comptime let BUF = 256 * 4      # compile-time constant
 type Speed = float              # type alias
-```
-
-### String interpolation and multi-line strings
-
-```vexel
-let x: int = 42
-print(f"The answer is {x}!")    # f-strings
-
-let text: str = """
-Line one
-Line two
-Line three
-"""
 ```
 
 ### Functions
@@ -116,7 +118,7 @@ fn add(a: int, b: int) -> int:
     return a + b
 
 fn greet(name: str = "World"):  # default parameters
-    print(f"Hello, {name}!")
+    print("Hello, " + name + "!")
 
 fn sum(...nums: int[]) -> int:  # variadic
     let total: int = 0
@@ -124,10 +126,22 @@ fn sum(...nums: int[]) -> int:  # variadic
         total += n
     return total
 
-fn min_max(arr: int[]) -> (int, int):  # multi-return via tuple
+fn min_max(arr: int[]) -> (int, int):
     return (arr[0], arr[arr.len() - 1])
 
-let (lo, hi): (int, int) = min_max([3, 1, 4, 1, 5])
+pub fn public_api() -> int:     # visibility
+    return 42
+
+extern fn strlen(s: str) -> int # C FFI
+```
+
+### Closures with Capture
+
+```vexel
+fn main():
+    let multiplier: int = 3
+    let triple: fn(int) -> int = fn(x: int) -> int: return x * multiplier
+    print(triple(7))    # 21 — multiplier is captured from outer scope
 ```
 
 ### Generics
@@ -136,41 +150,22 @@ let (lo, hi): (int, int) = min_max([3, 1, 4, 1, 5])
 fn first[T](arr: T[]) -> T:
     return arr[0]
 
-fn last[T](arr: T[]) -> T:
-    return arr[arr.len() - 1]
+fn identity[T](x: T) -> T:
+    return x
 
-let x: int = first([10, 20, 30])      # 10
-let s: str = last(["a", "b", "c"])    # "c"
-```
-
-### Closures and first-class functions
-
-```vexel
-let double: fn(int) -> int = fn(x: int) -> int:
-    return x * 2
-
-fn apply(arr: int[], f: fn(int) -> int) -> int[]:
-    let result: int[] = []
-    for x in arr:
-        result.push(f(x))
-    return result
-
-let doubled: int[] = apply([1, 2, 3, 4, 5], double)
+let x: int = first([10, 20, 30])   # 10
+let s: str = identity("hello")     # "hello"
 ```
 
 ### Interfaces
 
 ```vexel
 interface Shape:
-    fn area(self) -> float
-    fn name(self) -> str
+    fn area() -> float
+    fn name() -> str
 
 struct Circle:
     radius: float
-
-struct Rect:
-    width: float
-    height: float
 
 impl Shape for Circle:
     fn area(self) -> float:
@@ -178,143 +173,18 @@ impl Shape for Circle:
     fn name(self) -> str:
         return "Circle"
 
-impl Shape for Rect:
-    fn area(self) -> float:
-        return self.width * self.height
-    fn name(self) -> str:
-        return "Rect"
-
 fn describe(s: Shape):
-    print(s.name() + " has area " + str(s.area()))
+    print(s.name() + " area=" + str(s.area()))
 
 fn main():
     let c: Shape = new Circle(5.0)
-    let r: Shape = new Rect(4.0, 3.0)
-    describe(c)    # Circle has area 78.5397
-    describe(r)    # Rect has area 12
-```
-
-### Pattern matching on types
-
-Works on interface values — checks the concrete type and binds fields:
-
-```vexel
-fn classify(s: Shape) -> str:
-    match s:
-        case Circle(radius):
-            return "circle with radius " + str(radius)
-        case Rect(w, h):
-            return "rect " + str(w) + "x" + str(h)
-    return "unknown"
-```
-
-### Null safety
-
-```vexel
-let maybe: int? = null
-if maybe != null:
-    print(maybe)
-
-let val: str? = "hello"
-print(val)   # prints: hello
-```
-
-### Modules and namespaces
-
-```vexel
-import "mathlib.vx" as math
-
-let x: int = math.square(5)    # 25
-let y: float = math.average(3.0, 7.0)  # 5.0
-```
-
-### Dictionaries
-
-```vexel
-let scores: dict[str, int] = {}
-scores["Alice"] = 95
-scores["Bob"]   = 87
-print(scores["Alice"])          # 95
-print(scores.has("Bob"))        # true
-let keys: str[] = scores.keys()
-scores.remove("Bob")
-print(scores.len())             # 1
-```
-
-### Control flow
-
-```vexel
-# if / elif / else
-if x > 0:
-    print("positive")
-elif x < 0:
-    print("negative")
-else:
-    print("zero")
-
-# range loop
-for i in 0..10:
-    print(i)
-
-# for-each
-for item in my_array:
-    print(item)
-
-# for-each with index
-for i, item in my_array:
-    print(f"{i}: {item}")
-
-# while
-while x > 0:
-    x -= 1
-
-# chained comparisons
-if 0 < x < 10:
-    print("single digit")
-
-# ternary
-let label: str = x > 0 ? "positive" : "non-positive"
-
-# break / continue
-for i in 0..100:
-    if i == 5:
-        break
-```
-
-### Match statement
-
-```vexel
-# value matching
-match status:
-    case 0:
-        print("ok")
-    case 1, 2:
-        print("warning")
-    default:
-        print("unknown")
-
-# type pattern matching (on interface values)
-match shape:
-    case Circle(r):
-        print("radius=" + str(r))
-    case Rect(w, h):
-        print("width=" + str(w))
-```
-
-### Structs
-
-```vexel
-struct Vec2:
-    x: float
-    y: float
-
-let v: Vec2 = new Vec2(3.0, 4.0)
-print(v.x)
+    describe(c)
 ```
 
 ### Enums
 
 ```vexel
+# Simple enum
 enum Direction:
     North
     South
@@ -324,69 +194,246 @@ enum Direction:
 let dir: int = Direction.North
 match dir:
     case Direction.North: print("going north")
-    case Direction.South: print("going south")
+    default:              print("other")
 ```
 
-### Arrays
+### Match with Guards
 
 ```vexel
-let nums: int[] = [10, 20, 30]
-nums.push(40)
-let last: int = nums.pop()
-print(nums.len())
-print(nums.contains(20))    # true
-nums.reverse()
-print(nums[0])
-nums[0] = 99
-
-for n in nums:
-    print(n)
+let score: int = 85
+match score:
+    case s if s >= 90: print("A")
+    case s if s >= 80: print("B")
+    case s if s >= 70: print("C")
+    default:           print("F")
 ```
 
-### String methods
+### Null Safety
 
 ```vexel
-let s: str = "Hello, World"
-print(s.upper())                     # "HELLO, WORLD"
-print(s.lower())                     # "hello, world"
-print(s.len())                       # 12
-print(s.contains("World"))           # true
-print(s.starts_with("Hello"))        # true
-print(s.ends_with("World"))          # true
-print(s.replace("World", "Vexel"))  # "Hello, Vexel"
-print(s.trim())                      # strips whitespace
-print(s[0])                          # "H"
+let maybe: int? = null
+let val: int = maybe ?? 42      # null coalescing — val = 42
 
-let parts: str[] = s.split(", ")
+let user: User? = find_user(id)
+let name: str? = user?.name     # optional chaining — null if user is null
 ```
 
-### Error handling
+### Destructuring
+
+```vexel
+# Struct destructuring
+let {x, y} = point
+
+# Array destructuring
+let [first, second] = arr
+
+# Tuple unpacking
+let (q, r): (int, int) = divmod(17, 5)
+```
+
+### List Comprehensions
+
+```vexel
+let evens: int[] = [x for x in nums if x % 2 == 0]
+let squares: int[] = [x * x for x in 0..10]
+```
+
+### Defer
+
+```vexel
+fn load_file(path: str) -> str:
+    let f = open(path)
+    defer f.close()         # runs when function exits, no matter what
+    return f.read()
+```
+
+### Labeled Loops
+
+```vexel
+outer:
+for i in 0..10:
+    for j in 0..10:
+        if i == j:
+            break outer     # breaks the outer loop
+```
+
+### do-while
+
+```vexel
+let i: int = 0
+do:
+    print(i)
+    i = i + 1
+while i < 5:
+```
+
+### Error Handling
 
 ```vexel
 try:
-    let content: str = read_file("missing.txt")
-    if content == "":
-        throw("File empty")
+    let data: str = read_file("missing.txt")
+    if data == "":
+        throw("File is empty")
+catch IOError as e:
+    print("IO error: " + e)
 catch e:
     print("Error: " + e)
+finally:
+    print("cleanup")
 ```
 
-### Math builtins
+### Comptime
 
 ```vexel
-sqrt(x)    floor(x)    ceil(x)    round(x)
-abs(x)     pow(a, b)
-min(a, b)  max(a, b)   clamp(x, lo, hi)
-lerp(a, b, t)          atan2(y, x)
-sin(x)     cos(x)      tan(x)
-log(x)     log2(x)
-rand()                 # float 0.0–1.0
-rand_int(a, b)         # int in [a, b]
-PI                     # 3.14159...
-E                      # 2.71828...
+comptime let MAX_SIZE = 1024 * 64
+comptime let FLAG = 1 << 8
+comptime let MASK = 0xFF & FLAG
 ```
 
-### Conversion builtins
+### Test Framework
+
+```vexel
+test "addition":
+    assert_eq(1 + 1, 2)
+    assert_true(10 > 5)
+    assert_false(3 > 10)
+
+test "strings":
+    let s: str = str_upper("hello")
+    assert_eq(s, "HELLO")
+```
+
+### Threads and Synchronization
+
+```vexel
+let mu: int? = mutex_new()
+let counter: int? = atomic_new(0)
+
+fn worker():
+    mutex_lock(mu)
+    atomic_add(counter, 1)
+    mutex_unlock(mu)
+
+fn main():
+    let t1: int = thread_spawn(worker)
+    let t2: int = thread_spawn(worker)
+    thread_join(t1)
+    thread_join(t2)
+    print(atomic_load(counter))   # 2
+```
+
+### Atomic Operations
+
+```vexel
+let val: int? = atomic_new(0)
+atomic_add(val, 10)
+atomic_sub(val, 3)
+let n: int = atomic_load(val)           # 7
+let ok: bool = atomic_compare_swap(val, 7, 100)  # true
+```
+
+### Bitwise Operators
+
+```vexel
+let flags: int = 0b0101 & 0b0011   # AND  → 1
+let mask:  int = 1 << 4             # shift → 16
+let inv:   int = ~flags             # NOT
+let merged = flags | 0b1000         # OR
+let diff   = flags ^ 0b0111         # XOR
+```
+
+### String Builtins
+
+```vexel
+str_upper(s)                    # "HELLO"
+str_lower(s)                    # "hello"
+str_trim(s)                     # strip whitespace
+str_find(s, "world")            # index or -1
+str_slice(s, 0, 5)              # substring
+str_repeat("ab", 3)             # "ababab"
+str_replace(s, "old", "new")
+str_split(s, ",")               # str[]
+str_contains(s, "lo")           # bool
+str_starts_with(s, "He")        # bool
+str_ends_with(s, "ld")          # bool
+char_at(s, 0)                   # single-char str
+char_to_int("A")                # 65
+int_to_char(65)                 # "A"
+str_char_len(s)                 # UTF-8 codepoint count
+str_format("%s is %d", name, age)
+```
+
+### Array Builtins
+
+```vexel
+array_sort(arr)
+array_reverse(arr)
+array_index_of(arr, val)        # int or -1
+array_contains(arr, val)        # bool
+array_slice(arr, 1, 4)          # new sub-array
+array_join(words, ", ")         # str
+```
+
+### Math Builtins
+
+```vexel
+sqrt(x)   floor(x)   ceil(x)   round(x)
+abs(x)    pow(a, b)
+min(a, b) max(a, b)  clamp(x, lo, hi)
+lerp(a, b, t)        atan2(y, x)
+sin(x)    cos(x)     tan(x)
+log(x)    log2(x)    log10(x)
+exp(x)    hypot(a, b)
+rand()               rand_int(a, b)
+```
+
+### Stdlib Builtins
+
+```vexel
+# Encoding
+base64_encode(s)        # str
+base64_decode(s)        # str
+
+# Crypto / IDs
+sha256(s)               # hex string
+uuid_v4()               # "xxxxxxxx-xxxx-4xxx-..."
+
+# Data
+csv_parse(s, ",")       # str[][]
+json_stringify_int(n)   # "42"
+json_stringify_float(f) # "3.14"
+json_stringify_str(s)   # "\"hello\""
+
+# OS
+argv()                  # str[]
+env_get("HOME")         # str
+env_set("KEY", "val")
+shell("ls -la")         # str (stdout)
+http_get(url)           # str (via curl)
+
+# File I/O
+read_file("data.txt")
+write_file("out.txt", content)
+append_file("log.txt", line)
+file_exists("data.txt")   # bool
+os_cwd()
+os_mkdir("dir")
+os_delete("file")
+os_list_dir(".")          # str[]
+
+# Time and input
+time_now()              # Unix timestamp int
+time_format(ts)         # human-readable str
+input("Name: ")         # read stdin line
+
+# Type helpers
+type_of(val)            # str
+is_null(val)            # bool
+to_int(s)               # str/float → int
+to_float(s)             # str/int → float
+```
+
+### Conversion
 
 ```vexel
 int(3.9)          # 3
@@ -394,48 +441,23 @@ float(5)          # 5.0
 str(42)           # "42"
 bool(1)           # true
 parse_int("42")   # 42
-parse_float("3.14")  # 3.14
-```
-
-### OS and file builtins
-
-```vexel
-read_file("data.txt")
-write_file("out.txt", "hello")
-append_file("log.txt", "line\n")
-file_exists("data.txt")         # bool
-os_cwd()                        # current directory as str
-os_mkdir("new_dir")             # bool
-os_delete("file.txt")           # bool
-os_list_dir(".")                # str[]
-```
-
-### Time and input
-
-```vexel
-let ts: int = time_now()        # Unix timestamp
-let line: str = input("Name: ") # read a line from stdin
+parse_float("3.14")
 ```
 
 ### Operators
 
 ```
-+  -  *  /  %           arithmetic
-==  !=  <  >  <=  >=    comparison (chainable: 0 < x < 10)
-and  or  not             logical
-+=  -=  *=  /=          compound assignment
-->                       return type / function arrow
-?  :                     ternary  (cond ? a : b)
-..                       range  (0..10)
-...                      variadic param prefix
-?                        nullable type suffix  (int?)
-```
-
-### Assert and exit
-
-```vexel
-assert x > 0, "x must be positive"
-exit(0)
++  -  *  /  %  **        arithmetic (** = power)
+&  |  ^  ~  <<  >>       bitwise
+==  !=  <  >  <=  >=     comparison
+and  or  not              logical
++=  -=  *=  /=           compound assignment
+??                        null coalesce
+?.                        optional chain
+..   ..=                  range (exclusive / inclusive)
+->                        return type arrow
+?   :                     ternary  (cond ? a : b)
+...                       variadic param prefix
 ```
 
 ## Examples
@@ -453,29 +475,28 @@ fn main():
         print(fib(i))
 ```
 
-### Higher-order functions
+### Generic Stack
 
 ```vexel
-fn apply(arr: int[], f: fn(int) -> int) -> int[]:
-    let result: int[] = []
-    for x in arr:
-        result.push(f(x))
-    return result
+fn push[T](stack: T[], val: T) -> T[]:
+    stack.push(val)
+    return stack
+
+fn pop[T](stack: T[]) -> T:
+    return stack.pop()
 
 fn main():
-    let nums: int[] = [1, 2, 3, 4, 5]
-    let doubled: int[] = apply(nums, fn(x: int) -> int:
-        return x * 2
-    )
-    for n in doubled:
-        print(n)
+    let s: int[] = []
+    push(s, 10)
+    push(s, 20)
+    print(pop(s))   # 20
 ```
 
-### Interface polymorphism
+### Interface Polymorphism
 
 ```vexel
 interface Animal:
-    fn speak(self) -> str
+    fn speak() -> str
 
 struct Dog:
     name: str
@@ -484,39 +505,48 @@ struct Cat:
     name: str
 
 impl Animal for Dog:
-    fn speak(self) -> str:
-        return self.name + " says: woof!"
+    fn speak(self) -> str: return self.name + " says: woof!"
 
 impl Animal for Cat:
-    fn speak(self) -> str:
-        return self.name + " says: meow!"
-
-fn make_noise(a: Animal):
-    print(a.speak())
+    fn speak(self) -> str: return self.name + " says: meow!"
 
 fn main():
-    let d: Animal = new Dog("Rex")
-    let c: Animal = new Cat("Whiskers")
-    make_noise(d)
-    make_noise(c)
+    let animals: Animal[] = [new Dog("Rex"), new Cat("Whiskers")]
+    for a in animals:
+        print(a.speak())
 ```
 
-### Namespace imports
+### Thread-Safe Counter
 
 ```vexel
-# mathlib.vx
-fn square(n: int) -> int: return n * n
-fn cube(n: int) -> int:   return n * n * n
+let mu: int? = mutex_new()
+let count: int? = atomic_new(0)
 
-# main.vx
-import "mathlib.vx" as math
+fn increment():
+    mutex_lock(mu)
+    atomic_add(count, 1)
+    mutex_unlock(mu)
 
 fn main():
-    print(math.square(4))   # 16
-    print(math.cube(3))     # 27
+    let threads: int[] = []
+    for i in 0..10:
+        threads.push(thread_spawn(increment))
+    for t in threads:
+        thread_join(t)
+    print(atomic_load(count))   # 10
 ```
 
-## Project structure
+### CSV Processing
+
+```vexel
+fn main():
+    let data: str = read_file("sales.csv")
+    let rows: str[][] = csv_parse(data, ",")
+    for row in rows:
+        print(row[0] + ": " + row[1])
+```
+
+## Project Structure
 
 ```
 compiler/
