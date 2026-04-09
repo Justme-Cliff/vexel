@@ -6630,13 +6630,53 @@ def jit_run(llvm_ir: str) -> int:
     tm     = target.create_target_machine()
     mod    = binding.parse_assembly(llvm_ir)
     mod.verify()
+    # Apply optimization passes: mem2reg promotes alloca-in-loops to SSA
+    # registers (prevents stack overflow in large loops) and also speeds
+    # up the generated code significantly.
+    try:
+        pto = binding.PipelineTuningOptions()
+        pto.speed_level = 2
+        pto.loop_vectorization = False
+        pto.slp_vectorization = False
+        pb  = binding.create_pass_builder(tm, pto)
+        mpm = pb.getModulePassManager()
+        mpm.run(mod, pb)
+    except Exception:
+        pass  # optimization is best-effort; continue without it
+
     engine = binding.create_mcjit_compiler(mod, tm)
+    # On Windows the C runtime uses _popen/_pclose instead of popen/pclose.
+    # Register the aliased names so the JIT can resolve them.
+    if sys.platform == "win32":
+        import ctypes.util
+        _crt = ctypes.CDLL("msvcrt")
+        for _win, _vx in [("_popen", "popen"), ("_pclose", "pclose"),
+                           ("_fdopen", "fdopen"), ("_fileno", "fileno")]:
+            _fn = getattr(_crt, _win, None)
+            if _fn:
+                binding.add_symbol(_vx, ctypes.cast(_fn, ctypes.c_void_p).value)
     engine.finalize_object()
     engine.run_static_constructors()
     addr   = engine.get_function_address("main")
     if not addr:
         raise CodegenError("No 'main' function found")
-    ctypes.CFUNCTYPE(None)(addr)()
+    # Run on a thread with a large stack so that loops with many alloca
+    # instructions (e.g. a 1M-element push loop) don't overflow the default
+    # 1 MB Windows stack.
+    import threading
+    exc_holder = [None]
+    def _run():
+        try:
+            ctypes.CFUNCTYPE(None)(addr)()
+        except Exception as e:
+            exc_holder[0] = e
+    old_size = threading.stack_size(64 * 1024 * 1024)  # 64 MB
+    t = threading.Thread(target=_run)
+    t.start()                          # start while 64 MB is still active
+    threading.stack_size(old_size)     # restore after thread is launched
+    t.join()
+    if exc_holder[0]:
+        raise exc_holder[0]
     return 0
 
 
