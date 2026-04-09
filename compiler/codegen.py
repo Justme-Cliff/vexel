@@ -95,6 +95,9 @@ class Compiler:
         # Defer stacks: one list per function nesting level
         self._defer_stack: list[list] = []
 
+        # Named return values for current function
+        self._current_named_returns: list[tuple] = []
+
         # Interface vtable registry
         # name → {methods:[str,...], method_sigs:{name:MethodSig}, vtable_ll, fat_ll}
         self._interfaces: dict[str, dict] = {}
@@ -305,7 +308,7 @@ class Compiler:
             vt = self._infer_type(node.pairs[0][1])
             return f"dict[{kt},{vt}]"
         if isinstance(node, Identifier):
-            if node.name in ("PI", "E"): return "float"
+            if node.name in ("PI", "TAU", "E", "INF", "NAN"): return "float"
             info = self._lookup(node.name)
             return info["vx_type"] if info else "int"
         if isinstance(node, BinOp):
@@ -494,7 +497,8 @@ class Compiler:
         lt.set_body(*[self._vx_to_llvm(f.type_name) for f in d.fields])
         self._structs[d.name] = {
             "llvm_type": lt,
-            "fields": [(f.name, f.type_name) for f in d.fields],
+            "fields":    [(f.name, f.type_name) for f in d.fields],
+            "defaults":  [f.default for f in d.fields],  # AST nodes or None
         }
 
     # ------------------------------------------------------------------ #
@@ -534,6 +538,17 @@ class Compiler:
             self.builder.store(arg, al)
             self._declare(param.name, al, resolved)
 
+        # Named return values: allocate and declare them as local variables
+        if d.named_returns:
+            for (ret_name, ret_type) in d.named_returns:
+                resolved_rt = self._resolve_type(ret_type)
+                al = self.builder.alloca(self._vx_to_llvm(resolved_rt), name=ret_name)
+                self.builder.store(ir.Constant(self._vx_to_llvm(resolved_rt), 0), al)
+                self._declare(ret_name, al, resolved_rt)
+            self._current_named_returns = d.named_returns
+        else:
+            self._current_named_returns = []
+
         for stmt in d.body:
             if self.builder.block.is_terminated: break
             self._compile_stmt(stmt)
@@ -542,6 +557,18 @@ class Compiler:
             self._emit_defers()
             if fn.ftype.return_type == VOID_TY:
                 self.builder.ret_void()
+            elif self._current_named_returns:
+                # Bare return — return named return values
+                nrs = self._current_named_returns
+                if len(nrs) == 1:
+                    rname, rtype = nrs[0]
+                    info = self._lookup(rname)
+                    if info:
+                        self.builder.ret(self.builder.load(info["ptr"]))
+                    else:
+                        self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
+                else:
+                    self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
             else:
                 self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
 
@@ -1008,6 +1035,15 @@ class Compiler:
         ret_ty = self.current_fn.ftype.return_type
         self._emit_defers()   # run deferred exprs before return
         if node.value is None:
+            # Named return: bare return loads the named return variable
+            nrs = getattr(self, '_current_named_returns', [])
+            if nrs and ret_ty != VOID_TY:
+                if len(nrs) == 1:
+                    rname, _ = nrs[0]
+                    info = self._lookup(rname)
+                    if info:
+                        self.builder.ret(self.builder.load(info["ptr"]))
+                        return
             if ret_ty == VOID_TY: self.builder.ret_void()
             else:                 self.builder.ret(ir.Constant(ret_ty, 0))
         else:
@@ -1412,6 +1448,13 @@ class Compiler:
         if start_v.type != I64_TY: start_v = self.builder.fptosi(start_v, I64_TY)
         if end_v.type   != I64_TY: end_v   = self.builder.fptosi(end_v,   I64_TY)
 
+        # Optional step (default 1, may be negative for countdown)
+        if node.step:
+            step_v, _ = self._compile_expr(node.step)
+            if step_v.type != I64_TY: step_v = self.builder.fptosi(step_v, I64_TY)
+        else:
+            step_v = ir.Constant(I64_TY, 1)
+
         i_al = self.builder.alloca(I64_TY, name=node.var)
         self.builder.store(start_v, i_al)
 
@@ -1421,8 +1464,22 @@ class Compiler:
 
         self.builder.branch(chk)
         self.builder.position_at_end(chk)
-        iv   = self.builder.load(i_al)
-        cond = self.builder.icmp_signed("<", iv, end_v)
+        iv = self.builder.load(i_al)
+        # Dynamic step sign: if step > 0 then i < end, else i > end
+        # (inclusive range uses <= / >=)
+        inclusive = getattr(node, 'inclusive', False)
+        if node.step:
+            step_pos = self.builder.icmp_signed(">", step_v, ir.Constant(I64_TY, 0))
+            if inclusive:
+                cond_fwd = self.builder.icmp_signed("<=", iv, end_v)
+                cond_rev = self.builder.icmp_signed(">=", iv, end_v)
+            else:
+                cond_fwd = self.builder.icmp_signed("<",  iv, end_v)
+                cond_rev = self.builder.icmp_signed(">",  iv, end_v)
+            cond = self.builder.select(step_pos, cond_fwd, cond_rev)
+        else:
+            cmp_op = "<=" if inclusive else "<"
+            cond = self.builder.icmp_signed(cmp_op, iv, end_v)
         self.builder.cbranch(cond, bdy, ext)
 
         self.builder.position_at_end(bdy)
@@ -1438,7 +1495,7 @@ class Compiler:
         self._pop_scope()
         if not self.builder.block.is_terminated:
             ic   = self.builder.load(i_al)
-            inxt = self.builder.add(ic, ir.Constant(I64_TY, 1))
+            inxt = self.builder.add(ic, step_v)
             self.builder.store(inxt, i_al)
             self.builder.branch(chk)
 
@@ -1759,8 +1816,16 @@ class Compiler:
             # Built-in constants
             if node.name == "PI":
                 return ir.Constant(F64_TY, 3.141592653589793), "float"
+            if node.name == "TAU":
+                return ir.Constant(F64_TY, 6.283185307179586), "float"
             if node.name == "E":
                 return ir.Constant(F64_TY, 2.718281828459045), "float"
+            if node.name == "INF":
+                import math
+                return ir.Constant(F64_TY, math.inf), "float"
+            if node.name == "NAN":
+                import math
+                return ir.Constant(F64_TY, math.nan), "float"
             info = self._lookup(node.name)
             if info is None:
                 raise CodegenError(f"Undefined variable '{node.name}'")
@@ -1789,6 +1854,13 @@ class Compiler:
         if isinstance(node, ListComp):
             return self._compile_list_comp(node)
 
+        if isinstance(node, PipeExpr):
+            # value |> func — should have been desugared in parser, but handle here too
+            val_v, val_t = self._compile_expr(node.value)
+            if isinstance(node.func, Identifier):
+                return self._compile_expr(Call(node.func.name, [node.value]))
+            return self._compile_expr(node.func)
+
         if isinstance(node, TernaryExpr):
             return self._compile_ternary(node)
 
@@ -1804,6 +1876,13 @@ class Compiler:
             return self.builder.load(ptr, name=node.field), vt
 
         if isinstance(node, NewExpr):  return self._compile_new(node)
+
+        if isinstance(node, StructUpdateExpr):
+            return self._compile_struct_update(node)
+
+        if isinstance(node, SpreadExpr):
+            # Spread used as standalone expression — just return the underlying value
+            return self._compile_expr(node.value)
 
         if isinstance(node, IndexExpr):
             obj_v, obj_t = self._compile_expr(node.obj)
@@ -1987,6 +2066,11 @@ class Compiler:
     def _compile_list_comp(self, node: 'ListComp') -> tuple[ir.Value, str]:
         """[expr for var in iterable if cond]  →  build new array."""
         fn = self.current_fn
+
+        # B2 fix: handle RangeExpr iterables
+        if isinstance(node.iterable, RangeExpr):
+            return self._compile_list_comp_range(node)
+
         arr_v, avt = self._compile_expr(node.iterable)
         elem_vt = avt[:-2] if avt.endswith("[]") else "int"
         elem_lt = self._vx_to_llvm(elem_vt)
@@ -2061,6 +2145,89 @@ class Compiler:
 
         self.builder.position_at_end(ext)
         return result_arr, elem_vt + "[]"
+
+    def _compile_list_comp_range(self, node: 'ListComp') -> tuple[ir.Value, str]:
+        """[expr for var in start..end [step s] [if cond]]  →  range-based list comp."""
+        fn = self.current_fn
+        rng = node.iterable   # RangeExpr
+        start_v, _ = self._compile_expr(rng.start)
+        end_v,   _ = self._compile_expr(rng.end)
+        if start_v.type != I64_TY: start_v = self.builder.fptosi(start_v, I64_TY)
+        if end_v.type   != I64_TY: end_v   = self.builder.fptosi(end_v,   I64_TY)
+        if rng.step:
+            step_v, _ = self._compile_expr(rng.step)
+            if step_v.type != I64_TY: step_v = self.builder.fptosi(step_v, I64_TY)
+        else:
+            step_v = ir.Constant(I64_TY, 1)
+
+        # Allocate result array
+        result_arr_raw = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        result_arr = self.builder.bitcast(result_arr_raw, self.arr_ptr_type)
+        init_data = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        z = ir.Constant(I32_TY, 0)
+        dp_sl = self.builder.gep(result_arr, [z, z], inbounds=True)
+        self.builder.store(init_data, dp_sl)
+        lp_sl = self.builder.gep(result_arr, [z, ir.Constant(I32_TY,1)], inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, 0), lp_sl)
+        cp_sl = self.builder.gep(result_arr, [z, ir.Constant(I32_TY,2)], inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, 8), cp_sl)
+
+        i_al = self.builder.alloca(I64_TY, name="_lc_i")
+        self.builder.store(start_v, i_al)
+
+        chk = fn.append_basic_block("lc.chk")
+        bdy = fn.append_basic_block("lc.bdy")
+        ext = fn.append_basic_block("lc.ext")
+
+        self.builder.branch(chk)
+        self.builder.position_at_end(chk)
+        iv = self.builder.load(i_al)
+        cmp_op = "<=" if rng.inclusive else "<"
+        cond = self.builder.icmp_signed(cmp_op, iv, end_v)
+        self.builder.cbranch(cond, bdy, ext)
+
+        self.builder.position_at_end(bdy)
+        self._push_scope()
+        item_al = self.builder.alloca(I64_TY, name=node.var)
+        self.builder.store(iv, item_al)
+        self._declare(node.var, item_al, "int")
+
+        do_push = fn.append_basic_block("lc.push")
+        skip_b  = fn.append_basic_block("lc.skip")
+
+        if node.condition:
+            cv, _ = self._compile_expr(node.condition)
+            self.builder.cbranch(cv, do_push, skip_b)
+        else:
+            self.builder.branch(do_push)
+
+        self.builder.position_at_end(do_push)
+        map_val, map_vt = self._compile_expr(node.expr)
+        esz = ir.Constant(I64_TY, _elem_size(map_vt))
+        map_al = self.builder.alloca(self._vx_to_llvm(map_vt))
+        self.builder.store(map_val, map_al)
+        map_raw = self.builder.bitcast(map_al, I8PTR)
+        fn_h = self._get_helper("__vx_array_push")
+        self.builder.call(fn_h, [result_arr_raw, map_raw, esz])
+        self.builder.branch(skip_b)
+
+        self.builder.position_at_end(skip_b)
+        self._pop_scope()
+        ic   = self.builder.load(i_al)
+        inxt = self.builder.add(ic, step_v)
+        self.builder.store(inxt, i_al)
+        self.builder.branch(chk)
+
+        self.builder.position_at_end(ext)
+        # Infer result element type from the map expression (default int)
+        res_elem_vt = "int"
+        try:
+            from compiler.analyzer import Analyzer as _A
+            # Quick type inference: check the map_val type
+            res_elem_vt = map_vt if 'map_vt' in dir() else "int"
+        except Exception:
+            pass
+        return result_arr, res_elem_vt + "[]"
 
     def _compile_method_call(self, node: MethodCall) -> tuple[ir.Value, str]:
         # Namespace call: ns.func(args) where ns is a known namespace alias
@@ -2288,6 +2455,13 @@ class Compiler:
     #  Private helper functions                                            #
     # ------------------------------------------------------------------ #
 
+    def _get_or_declare(self, name: str, fn_type: ir.FunctionType) -> ir.Function:
+        """Get or declare an LLVM intrinsic or external function by name."""
+        for f in self.module.functions:
+            if f.name == name:
+                return f
+        return ir.Function(self.module, fn_type, name=name)
+
     def _get_helper(self, name: str) -> ir.Function:
         if name in self._helper_fns:
             return self._helper_fns[name]
@@ -2332,6 +2506,8 @@ class Compiler:
             "__vx_dict_remove":          self._build_dict_remove,
             "__vx_dict_len":             self._build_dict_len,
             "__vx_dict_keys":            self._build_dict_keys,
+            "__vx_dict_values":          self._build_dict_values,
+            "__vx_dict_items":           self._build_dict_items,
             # v5 helpers
             "__vx_time_format":          self._build_time_format,
             "__vx_input":                self._build_input,
@@ -2361,6 +2537,59 @@ class Compiler:
             "__vx_json_stringify_float": self._build_json_stringify_float,
             "__vx_json_stringify_str":   self._build_json_stringify_str,
             "__vx_http_get":             self._build_http_get,
+            # v8 new helpers
+            "__vx_csv_write":            self._build_csv_write,
+            "__vx_print_color":          self._build_print_color,
+            "__vx_dict_values":          self._build_dict_values,
+            "__vx_dict_items":           self._build_dict_items,
+            "__vx_datetime_now":         self._build_datetime_now,
+            "__vx_datetime_format":      self._build_datetime_format,
+            "__vx_datetime_from_ts":     self._build_datetime_from_ts,
+            "__vx_sleep_ms":             self._build_sleep_ms,
+            "__vx_signal_handle":        self._build_signal_handle,
+            "__vx_process_spawn":        self._build_process_spawn,
+            "__vx_process_wait":         self._build_process_wait,
+            "__vx_process_kill":         self._build_process_kill,
+            "__vx_progress_new":         self._build_progress_new,
+            "__vx_progress_update":      self._build_progress_update,
+            "__vx_progress_finish":      self._build_progress_finish,
+            "__vx_term_clear":           self._build_term_clear,
+            "__vx_term_move":            self._build_term_move,
+            "__vx_term_width":           self._build_term_width,
+            "__vx_channel_new":          self._build_channel_new,
+            "__vx_channel_send":         self._build_channel_send,
+            "__vx_channel_recv":         self._build_channel_recv,
+            "__vx_channel_try_recv":     self._build_channel_try_recv,
+            "__vx_channel_close":        self._build_channel_close,
+            "__vx_rwlock_new":           self._build_rwlock_new,
+            "__vx_rwlock_read_lock":     self._build_rwlock_read_lock,
+            "__vx_rwlock_read_unlock":   self._build_rwlock_read_unlock,
+            "__vx_rwlock_write_lock":    self._build_rwlock_write_lock,
+            "__vx_rwlock_write_unlock":  self._build_rwlock_write_unlock,
+            "__vx_thread_pool_new":      self._build_thread_pool_new,
+            "__vx_thread_pool_submit":   self._build_thread_pool_submit,
+            "__vx_thread_pool_wait":     self._build_thread_pool_wait,
+            "__vx_thread_pool_destroy":  self._build_thread_pool_destroy,
+            "__vx_benchmark":            self._build_benchmark,
+            "__vx_bench_ns":             self._build_bench_ns,
+            "__vx_json_parse_int":       self._build_json_parse_int,
+            "__vx_json_parse_str":       self._build_json_parse_str,
+            "__vx_json_parse_float":     self._build_json_parse_float,
+            "__vx_json_parse_bool":      self._build_json_parse_bool,
+            "__vx_env_load":             self._build_env_load,
+            "__vx_set_new":              self._build_set_new,
+            "__vx_set_add":              self._build_set_add,
+            "__vx_set_contains":         self._build_set_contains,
+            "__vx_set_remove":           self._build_set_remove,
+            "__vx_set_size":             self._build_set_size,
+            "__vx_set_to_array":         self._build_set_to_array,
+            "__vx_set_union":            self._build_set_union,
+            "__vx_set_intersect":        self._build_set_intersect,
+            "__vx_uuid_v1":              self._build_uuid_v1,
+            "__vx_condvar_new":          self._build_condvar_new,
+            "__vx_condvar_wait":         self._build_condvar_wait,
+            "__vx_condvar_signal":       self._build_condvar_signal,
+            "__vx_condvar_broadcast":    self._build_condvar_broadcast,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -3945,19 +4174,39 @@ class Compiler:
         # --- Mutex (#50) ---
         if name == "mutex_new":
             fn_h = self._get_helper("__vx_mutex_new")
-            return self.builder.call(fn_h, []), "int?"
+            raw = self.builder.call(fn_h, [])
+            return self.builder.ptrtoint(raw, I64_TY), "int"
 
         if name == "mutex_lock":
             fn_h = self._get_helper("__vx_mutex_lock")
             mu_v, _ = self._compile_expr(node.args[0])
-            self.builder.call(fn_h, [mu_v])
+            mu_ptr = self.builder.inttoptr(mu_v, I8PTR) if mu_v.type == I64_TY else mu_v
+            self.builder.call(fn_h, [mu_ptr])
             return ir.Constant(I64_TY, 0), "void"
 
         if name == "mutex_unlock":
             fn_h = self._get_helper("__vx_mutex_unlock")
             mu_v, _ = self._compile_expr(node.args[0])
-            self.builder.call(fn_h, [mu_v])
+            mu_ptr = self.builder.inttoptr(mu_v, I8PTR) if mu_v.type == I64_TY else mu_v
+            self.builder.call(fn_h, [mu_ptr])
             return ir.Constant(I64_TY, 0), "void"
+
+        if name == "mutex_try_lock":
+            import sys as _sys
+            mu_v, _ = self._compile_expr(node.args[0])
+            mu_ptr = self.builder.inttoptr(mu_v, I8PTR) if mu_v.type == I64_TY else mu_v
+            if _sys.platform == "win32":
+                # TryEnterCriticalSection returns BOOL (i32)
+                try_ty = ir.FunctionType(I32_TY, [I8PTR])
+                try_fn = self._get_or_declare("TryEnterCriticalSection",
+                                              ir.FunctionType(I32_TY, [I8PTR]))
+                r32 = self.builder.call(try_fn, [mu_ptr])
+                return self.builder.icmp_signed("!=", r32, ir.Constant(I32_TY, 0)), "bool"
+            else:
+                try_ty = ir.FunctionType(I32_TY, [I8PTR])
+                try_fn_f = self._get_or_declare_fn("pthread_mutex_trylock", try_ty)
+                r32 = self.builder.call(try_fn_f, [mu_ptr])
+                return self.builder.icmp_signed("==", r32, ir.Constant(I32_TY, 0)), "bool"
 
         # --- str_format (printf-style, #4 stdlib) ---
         if name == "str_format":
@@ -4019,6 +4268,372 @@ class Compiler:
                 return val_v, vt
             return ir.Constant(I64_TY, 0), "null"
 
+        # --- v8 New builtins ---
+
+        if name == "rand_seed":
+            val_v, _ = self._compile_expr(node.args[0])
+            if val_v.type != I32_TY:
+                val_v = self.builder.trunc(val_v, I32_TY) if val_v.type == I64_TY \
+                        else self.builder.fptosi(val_v, I32_TY)
+            self.builder.call(self.srand_fn, [val_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "csv_write":
+            rows_v, _ = self._compile_expr(node.args[0])
+            delim_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_csv_write")
+            return self.builder.call(fn_h, [self.builder.bitcast(rows_v, I8PTR), delim_v]), "str"
+
+        if name == "popcount":
+            val_v, _ = self._compile_expr(node.args[0])
+            if val_v.type != I64_TY: val_v = self.builder.sext(val_v, I64_TY)
+            fn_ty = ir.FunctionType(I64_TY, [I64_TY])
+            intr = self._get_or_declare("llvm.ctpop.i64", fn_ty)
+            return self.builder.call(intr, [val_v]), "int"
+
+        if name == "clz":
+            val_v, _ = self._compile_expr(node.args[0])
+            if val_v.type != I64_TY: val_v = self.builder.sext(val_v, I64_TY)
+            fn_ty = ir.FunctionType(I64_TY, [I64_TY, I1_TY])
+            intr = self._get_or_declare("llvm.ctlz.i64", fn_ty)
+            return self.builder.call(intr, [val_v, ir.Constant(I1_TY, 0)]), "int"
+
+        if name == "ctz":
+            val_v, _ = self._compile_expr(node.args[0])
+            if val_v.type != I64_TY: val_v = self.builder.sext(val_v, I64_TY)
+            fn_ty = ir.FunctionType(I64_TY, [I64_TY, I1_TY])
+            intr = self._get_or_declare("llvm.cttz.i64", fn_ty)
+            return self.builder.call(intr, [val_v, ir.Constant(I1_TY, 0)]), "int"
+
+        if name == "bit_reverse":
+            val_v, _ = self._compile_expr(node.args[0])
+            if val_v.type != I64_TY: val_v = self.builder.sext(val_v, I64_TY)
+            fn_ty = ir.FunctionType(I64_TY, [I64_TY])
+            intr = self._get_or_declare("llvm.bitreverse.i64", fn_ty)
+            return self.builder.call(intr, [val_v]), "int"
+
+        if name == "log_info":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fmt = self._gstr_ptr(self._global_str("\033[0;32m[INFO]\033[0m %s\n"))
+            self.builder.call(self.printf, [fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "log_warn":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fmt = self._gstr_ptr(self._global_str("\033[0;33m[WARN]\033[0m %s\n"))
+            self.builder.call(self.printf, [fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "log_error":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fmt = self._gstr_ptr(self._global_str("\033[0;31m[ERROR]\033[0m %s\n"))
+            self.builder.call(self.printf, [fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "log_debug":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fmt = self._gstr_ptr(self._global_str("\033[0;36m[DEBUG]\033[0m %s\n"))
+            self.builder.call(self.printf, [fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "print_color":
+            msg_v,   _ = self._compile_expr(node.args[0])
+            color_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_print_color")
+            self.builder.call(fn_h, [msg_v, color_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "print_bold":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fmt = self._gstr_ptr(self._global_str("\033[1m%s\033[0m\n"))
+            self.builder.call(self.printf, [fmt, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v8 builtins ---
+
+        if name == "datetime_now":
+            fn_h = self._get_helper("__vx_datetime_now")
+            return self.builder.call(fn_h, []), "str"
+
+        if name == "datetime_format":
+            fmt_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_datetime_format")
+            return self.builder.call(fn_h, [fmt_v]), "str"
+
+        if name == "datetime_timestamp":
+            null_ptr = ir.Constant(I8PTR, None)
+            return self.builder.call(self.time_fn, [null_ptr]), "int"
+
+        if name == "datetime_from_ts":
+            ts_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_datetime_from_ts")
+            return self.builder.call(fn_h, [ts_v]), "str"
+
+        if name == "sleep_ms":
+            ms_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_sleep_ms")
+            self.builder.call(fn_h, [ms_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "SIGINT":
+            return ir.Constant(I64_TY, 2), "int"
+
+        if name == "SIGTERM":
+            return ir.Constant(I64_TY, 15), "int"
+
+        if name == "signal_handle":
+            sig_v, _ = self._compile_expr(node.args[0])
+            # args[1] is a function pointer; compile as expression
+            fn_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_signal_handle")
+            self.builder.call(fn_h, [sig_v, self.builder.bitcast(fn_v, I8PTR)])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "process_spawn":
+            cmd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_process_spawn")
+            return self.builder.call(fn_h, [cmd_v]), "int"
+
+        if name == "process_wait":
+            pid_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_process_wait")
+            return self.builder.call(fn_h, [pid_v]), "int"
+
+        if name == "process_kill":
+            pid_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_process_kill")
+            self.builder.call(fn_h, [pid_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "progress_new":
+            total_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_progress_new")
+            return self.builder.call(fn_h, [total_v]), "int"
+
+        if name == "progress_update":
+            id_v,  _ = self._compile_expr(node.args[0])
+            cur_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_progress_update")
+            self.builder.call(fn_h, [id_v, cur_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "progress_finish":
+            id_v,  _ = self._compile_expr(node.args[0])
+            msg_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_progress_finish")
+            self.builder.call(fn_h, [id_v, msg_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "term_clear":
+            fn_h = self._get_helper("__vx_term_clear")
+            self.builder.call(fn_h, [])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "term_move":
+            row_v, _ = self._compile_expr(node.args[0])
+            col_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_term_move")
+            self.builder.call(fn_h, [row_v, col_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "term_width":
+            fn_h = self._get_helper("__vx_term_width")
+            return self.builder.call(fn_h, []), "int"
+
+        if name == "channel_new":
+            fn_h = self._get_helper("__vx_channel_new")
+            return self.builder.call(fn_h, []), "int"
+
+        if name == "channel_send":
+            ch_v,  _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_channel_send")
+            self.builder.call(fn_h, [ch_v, val_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "channel_recv":
+            ch_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_channel_recv")
+            return self.builder.call(fn_h, [ch_v]), "int"
+
+        if name == "channel_try_recv":
+            ch_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_channel_try_recv")
+            return self.builder.call(fn_h, [ch_v]), "int"
+
+        if name == "channel_close":
+            ch_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_channel_close")
+            self.builder.call(fn_h, [ch_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "rwlock_new":
+            fn_h = self._get_helper("__vx_rwlock_new")
+            return self.builder.call(fn_h, []), "int"
+
+        if name in ("rwlock_read_lock", "rwlock_read_unlock",
+                    "rwlock_write_lock", "rwlock_write_unlock"):
+            lk_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper(f"__vx_{name}")
+            self.builder.call(fn_h, [lk_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "thread_pool_new":
+            n_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_thread_pool_new")
+            return self.builder.call(fn_h, [n_v]), "int"
+
+        if name == "thread_pool_submit":
+            pool_v, _ = self._compile_expr(node.args[0])
+            task_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_thread_pool_submit")
+            self.builder.call(fn_h, [pool_v, self.builder.bitcast(task_v, I8PTR)])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "thread_pool_wait":
+            pool_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_thread_pool_wait")
+            self.builder.call(fn_h, [pool_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "thread_pool_destroy":
+            pool_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_thread_pool_destroy")
+            self.builder.call(fn_h, [pool_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "benchmark":
+            fn_v,  _ = self._compile_expr(node.args[0])
+            cnt_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_benchmark")
+            return self.builder.call(fn_h, [self.builder.bitcast(fn_v, I8PTR), cnt_v]), "str"
+
+        if name == "bench_ns":
+            fn_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_bench_ns")
+            return self.builder.call(fn_h, [self.builder.bitcast(fn_v, I8PTR)]), "int"
+
+        if name == "json_parse_int":
+            json_v, _ = self._compile_expr(node.args[0])
+            key_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_json_parse_int")
+            return self.builder.call(fn_h, [json_v, key_v]), "int"
+
+        if name == "json_parse_str":
+            json_v, _ = self._compile_expr(node.args[0])
+            key_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_json_parse_str")
+            return self.builder.call(fn_h, [json_v, key_v]), "str"
+
+        if name == "json_parse_float":
+            json_v, _ = self._compile_expr(node.args[0])
+            key_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_json_parse_float")
+            return self.builder.call(fn_h, [json_v, key_v]), "float"
+
+        if name == "json_parse_bool":
+            json_v, _ = self._compile_expr(node.args[0])
+            key_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_json_parse_bool")
+            return self.builder.call(fn_h, [json_v, key_v]), "bool"
+
+        if name == "env_load":
+            path_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_env_load")
+            self.builder.call(fn_h, [path_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "set_new":
+            fn_h = self._get_helper("__vx_set_new")
+            return self.builder.call(fn_h, []), "int"
+
+        if name == "set_add":
+            s_v,   _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_set_add")
+            self.builder.call(fn_h, [s_v, val_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "set_contains":
+            s_v,   _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_set_contains")
+            return self.builder.call(fn_h, [s_v, val_v]), "bool"
+
+        if name == "set_remove":
+            s_v,   _ = self._compile_expr(node.args[0])
+            val_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_set_remove")
+            self.builder.call(fn_h, [s_v, val_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "set_size":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_set_size")
+            return self.builder.call(fn_h, [s_v]), "int"
+
+        if name == "set_to_array":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_set_to_array")
+            return self.builder.call(fn_h, [s_v]), "int[]"
+
+        if name == "set_union":
+            a_v, _ = self._compile_expr(node.args[0])
+            b_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_set_union")
+            return self.builder.call(fn_h, [a_v, b_v]), "int"
+
+        if name == "set_intersect":
+            a_v, _ = self._compile_expr(node.args[0])
+            b_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_set_intersect")
+            return self.builder.call(fn_h, [a_v, b_v]), "int"
+
+        if name == "uuid_v1":
+            fn_h = self._get_helper("__vx_uuid_v1")
+            return self.builder.call(fn_h, []), "str"
+
+        if name == "bounds_check":
+            idx_v, _ = self._compile_expr(node.args[0])
+            len_v, _ = self._compile_expr(node.args[1])
+            # Abort if idx < 0 or idx >= len
+            ok1 = self.builder.icmp_signed(">=", idx_v, ir.Constant(I64_TY, 0))
+            ok2 = self.builder.icmp_signed("<",  idx_v, len_v)
+            ok  = self.builder.and_(ok1, ok2)
+            ok_bb   = self.current_fn.append_basic_block("bc_ok")
+            fail_bb = self.current_fn.append_basic_block("bc_fail")
+            self.builder.cbranch(ok, ok_bb, fail_bb)
+            self.builder.position_at_end(fail_bb)
+            fmt = self._gstr_ptr(self._global_str("index out of bounds\n"))
+            self.builder.call(self.printf, [fmt])
+            self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+            self.builder.unreachable()
+            self.builder.position_at_end(ok_bb)
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "condvar_new":
+            fn_h = self._get_helper("__vx_condvar_new")
+            return self.builder.call(fn_h, []), "int"
+
+        if name == "condvar_wait":
+            cv_v, _ = self._compile_expr(node.args[0])
+            mu_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_condvar_wait")
+            self.builder.call(fn_h, [cv_v, mu_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "condvar_signal":
+            cv_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_condvar_signal")
+            self.builder.call(fn_h, [cv_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "condvar_broadcast":
+            cv_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_condvar_broadcast")
+            self.builder.call(fn_h, [cv_v])
+            return ir.Constant(I64_TY, 0), "void"
+
         # --- ADT enum constructor calls: EnumName.Variant(...) handled via FieldAccess at call site ---
 
         # --- Generic function monomorphization ---
@@ -4060,6 +4675,27 @@ class Compiler:
 
         compiled_args = []
         for arg_node, (_, pt) in zip(args_with_defaults, sig.params):
+            # Handle spread: ...arr expands to individual elements
+            if isinstance(arg_node, SpreadExpr):
+                arr_v, arr_t = self._compile_expr(arg_node.value)
+                arr     = self.builder.bitcast(arr_v, self.arr_ptr_type)
+                z = ir.Constant(I32_TY, 0)
+                arr_len = self.builder.load(
+                    self.builder.gep(arr, [z, ir.Constant(I32_TY,1)], inbounds=True))
+                arr_data = self.builder.load(
+                    self.builder.gep(arr, [z, z], inbounds=True))
+                # For each element, load and add to compiled_args
+                # (This only works for fixed-size spreads known at compile time;
+                #  for dynamic spreads, we'd need a different calling convention.)
+                # As a practical approach: extract first N elements where N is the
+                # number of remaining params
+                elem_ty = self._vx_to_llvm(pt[:-2] if pt.endswith("[]") else "int")
+                elem_ptr = self.builder.bitcast(arr_data, ir.PointerType(elem_ty))
+                # Just take the first element for simple spread
+                ep = self.builder.gep(elem_ptr, [ir.Constant(I32_TY, 0)], inbounds=False)
+                av = self.builder.load(ep)
+                compiled_args.append(av)
+                continue
             av, at = self._compile_expr(arg_node)
             pt_resolved = self._resolve_type(pt)
             # Auto-box struct to interface if needed
@@ -4478,6 +5114,37 @@ class Compiler:
     #  Structs                                                             #
     # ------------------------------------------------------------------ #
 
+    def _compile_struct_update(self, node: StructUpdateExpr) -> tuple[ir.Value, str]:
+        """{ ...base, field: val } — shallow-copy base struct with fields overridden."""
+        base_v, base_t = self._compile_expr(node.base)
+        si = self._structs.get(base_t)
+        if si is None:
+            raise CodegenError(f"StructUpdateExpr: '{base_t}' is not a struct")
+        lt     = si["llvm_type"]
+        fields = si["fields"]
+
+        # Allocate new struct
+        null_ptr = ir.Constant(ir.PointerType(lt), None)
+        sp       = self.builder.gep(null_ptr, [ir.Constant(I32_TY, 1)], inbounds=False)
+        sz       = self.builder.ptrtoint(sp, I64_TY)
+        raw      = self.builder.call(self.malloc_fn, [sz])
+        sptr     = self.builder.bitcast(raw, ir.PointerType(lt))
+
+        # Build override dict {name: val}
+        overrides = {name: val_node for name, val_node in node.fields}
+
+        for idx, (fname, ftype) in enumerate(fields):
+            src_fp  = self.builder.gep(base_v, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,idx)], inbounds=True)
+            dst_fp  = self.builder.gep(sptr,   [ir.Constant(I32_TY,0), ir.Constant(I32_TY,idx)], inbounds=True)
+            if fname in overrides:
+                fv, fvt = self._compile_expr(overrides[fname])
+                if ftype == "float" and fvt == "int":
+                    fv = self.builder.sitofp(fv, F64_TY)
+                self.builder.store(fv, dst_fp)
+            else:
+                self.builder.store(self.builder.load(src_fp), dst_fp)
+        return sptr, base_t
+
     def _compile_new(self, node: NewExpr) -> tuple[ir.Value, str]:
         si = self._structs.get(node.type_name)
         if si is None:
@@ -4492,10 +5159,16 @@ class Compiler:
         raw      = self.builder.call(self.malloc_fn, [sz])
         sptr     = self.builder.bitcast(raw, ir.PointerType(lt))
 
+        defaults = si.get("defaults", [None] * len(fields))
         for idx, (fname, ftype) in enumerate(fields):
             fv = ir.Constant(self._vx_to_llvm(ftype), 0)
             if idx < len(node.args):
                 fv, fvt = self._compile_expr(node.args[idx])
+                if ftype == "float" and fvt == "int":
+                    fv = self.builder.sitofp(fv, F64_TY)
+            elif idx < len(defaults) and defaults[idx] is not None:
+                # Use default field value from struct declaration
+                fv, fvt = self._compile_expr(defaults[idx])
                 if ftype == "float" and fvt == "int":
                     fv = self.builder.sitofp(fv, F64_TY)
             fp = self.builder.gep(sptr,
@@ -4636,6 +5309,22 @@ class Compiler:
 
         if method == "keys":
             fn_h = self._get_helper("__vx_dict_keys")
+            raw_arr = self.builder.call(fn_h, [raw])
+            arr_ptr = self.builder.bitcast(raw_arr, self.arr_ptr_type)
+            return arr_ptr, "str[]"
+
+        if method == "values":
+            fn_h = self._get_helper("__vx_dict_values")
+            raw_arr = self.builder.call(fn_h, [raw])
+            arr_ptr = self.builder.bitcast(raw_arr, self.arr_ptr_type)
+            # Value type depends on dict type annotation; use int as default
+            inner = dict_t[5:-1]  # strip "dict[" and "]"
+            val_t = inner[inner.index(',')+1:].strip() if ',' in inner else "int"
+            return arr_ptr, val_t + "[]"
+
+        if method == "items":
+            # Returns str[] where each element is "key:value" pair string
+            fn_h = self._get_helper("__vx_dict_items")
             raw_arr = self.builder.call(fn_h, [raw])
             arr_ptr = self.builder.bitcast(raw_arr, self.arr_ptr_type)
             return arr_ptr, "str[]"
@@ -6611,6 +7300,1470 @@ class Compiler:
         b.ret(result)
         return fn
 
+    # ------------------------------------------------------------------ #
+    #  v8 new helper builders                                             #
+    # ------------------------------------------------------------------ #
+
+    def _build_csv_write(self) -> ir.Function:
+        """csv_write(rows: str[][], delim: str) -> str — serialize 2D array to CSV."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_csv_write")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        rows_raw, delim = fn.args[0], fn.args[1]
+        # Allocate a big output buffer
+        out_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 65536)])
+        # Start with empty string
+        b.store(ir.Constant(I8_TY, 0), out_buf)
+        rows = b.bitcast(rows_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        rows_lp = b.gep(rows, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        rows_len = b.load(rows_lp)
+        rows_dp  = b.gep(rows, [z, z], inbounds=True)
+        rows_data_raw = b.load(rows_dp)
+        rows_data = b.bitcast(rows_data_raw, ir.PointerType(I8PTR))
+        # We'll build via repeated sprintf calls into a growing offset
+        off_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), off_al)
+        ri_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), ri_al)
+        row_chk = fn.append_basic_block("csv.row.chk")
+        row_bdy = fn.append_basic_block("csv.row.bdy")
+        row_ext = fn.append_basic_block("csv.row.ext")
+        b.branch(row_chk)
+        b.position_at_end(row_chk)
+        ri = b.load(ri_al)
+        b.cbranch(b.icmp_signed("<", ri, rows_len), row_bdy, row_ext)
+        b.position_at_end(row_bdy)
+        row_p = b.gep(rows_data, [ri], inbounds=False)
+        row_raw_v = b.load(row_p)
+        row_v = b.bitcast(row_raw_v, self.arr_ptr_type)
+        col_lp = b.gep(row_v, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        col_len = b.load(col_lp)
+        col_dp  = b.gep(row_v, [z, z], inbounds=True)
+        col_data_raw = b.load(col_dp)
+        col_data = b.bitcast(col_data_raw, ir.PointerType(I8PTR))
+        ci_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), ci_al)
+        col_chk = fn.append_basic_block("csv.col.chk")
+        col_bdy = fn.append_basic_block("csv.col.bdy")
+        col_ext = fn.append_basic_block("csv.col.ext")
+        b.branch(col_chk)
+        b.position_at_end(col_chk)
+        ci = b.load(ci_al)
+        b.cbranch(b.icmp_signed("<", ci, col_len), col_bdy, col_ext)
+        b.position_at_end(col_bdy)
+        cell_p = b.gep(col_data, [ci], inbounds=False)
+        cell   = b.load(cell_p)
+        off    = b.load(off_al)
+        dst    = b.gep(out_buf, [off], inbounds=False)
+        cell_len = b.call(self.strlen_fn, [cell])
+        b.call(self.memcpy_fn, [dst, cell, cell_len])
+        new_off = b.add(off, cell_len)
+        # Append delimiter unless last column
+        is_last = b.icmp_signed("==", b.add(ci, ir.Constant(I64_TY, 1)), col_len)
+        delim_len = b.call(self.strlen_fn, [delim])
+        actual_delim_len = b.select(is_last, ir.Constant(I64_TY, 0), delim_len)
+        delim_dst = b.gep(out_buf, [new_off], inbounds=False)
+        # Only write delim bytes if not last
+        delim_end = fn.append_basic_block("csv.delim.write")
+        no_delim  = fn.append_basic_block("csv.delim.skip")
+        b.cbranch(is_last, no_delim, delim_end)
+        b.position_at_end(delim_end)
+        b.call(self.memcpy_fn, [delim_dst, delim, delim_len])
+        b.branch(no_delim)
+        b.position_at_end(no_delim)
+        final_off = b.add(new_off, actual_delim_len)
+        b.store(final_off, off_al)
+        b.store(b.add(ci, ir.Constant(I64_TY, 1)), ci_al)
+        b.branch(col_chk)
+        b.position_at_end(col_ext)
+        # Newline after each row
+        off2 = b.load(off_al)
+        nl_dst = b.gep(out_buf, [off2], inbounds=False)
+        b.store(ir.Constant(I8_TY, ord('\n')), nl_dst)
+        b.store(b.add(off2, ir.Constant(I64_TY, 1)), off_al)
+        b.store(b.add(ri, ir.Constant(I64_TY, 1)), ri_al)
+        b.branch(row_chk)
+        b.position_at_end(row_ext)
+        # Null-terminate
+        final = b.load(off_al)
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [final], inbounds=False))
+        b.ret(out_buf)
+        return fn
+
+    def _build_print_color(self) -> ir.Function:
+        """print_color(msg, color) — print msg with ANSI color."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(VOID_TY, [I8PTR, I8PTR]),
+                         name="__vx_print_color")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        msg, color = fn.args[0], fn.args[1]
+
+        def _gp(gv):
+            z = ir.Constant(I32_TY, 0)
+            return b.gep(gv, [z, z], inbounds=True)
+
+        codes = [
+            ("Red",     "\033[0;31m"),
+            ("Green",   "\033[0;32m"),
+            ("Yellow",  "\033[0;33m"),
+            ("Blue",    "\033[0;34m"),
+            ("Magenta", "\033[0;35m"),
+            ("Cyan",    "\033[0;36m"),
+            ("White",   "\033[0;37m"),
+            ("Bold",    "\033[1m"),
+        ]
+        reset_gv  = self._global_str("\033[0m\n")
+        fmt3_gv   = self._global_str("%s%s%s")
+        done_b    = fn.append_basic_block("pc.done")
+        for cname, code in codes:
+            name_gv = self._global_str(cname)
+            code_gv = self._global_str(code)
+            cmp     = b.call(self.strcmp_fn, [color, self._gstr_ptr_const(name_gv)])
+            match_b = fn.append_basic_block(f"pc.{cname.lower()}")
+            next_b  = fn.append_basic_block(f"pc.nx{cname.lower()}")
+            b.cbranch(b.icmp_signed("==", cmp, ir.Constant(I32_TY, 0)), match_b, next_b)
+            b.position_at_end(match_b)
+            b.call(self.printf, [_gp(fmt3_gv), _gp(code_gv), msg, _gp(reset_gv)])
+            b.branch(done_b)
+            b.position_at_end(next_b)
+        # Default: plain
+        fmt_plain = self._global_str("%s\n")
+        b.call(self.printf, [_gp(fmt_plain), msg])
+        b.branch(done_b)
+        b.position_at_end(done_b)
+        b.ret_void()
+        return fn
+
+    def _build_dict_values(self) -> ir.Function:
+        """dict.values() — return i8* array of values (as i64 array)."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_dict_values")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        hdr = b.bitcast(fn.args[0], self.dict_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        # Load vals_ptr and len
+        vf = b.gep(hdr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        lf = b.gep(hdr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        vals_raw = b.load(vf)
+        dlen     = b.load(lf)
+        # Build a vx_array header around the existing vals buffer
+        arr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        arr     = b.bitcast(arr_raw, self.arr_ptr_type)
+        dp  = b.gep(arr, [z, z], inbounds=True)
+        lp  = b.gep(arr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        cp  = b.gep(arr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        b.store(vals_raw, dp)
+        b.store(dlen, lp)
+        b.store(dlen, cp)
+        b.ret(arr_raw)
+        return fn
+
+    def _build_dict_items(self) -> ir.Function:
+        """dict.items() — return str[] of 'key:value' pairs."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_dict_items")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        hdr = b.bitcast(fn.args[0], self.dict_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        kf  = b.gep(hdr, [z, z], inbounds=True)
+        vf  = b.gep(hdr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        lf  = b.gep(hdr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        keys_raw = b.load(kf)
+        vals_raw = b.load(vf)
+        dlen     = b.load(lf)
+        keys_data = b.bitcast(keys_raw, ir.PointerType(I8PTR))
+        vals_data = b.bitcast(vals_raw, ir.PointerType(I64_TY))
+        # Build result array
+        arr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        init_data = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        arr     = b.bitcast(arr_raw, self.arr_ptr_type)
+        dp  = b.gep(arr, [z, z], inbounds=True)
+        lp  = b.gep(arr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        cp  = b.gep(arr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        b.store(init_data, dp)
+        b.store(ir.Constant(I64_TY, 0), lp)
+        b.store(ir.Constant(I64_TY, 8), cp)
+        push_h = self._get_helper("__vx_array_push")
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk = fn.append_basic_block("di.chk")
+        bdy = fn.append_basic_block("di.bdy")
+        ext = fn.append_basic_block("di.ext")
+        b.branch(chk)
+        b.position_at_end(chk)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, dlen), bdy, ext)
+        b.position_at_end(bdy)
+        kp  = b.gep(keys_data, [iv], inbounds=False)
+        vp  = b.gep(vals_data, [iv], inbounds=False)
+        key = b.load(kp)
+        val = b.load(vp)
+        # Format: "key:value"
+        pair_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 512)])
+        fmt_gv   = self._global_str("%s:%lld")
+        b.call(self.sprintf_fn, [pair_buf, self._gstr_ptr_const(fmt_gv), key, val])
+        pair_al = b.alloca(I8PTR)
+        b.store(pair_buf, pair_al)
+        b.call(push_h, [arr_raw, b.bitcast(pair_al, I8PTR), ir.Constant(I64_TY, 8)])
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk)
+        b.position_at_end(ext)
+        b.ret(arr_raw)
+        return fn
+
+
+    # ------------------------------------------------------------------ #
+    #  v8 helper builders                                               #
+    # ------------------------------------------------------------------ #
+
+    def _build_datetime_now(self) -> ir.Function:
+        """datetime_now() -> str  — current local time as 'YYYY-MM-DD HH:MM:SS'."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_datetime_now")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 32)])
+        ts_al = b.alloca(I64_TY)
+        null = ir.Constant(I8PTR, None)
+        ts = b.call(self.time_fn, [null])
+        b.store(ts, ts_al)
+        ts_ptr = b.bitcast(ts_al, I8PTR)
+        tm_ptr = b.call(self.localtime_fn, [ts_ptr])
+        fmt_gv = self._global_str("%Y-%m-%d %H:%M:%S")
+        fmt_p  = self._gstr_ptr_const(fmt_gv)
+        b.call(self.strftime_fn, [buf, ir.Constant(I64_TY, 32), fmt_p, tm_ptr])
+        b.ret(buf)
+        return fn
+
+    def _build_datetime_format(self) -> ir.Function:
+        """datetime_format(fmt: str) -> str  — format current time with custom fmt."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_datetime_format")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fmt_arg = fn.args[0]
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+        ts_al = b.alloca(I64_TY)
+        null = ir.Constant(I8PTR, None)
+        ts = b.call(self.time_fn, [null])
+        b.store(ts, ts_al)
+        ts_ptr = b.bitcast(ts_al, I8PTR)
+        tm_ptr = b.call(self.localtime_fn, [ts_ptr])
+        b.call(self.strftime_fn, [buf, ir.Constant(I64_TY, 256), fmt_arg, tm_ptr])
+        b.ret(buf)
+        return fn
+
+    def _build_datetime_from_ts(self) -> ir.Function:
+        """datetime_from_ts(ts: i64) -> str  — format a unix timestamp."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_datetime_from_ts")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ts = fn.args[0]
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 32)])
+        ts_al = b.alloca(I64_TY)
+        b.store(ts, ts_al)
+        ts_ptr = b.bitcast(ts_al, I8PTR)
+        tm_ptr = b.call(self.localtime_fn, [ts_ptr])
+        fmt_gv = self._global_str("%Y-%m-%d %H:%M:%S")
+        fmt_p  = self._gstr_ptr_const(fmt_gv)
+        b.call(self.strftime_fn, [buf, ir.Constant(I64_TY, 32), fmt_p, tm_ptr])
+        b.ret(buf)
+        return fn
+
+    def _build_sleep_ms(self) -> ir.Function:
+        """sleep_ms(ms: i64) — sleep for ms milliseconds."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_sleep_ms")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ms = fn.args[0]
+        if _sys.platform == "win32":
+            ms32 = b.trunc(ms, I32_TY)
+            sleep_ty = ir.FunctionType(VOID_TY, [I32_TY])
+            sleep_fn = self._get_or_declare_fn("Sleep", sleep_ty)
+            b.call(sleep_fn, [ms32])
+        else:
+            us = b.mul(ms, ir.Constant(I64_TY, 1000))
+            us32 = b.trunc(us, I32_TY)
+            usleep_ty = ir.FunctionType(I32_TY, [I32_TY])
+            usleep_fn = self._get_or_declare_fn("usleep", usleep_ty)
+            b.call(usleep_fn, [us32])
+        b.ret_void()
+        return fn
+
+    def _build_signal_handle(self) -> ir.Function:
+        """signal_handle(signum: i64, handler: i8*) — install signal handler."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I8PTR]),
+                         name="__vx_signal_handle")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        signum, handler = fn.args[0], fn.args[1]
+        sig32 = b.trunc(signum, I32_TY)
+        # signal(int, void(*)(int)) -> void(*)(int)
+        handler_ty = ir.FunctionType(VOID_TY, [I32_TY])
+        handler_ptr_ty = ir.PointerType(handler_ty)
+        signal_ty = ir.FunctionType(handler_ptr_ty, [I32_TY, handler_ptr_ty])
+        signal_fn = self._get_or_declare_fn("signal", signal_ty)
+        real_handler = b.bitcast(handler, handler_ptr_ty)
+        b.call(signal_fn, [sig32, real_handler])
+        b.ret_void()
+        return fn
+
+    def _build_process_spawn(self) -> ir.Function:
+        """process_spawn(cmd: str) -> i64 PID (opaque handle stored in malloc)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_process_spawn")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cmd = fn.args[0]
+        # Use popen for simplicity — returns a FILE* stored as i64
+        mode_gv = self._global_str("r")
+        mode_p  = self._gstr_ptr_const(mode_gv)
+        fp = b.call(self.popen_fn, [cmd, mode_p])
+        result = b.ptrtoint(fp, I64_TY)
+        b.ret(result)
+        return fn
+
+    def _build_process_wait(self) -> ir.Function:
+        """process_wait(handle: i64) -> i64 exit_code."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_process_wait")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]
+        fp = b.inttoptr(handle, I8PTR)
+        rc32 = b.call(self.pclose_fn, [fp])
+        b.ret(b.sext(rc32, I64_TY))
+        return fn
+
+    def _build_process_kill(self) -> ir.Function:
+        """process_kill(handle: i64) — close the process handle."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_process_kill")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]
+        fp = b.inttoptr(handle, I8PTR)
+        b.call(self.pclose_fn, [fp])
+        b.ret_void()
+        return fn
+
+    # Progress bar state: malloc'd {i64 total, i64 current}
+    def _build_progress_new(self) -> ir.Function:
+        """progress_new(total) -> i64 handle (opaque pointer)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_progress_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        total = fn.args[0]
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
+        buf64 = b.bitcast(buf, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        total_p = b.gep(buf64, [z], inbounds=False)
+        cur_p   = b.gep(buf64, [ir.Constant(I32_TY, 1)], inbounds=False)
+        b.store(total, total_p)
+        b.store(ir.Constant(I64_TY, 0), cur_p)
+        b.ret(b.ptrtoint(buf, I64_TY))
+        return fn
+
+    def _build_progress_update(self) -> ir.Function:
+        """progress_update(handle, current) — redraw progress bar."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_progress_update")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle, current = fn.args[0], fn.args[1]
+        buf    = b.inttoptr(handle, I8PTR)
+        buf64  = b.bitcast(buf, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        total_p = b.gep(buf64, [z], inbounds=False)
+        cur_p   = b.gep(buf64, [ir.Constant(I32_TY, 1)], inbounds=False)
+        total = b.load(total_p)
+        b.store(current, cur_p)
+        # Compute percentage (avoid /0)
+        safe_total = b.select(b.icmp_signed("==", total, ir.Constant(I64_TY, 0)),
+                              ir.Constant(I64_TY, 1), total)
+        pct = b.sdiv(b.mul(current, ir.Constant(I64_TY, 100)), safe_total)
+        fmt_gv = self._global_str("\r[%3lld%%] ")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv), pct])
+        # Draw filled/empty blocks
+        filled = b.sdiv(pct, ir.Constant(I64_TY, 5))
+        fi_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), fi_al)
+        bar_chk = fn.append_basic_block("bar_chk")
+        bar_bdy = fn.append_basic_block("bar_bdy")
+        bar_ext = fn.append_basic_block("bar_ext")
+        b.branch(bar_chk)
+        b.position_at_end(bar_chk)
+        fi = b.load(fi_al)
+        b.cbranch(b.icmp_signed("<", fi, ir.Constant(I64_TY, 20)), bar_bdy, bar_ext)
+        b.position_at_end(bar_bdy)
+        is_full = b.icmp_signed("<", b.load(fi_al), filled)
+        full_gv = self._global_str("#")
+        empt_gv = self._global_str(".")
+        ch_gv = b.select(is_full, self._gstr_ptr_const(full_gv),
+                         self._gstr_ptr_const(empt_gv))
+        sfmt_gv = self._global_str("%s")
+        b.call(self.printf, [self._gstr_ptr_const(sfmt_gv), ch_gv])
+        b.store(b.add(b.load(fi_al), ir.Constant(I64_TY, 1)), fi_al)
+        b.branch(bar_chk)
+        b.position_at_end(bar_ext)
+        b.ret_void()
+        return fn
+
+    def _build_progress_finish(self) -> ir.Function:
+        """progress_finish(handle, msg) — finalize progress bar."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I8PTR]),
+                         name="__vx_progress_finish")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        _, msg = fn.args[0], fn.args[1]
+        fmt_gv = self._global_str("\r[100%%] #################### %s\n")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv), msg])
+        b.ret_void()
+        return fn
+
+    def _build_term_clear(self) -> ir.Function:
+        """term_clear() — clear terminal."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, []),
+                         name="__vx_term_clear")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fmt_gv = self._global_str("\033[2J\033[H")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv)])
+        b.ret_void()
+        return fn
+
+    def _build_term_move(self) -> ir.Function:
+        """term_move(row, col) — move cursor."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_term_move")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        row, col = fn.args[0], fn.args[1]
+        fmt_gv = self._global_str("\033[%lld;%lldH")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv), row, col])
+        b.ret_void()
+        return fn
+
+    def _build_term_width(self) -> ir.Function:
+        """term_width() -> i64 — terminal width (80 default on Windows)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_term_width")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        if _sys.platform == "win32":
+            # GetConsoleScreenBufferInfo not trivial in IR; return 80
+            b.ret(ir.Constant(I64_TY, 80))
+        else:
+            # ioctl(TIOCGWINSZ) not trivial; use $COLUMNS env var fallback
+            cols_gv = self._global_str("COLUMNS")
+            cols_p  = self._gstr_ptr_const(cols_gv)
+            env_val = b.call(self.getenv_fn, [cols_p])
+            is_null = b.icmp_unsigned("==",
+                        b.ptrtoint(env_val, I64_TY), ir.Constant(I64_TY, 0))
+            w_al = b.alloca(I64_TY)
+            b.store(ir.Constant(I64_TY, 80), w_al)
+            have_bb = fn.append_basic_block("have_cols")
+            end_bb  = fn.append_basic_block("end")
+            b.cbranch(is_null, end_bb, have_bb)
+            b.position_at_end(have_bb)
+            w = b.sext(b.trunc(b.call(self.atoll_fn, [env_val]), I32_TY), I64_TY)
+            b.store(w, w_al)
+            b.branch(end_bb)
+            b.position_at_end(end_bb)
+            b.ret(b.load(w_al))
+        return fn
+
+    # --- Channels: {mutex i8*, condvar i8*, i64* buf, i64 len, i64 cap, i64 closed} ---
+    # Layout (all i64-sized slots in malloc'd block):
+    #   [0] mutex ptr (8 bytes)
+    #   [1] condvar ptr (8 bytes)
+    #   [2] data ptr (8 bytes) — i64[] ring buffer
+    #   [3] len
+    #   [4] cap
+    #   [5] closed flag
+
+    def _build_channel_new(self) -> ir.Function:
+        """channel_new() -> i64 handle."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_channel_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Allocate channel header: 6 × 8 = 48 bytes
+        hdr = b.call(self.malloc_fn, [ir.Constant(I64_TY, 48)])
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        # mutex
+        mu_fn = self._get_helper("__vx_mutex_new")
+        mu = b.call(mu_fn, [])
+        mu_i = b.ptrtoint(mu, I64_TY)
+        b.store(mu_i, b.gep(hdr64, [z], inbounds=False))
+        # condvar
+        cv_fn = self._get_helper("__vx_condvar_new")
+        cv = b.call(cv_fn, [])
+        cv_i = b.ptrtoint(cv, I64_TY)
+        b.store(cv_i, b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False))
+        # ring buffer (cap=16)
+        cap = ir.Constant(I64_TY, 16)
+        data = b.call(self.malloc_fn, [b.mul(cap, ir.Constant(I64_TY, 8))])
+        data_i = b.ptrtoint(data, I64_TY)
+        b.store(data_i, b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        b.store(ir.Constant(I64_TY, 0),  b.gep(hdr64, [ir.Constant(I32_TY, 3)], inbounds=False))
+        b.store(cap,                      b.gep(hdr64, [ir.Constant(I32_TY, 4)], inbounds=False))
+        b.store(ir.Constant(I64_TY, 0),  b.gep(hdr64, [ir.Constant(I32_TY, 5)], inbounds=False))
+        b.ret(b.ptrtoint(hdr, I64_TY))
+        return fn
+
+    def _build_channel_send(self) -> ir.Function:
+        """channel_send(ch: i64, val: i64)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_channel_send")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ch_i, val = fn.args[0], fn.args[1]
+        hdr   = b.inttoptr(ch_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        mu_i   = b.load(b.gep(hdr64, [z], inbounds=False))
+        mu_ptr = b.inttoptr(mu_i, I8PTR)
+        lock_fn = self._get_helper("__vx_mutex_lock")
+        unlock_fn = self._get_helper("__vx_mutex_unlock")
+        b.call(lock_fn, [mu_ptr])
+        data_i  = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        len_p   = b.gep(hdr64, [ir.Constant(I32_TY, 3)], inbounds=False)
+        cur_len = b.load(len_p)
+        data_ptr = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        slot = b.gep(data_ptr, [b.trunc(cur_len, I32_TY)], inbounds=False)
+        b.store(val, slot)
+        b.store(b.add(cur_len, ir.Constant(I64_TY, 1)), len_p)
+        # signal waiting receivers
+        cv_i   = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False))
+        sig_fn = self._get_helper("__vx_condvar_signal")
+        b.call(sig_fn, [cv_i])
+        b.call(unlock_fn, [mu_ptr])
+        b.ret_void()
+        return fn
+
+    def _build_channel_recv(self) -> ir.Function:
+        """channel_recv(ch: i64) -> i64 — blocks until a value is available."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_channel_recv")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ch_i = fn.args[0]
+        hdr   = b.inttoptr(ch_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        mu_i   = b.load(b.gep(hdr64, [z], inbounds=False))
+        mu_ptr = b.inttoptr(mu_i, I8PTR)
+        lock_fn   = self._get_helper("__vx_mutex_lock")
+        unlock_fn = self._get_helper("__vx_mutex_unlock")
+        wait_fn   = self._get_helper("__vx_condvar_wait")
+        b.call(lock_fn, [mu_ptr])
+        # Spin-wait loop
+        wait_chk = fn.append_basic_block("wait_chk")
+        wait_bdy = fn.append_basic_block("wait_bdy")
+        recv_bb  = fn.append_basic_block("recv")
+        b.branch(wait_chk)
+        b.position_at_end(wait_chk)
+        len_p   = b.gep(hdr64, [ir.Constant(I32_TY, 3)], inbounds=False)
+        cur_len = b.load(len_p)
+        has_data = b.icmp_signed(">", cur_len, ir.Constant(I64_TY, 0))
+        b.cbranch(has_data, recv_bb, wait_bdy)
+        b.position_at_end(wait_bdy)
+        cv_i2  = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False))
+        b.call(wait_fn, [cv_i2, mu_i])
+        b.branch(wait_chk)
+        b.position_at_end(recv_bb)
+        data_i  = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_ptr = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        val = b.load(b.gep(data_ptr, [z], inbounds=False))
+        # Shift buffer left (simple queue: shift all down by 1)
+        new_len = b.sub(b.load(len_p), ir.Constant(I64_TY, 1))
+        shift_chk = fn.append_basic_block("shift_chk")
+        shift_bdy = fn.append_basic_block("shift_bdy")
+        shift_ext = fn.append_basic_block("shift_ext")
+        si_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), si_al)
+        b.branch(shift_chk)
+        b.position_at_end(shift_chk)
+        si = b.load(si_al)
+        b.cbranch(b.icmp_signed("<", si, new_len), shift_bdy, shift_ext)
+        b.position_at_end(shift_bdy)
+        src = b.gep(data_ptr, [b.trunc(b.add(si, ir.Constant(I64_TY, 1)), I32_TY)], inbounds=False)
+        dst = b.gep(data_ptr, [b.trunc(si, I32_TY)], inbounds=False)
+        b.store(b.load(src), dst)
+        b.store(b.add(si, ir.Constant(I64_TY, 1)), si_al)
+        b.branch(shift_chk)
+        b.position_at_end(shift_ext)
+        b.store(new_len, len_p)
+        b.call(unlock_fn, [mu_ptr])
+        b.ret(val)
+        return fn
+
+    def _build_channel_try_recv(self) -> ir.Function:
+        """channel_try_recv(ch: i64) -> i64  — -1 if empty, else dequeue."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_channel_try_recv")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ch_i = fn.args[0]
+        hdr   = b.inttoptr(ch_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        mu_i   = b.load(b.gep(hdr64, [z], inbounds=False))
+        mu_ptr = b.inttoptr(mu_i, I8PTR)
+        lock_fn   = self._get_helper("__vx_mutex_lock")
+        unlock_fn = self._get_helper("__vx_mutex_unlock")
+        b.call(lock_fn, [mu_ptr])
+        len_p   = b.gep(hdr64, [ir.Constant(I32_TY, 3)], inbounds=False)
+        cur_len = b.load(len_p)
+        has_data = b.icmp_signed(">", cur_len, ir.Constant(I64_TY, 0))
+        empty_bb = fn.append_basic_block("empty")
+        have_bb  = fn.append_basic_block("have")
+        b.cbranch(has_data, have_bb, empty_bb)
+        b.position_at_end(empty_bb)
+        b.call(unlock_fn, [mu_ptr])
+        b.ret(ir.Constant(I64_TY, -1))
+        b.position_at_end(have_bb)
+        data_i  = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_ptr = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        val = b.load(b.gep(data_ptr, [z], inbounds=False))
+        new_len = b.sub(cur_len, ir.Constant(I64_TY, 1))
+        # shift
+        si_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), si_al)
+        sh_chk = fn.append_basic_block("sh_chk"); sh_bdy = fn.append_basic_block("sh_bdy")
+        sh_ext = fn.append_basic_block("sh_ext")
+        b.branch(sh_chk)
+        b.position_at_end(sh_chk)
+        si = b.load(si_al)
+        b.cbranch(b.icmp_signed("<", si, new_len), sh_bdy, sh_ext)
+        b.position_at_end(sh_bdy)
+        src = b.gep(data_ptr, [b.trunc(b.add(si, ir.Constant(I64_TY, 1)), I32_TY)], inbounds=False)
+        dst = b.gep(data_ptr, [b.trunc(si, I32_TY)], inbounds=False)
+        b.store(b.load(src), dst)
+        b.store(b.add(si, ir.Constant(I64_TY, 1)), si_al)
+        b.branch(sh_chk)
+        b.position_at_end(sh_ext)
+        b.store(new_len, len_p)
+        b.call(unlock_fn, [mu_ptr])
+        b.ret(val)
+        return fn
+
+    def _build_channel_close(self) -> ir.Function:
+        """channel_close(ch: i64) — mark channel closed."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_channel_close")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        ch_i = fn.args[0]
+        hdr   = b.inttoptr(ch_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        closed_p = b.gep(hdr64, [ir.Constant(I32_TY, 5)], inbounds=False)
+        b.store(ir.Constant(I64_TY, 1), closed_p)
+        b.ret_void()
+        return fn
+
+    # --- RWLocks ---
+
+    def _build_rwlock_new(self) -> ir.Function:
+        """rwlock_new() -> i64 handle (opaque rwlock pointer)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_rwlock_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        if _sys.platform == "win32":
+            # SRWLOCK is a single pointer; malloc 8 bytes, InitializeSRWLock
+            buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 8)])
+            init_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            init_fn = self._get_or_declare_fn("InitializeSRWLock", init_ty)
+            b.call(init_fn, [buf])
+        else:
+            # pthread_rwlock_t ~56 bytes
+            buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 56)])
+            null = ir.Constant(I8PTR, None)
+            init_ty = ir.FunctionType(I32_TY, [I8PTR, I8PTR])
+            init_fn = self._get_or_declare_fn("pthread_rwlock_init", init_ty)
+            b.call(init_fn, [buf, null])
+        b.ret(b.ptrtoint(buf, I64_TY))
+        return fn
+
+    def _build_rwlock_read_lock(self) -> ir.Function:
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_rwlock_read_lock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]; ptr = b.inttoptr(handle, I8PTR)
+        if _sys.platform == "win32":
+            lk_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            lk_fn = self._get_or_declare_fn("AcquireSRWLockShared", lk_ty)
+        else:
+            lk_ty = ir.FunctionType(I32_TY, [I8PTR])
+            lk_fn = self._get_or_declare_fn("pthread_rwlock_rdlock", lk_ty)
+        b.call(lk_fn, [ptr]); b.ret_void()
+        return fn
+
+    def _build_rwlock_read_unlock(self) -> ir.Function:
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_rwlock_read_unlock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]; ptr = b.inttoptr(handle, I8PTR)
+        if _sys.platform == "win32":
+            ul_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            ul_fn = self._get_or_declare_fn("ReleaseSRWLockShared", ul_ty)
+        else:
+            ul_ty = ir.FunctionType(I32_TY, [I8PTR])
+            ul_fn = self._get_or_declare_fn("pthread_rwlock_unlock", ul_ty)
+        b.call(ul_fn, [ptr]); b.ret_void()
+        return fn
+
+    def _build_rwlock_write_lock(self) -> ir.Function:
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_rwlock_write_lock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]; ptr = b.inttoptr(handle, I8PTR)
+        if _sys.platform == "win32":
+            lk_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            lk_fn = self._get_or_declare_fn("AcquireSRWLockExclusive", lk_ty)
+        else:
+            lk_ty = ir.FunctionType(I32_TY, [I8PTR])
+            lk_fn = self._get_or_declare_fn("pthread_rwlock_wrlock", lk_ty)
+        b.call(lk_fn, [ptr]); b.ret_void()
+        return fn
+
+    def _build_rwlock_write_unlock(self) -> ir.Function:
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_rwlock_write_unlock")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        handle = fn.args[0]; ptr = b.inttoptr(handle, I8PTR)
+        if _sys.platform == "win32":
+            ul_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            ul_fn = self._get_or_declare_fn("ReleaseSRWLockExclusive", ul_ty)
+        else:
+            ul_ty = ir.FunctionType(I32_TY, [I8PTR])
+            ul_fn = self._get_or_declare_fn("pthread_rwlock_unlock", ul_ty)
+        b.call(ul_fn, [ptr]); b.ret_void()
+        return fn
+
+    # --- Thread pool (simple: fixed array of worker threads) ---
+    # Layout of pool header (8-byte slots): [mutex_ptr, condvar_ptr, data_ptr,
+    #   len, cap, done_flag, thread_count, thread_handles_ptr]
+
+    def _build_thread_pool_new(self) -> ir.Function:
+        """thread_pool_new(n: i64) -> i64 handle."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_thread_pool_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # For simplicity, allocate a struct: {mutex, condvar, task queue handle, done}
+        # Return the channel handle (tasks go through channel)
+        n = fn.args[0]
+        ch_fn = self._get_helper("__vx_channel_new")
+        ch = b.call(ch_fn, [])
+        # Allocate pool header: [ch_handle, n_threads, done]
+        hdr = b.call(self.malloc_fn, [ir.Constant(I64_TY, 24)])
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        b.store(ch, b.gep(hdr64, [z], inbounds=False))
+        b.store(n,  b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False))
+        b.store(ir.Constant(I64_TY, 0), b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        b.ret(b.ptrtoint(hdr, I64_TY))
+        return fn
+
+    def _build_thread_pool_submit(self) -> ir.Function:
+        """thread_pool_submit(pool: i64, task: i8*)  — enqueue a task function pointer."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I8PTR]),
+                         name="__vx_thread_pool_submit")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        pool_i, task = fn.args[0], fn.args[1]
+        hdr   = b.inttoptr(pool_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        ch = b.load(b.gep(hdr64, [z], inbounds=False))
+        task_i = b.ptrtoint(task, I64_TY)
+        send_fn = self._get_helper("__vx_channel_send")
+        b.call(send_fn, [ch, task_i])
+        b.ret_void()
+        return fn
+
+    def _build_thread_pool_wait(self) -> ir.Function:
+        """thread_pool_wait(pool: i64) — drain all pending tasks by calling them."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_thread_pool_wait")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        pool_i = fn.args[0]
+        hdr   = b.inttoptr(pool_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        ch = b.load(b.gep(hdr64, [z], inbounds=False))
+        # Drain queue: call each task
+        try_recv_fn = self._get_helper("__vx_channel_try_recv")
+        drain_chk = fn.append_basic_block("drain_chk")
+        drain_bdy = fn.append_basic_block("drain_bdy")
+        drain_ext = fn.append_basic_block("drain_ext")
+        b.branch(drain_chk)
+        b.position_at_end(drain_chk)
+        task_i = b.call(try_recv_fn, [ch])
+        is_empty = b.icmp_signed("==", task_i, ir.Constant(I64_TY, -1))
+        b.cbranch(is_empty, drain_ext, drain_bdy)
+        b.position_at_end(drain_bdy)
+        task_ptr = b.inttoptr(task_i, ir.PointerType(ir.FunctionType(VOID_TY, [])))
+        b.call(task_ptr, [])
+        b.branch(drain_chk)
+        b.position_at_end(drain_ext)
+        b.ret_void()
+        return fn
+
+    def _build_thread_pool_destroy(self) -> ir.Function:
+        """thread_pool_destroy(pool: i64) — free pool memory."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_thread_pool_destroy")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        pool_i = fn.args[0]
+        hdr = b.inttoptr(pool_i, I8PTR)
+        b.call(self.free_fn, [hdr])
+        b.ret_void()
+        return fn
+
+    # --- Benchmarking ---
+
+    def _build_benchmark(self) -> ir.Function:
+        """benchmark(fn: i8*, count: i64) -> str  — run fn count times, return timing string."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I64_TY]),
+                         name="__vx_benchmark")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fn_ptr_raw, count = fn.args[0], fn.args[1]
+        fn_ptr = b.bitcast(fn_ptr_raw, ir.PointerType(ir.FunctionType(VOID_TY, [])))
+        # t_start = time(NULL)
+        null = ir.Constant(I8PTR, None)
+        t_start = b.call(self.time_fn, [null])
+        # Loop count times
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        loop_chk = fn.append_basic_block("loop_chk")
+        loop_bdy = fn.append_basic_block("loop_bdy")
+        loop_ext = fn.append_basic_block("loop_ext")
+        b.branch(loop_chk)
+        b.position_at_end(loop_chk)
+        i = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", i, count), loop_bdy, loop_ext)
+        b.position_at_end(loop_bdy)
+        b.call(fn_ptr, [])
+        b.store(b.add(i, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(loop_chk)
+        b.position_at_end(loop_ext)
+        t_end = b.call(self.time_fn, [null])
+        elapsed = b.sub(t_end, t_start)
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 128)])
+        fmt_gv = self._global_str("%lld iterations in %lld seconds")
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), count, elapsed])
+        b.ret(buf)
+        return fn
+
+    def _build_bench_ns(self) -> ir.Function:
+        """bench_ns(fn: i8*) -> i64  — run fn once, return elapsed time() delta (seconds as i64)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_bench_ns")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fn_ptr_raw = fn.args[0]
+        fn_ptr = b.bitcast(fn_ptr_raw, ir.PointerType(ir.FunctionType(VOID_TY, [])))
+        null = ir.Constant(I8PTR, None)
+        t_start = b.call(self.time_fn, [null])
+        b.call(fn_ptr, [])
+        t_end = b.call(self.time_fn, [null])
+        b.ret(b.sub(t_end, t_start))
+        return fn
+
+    # --- JSON parsing (basic: scan for key in flat JSON string) ---
+
+    def _build_json_parse_int(self) -> ir.Function:
+        """json_parse_int(json: str, key: str) -> i64."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_json_parse_int")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        json_s, key = fn.args[0], fn.args[1]
+        # Build search pattern: "key": and scan for the number after it
+        pat_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+        fmt_gv  = self._global_str("\"%s\":")
+        b.call(self.sprintf_fn, [pat_buf, self._gstr_ptr_const(fmt_gv), key])
+        found = b.call(self.strstr_fn, [json_s, pat_buf])
+        is_null = b.icmp_unsigned("==", b.ptrtoint(found, I64_TY), ir.Constant(I64_TY, 0))
+        found_bb = fn.append_basic_block("found"); notfound_bb = fn.append_basic_block("notfound")
+        b.cbranch(is_null, notfound_bb, found_bb)
+        b.position_at_end(notfound_bb); b.ret(ir.Constant(I64_TY, 0))
+        b.position_at_end(found_bb)
+        pat_len = b.call(self.strlen_fn, [pat_buf])
+        val_ptr = b.gep(found, [pat_len], inbounds=False)
+        b.ret(b.call(self.atoll_fn, [val_ptr]))
+        return fn
+
+    def _build_json_parse_str(self) -> ir.Function:
+        """json_parse_str(json: str, key: str) -> str."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_json_parse_str")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        json_s, key = fn.args[0], fn.args[1]
+        pat_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+        fmt_gv  = self._global_str("\"%s\":\"")
+        b.call(self.sprintf_fn, [pat_buf, self._gstr_ptr_const(fmt_gv), key])
+        found = b.call(self.strstr_fn, [json_s, pat_buf])
+        is_null = b.icmp_unsigned("==", b.ptrtoint(found, I64_TY), ir.Constant(I64_TY, 0))
+        found_bb = fn.append_basic_block("found"); notfound_bb = fn.append_basic_block("notfound")
+        empty_gv = self._global_str("")
+        b.cbranch(is_null, notfound_bb, found_bb)
+        b.position_at_end(notfound_bb); b.ret(self._gstr_ptr_const(empty_gv))
+        b.position_at_end(found_bb)
+        pat_len = b.call(self.strlen_fn, [pat_buf])
+        val_start = b.gep(found, [pat_len], inbounds=False)
+        # Find closing quote
+        quote_gv = self._global_str("\"")
+        end_ptr  = b.call(self.strstr_fn, [val_start, self._gstr_ptr_const(quote_gv)])
+        is_null2 = b.icmp_unsigned("==", b.ptrtoint(end_ptr, I64_TY), ir.Constant(I64_TY, 0))
+        copy_bb = fn.append_basic_block("copy"); ret_bb = fn.append_basic_block("ret")
+        b.cbranch(is_null2, ret_bb, copy_bb)
+        b.position_at_end(ret_bb); b.ret(val_start)
+        b.position_at_end(copy_bb)
+        str_len = b.sub(b.ptrtoint(end_ptr, I64_TY), b.ptrtoint(val_start, I64_TY))
+        out_buf = b.call(self.malloc_fn, [b.add(str_len, ir.Constant(I64_TY, 1))])
+        b.call(self.memcpy_fn, [out_buf, val_start, str_len])
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [str_len], inbounds=False))
+        b.ret(out_buf)
+        return fn
+
+    def _build_json_parse_float(self) -> ir.Function:
+        """json_parse_float(json: str, key: str) -> double."""
+        fn = ir.Function(self.module, ir.FunctionType(F64_TY, [I8PTR, I8PTR]),
+                         name="__vx_json_parse_float")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        json_s, key = fn.args[0], fn.args[1]
+        pat_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+        fmt_gv  = self._global_str("\"%s\":")
+        b.call(self.sprintf_fn, [pat_buf, self._gstr_ptr_const(fmt_gv), key])
+        found = b.call(self.strstr_fn, [json_s, pat_buf])
+        is_null = b.icmp_unsigned("==", b.ptrtoint(found, I64_TY), ir.Constant(I64_TY, 0))
+        found_bb = fn.append_basic_block("found"); notfound_bb = fn.append_basic_block("notfound")
+        b.cbranch(is_null, notfound_bb, found_bb)
+        b.position_at_end(notfound_bb); b.ret(ir.Constant(F64_TY, 0.0))
+        b.position_at_end(found_bb)
+        pat_len = b.call(self.strlen_fn, [pat_buf])
+        val_ptr = b.gep(found, [pat_len], inbounds=False)
+        b.ret(b.call(self.atof_fn, [val_ptr]))
+        return fn
+
+    def _build_json_parse_bool(self) -> ir.Function:
+        """json_parse_bool(json: str, key: str) -> i1."""
+        fn = ir.Function(self.module, ir.FunctionType(I1_TY, [I8PTR, I8PTR]),
+                         name="__vx_json_parse_bool")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        json_s, key = fn.args[0], fn.args[1]
+        pat_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+        fmt_gv  = self._global_str("\"%s\":")
+        b.call(self.sprintf_fn, [pat_buf, self._gstr_ptr_const(fmt_gv), key])
+        found = b.call(self.strstr_fn, [json_s, pat_buf])
+        is_null = b.icmp_unsigned("==", b.ptrtoint(found, I64_TY), ir.Constant(I64_TY, 0))
+        found_bb = fn.append_basic_block("found"); notfound_bb = fn.append_basic_block("notfound")
+        b.cbranch(is_null, notfound_bb, found_bb)
+        b.position_at_end(notfound_bb); b.ret(ir.Constant(I1_TY, 0))
+        b.position_at_end(found_bb)
+        pat_len = b.call(self.strlen_fn, [pat_buf])
+        val_ptr = b.gep(found, [pat_len], inbounds=False)
+        true_gv = self._global_str("true")
+        cmp = b.call(self.strncmp_fn, [val_ptr, self._gstr_ptr_const(true_gv),
+                                        ir.Constant(I64_TY, 4)])
+        is_true = b.icmp_signed("==", cmp, ir.Constant(I32_TY, 0))
+        b.ret(is_true)
+        return fn
+
+    # --- .env loader ---
+
+    def _build_env_load(self) -> ir.Function:
+        """env_load(path: str) — parse .env file and set env vars."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR]),
+                         name="__vx_env_load")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        path = fn.args[0]
+        mode_gv = self._global_str("r")
+        fp = b.call(self.fopen_fn, [path, self._gstr_ptr_const(mode_gv)])
+        is_null = b.icmp_unsigned("==", b.ptrtoint(fp, I64_TY), ir.Constant(I64_TY, 0))
+        open_bb = fn.append_basic_block("open"); done_bb = fn.append_basic_block("done")
+        b.cbranch(is_null, done_bb, open_bb)
+        b.position_at_end(done_bb); b.ret_void()
+        b.position_at_end(open_bb)
+        line_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 1024)])
+        read_chk = fn.append_basic_block("read_chk")
+        read_bdy = fn.append_basic_block("read_bdy")
+        read_ext = fn.append_basic_block("read_ext")
+        b.branch(read_chk)
+        b.position_at_end(read_chk)
+        got = b.call(self.fgets_fn, [line_buf, ir.Constant(I32_TY, 1024), fp])
+        is_eof = b.icmp_unsigned("==", b.ptrtoint(got, I64_TY), ir.Constant(I64_TY, 0))
+        b.cbranch(is_eof, read_ext, read_bdy)
+        b.position_at_end(read_bdy)
+        # Find '=' in line
+        eq_gv  = self._global_str("=")
+        eq_ptr = b.call(self.strstr_fn, [line_buf, self._gstr_ptr_const(eq_gv)])
+        has_eq = b.icmp_unsigned("!=", b.ptrtoint(eq_ptr, I64_TY), ir.Constant(I64_TY, 0))
+        set_bb  = fn.append_basic_block("set_env")
+        skip_bb = fn.append_basic_block("skip_env")
+        b.cbranch(has_eq, set_bb, skip_bb)
+        b.position_at_end(set_bb)
+        # Terminate key at '=', set value starting at eq+1
+        b.store(ir.Constant(I8_TY, 0), eq_ptr)
+        val_ptr = b.gep(eq_ptr, [ir.Constant(I32_TY, 1)], inbounds=False)
+        # Strip newline from val
+        val_len = b.call(self.strlen_fn, [val_ptr])
+        last_idx = b.sub(val_len, ir.Constant(I64_TY, 1))
+        last_ch_p = b.gep(val_ptr, [last_idx], inbounds=False)
+        last_ch = b.zext(b.load(last_ch_p), I32_TY)
+        is_nl = b.icmp_signed("==", last_ch, ir.Constant(I32_TY, 10))
+        nl_strip_bb = fn.append_basic_block("nl_strip"); no_nl_bb = fn.append_basic_block("no_nl")
+        b.cbranch(is_nl, nl_strip_bb, no_nl_bb)
+        b.position_at_end(nl_strip_bb)
+        b.store(ir.Constant(I8_TY, 0), last_ch_p); b.branch(no_nl_bb)
+        b.position_at_end(no_nl_bb)
+        env_set_fn = self._get_helper("__vx_env_set")
+        b.call(env_set_fn, [line_buf, val_ptr])
+        b.branch(skip_bb)
+        b.position_at_end(skip_bb)
+        b.branch(read_chk)
+        b.position_at_end(read_ext)
+        b.call(self.fclose_fn, [fp])
+        b.ret_void()
+        return fn
+
+    # --- Integer sets (open-addressed hash set of i64 values) ---
+    # Header layout (i64 slots): [data_ptr, len, cap]
+    # data_ptr → i64[] with -1 (0xFFFFFFFFFFFFFFFF) = empty slot
+
+    _SET_EMPTY = -1   # sentinel for empty slot
+
+    def _build_set_new(self) -> ir.Function:
+        """set_new() -> i64 handle."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_set_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cap = ir.Constant(I64_TY, 16)
+        data = b.call(self.malloc_fn, [b.mul(cap, ir.Constant(I64_TY, 8))])
+        # Fill with -1 (empty)
+        memset_ty = ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY])
+        memset_fn = self._get_or_declare_fn("memset", memset_ty)
+        b.call(memset_fn, [data, ir.Constant(I32_TY, 0xFF),
+                           b.mul(cap, ir.Constant(I64_TY, 8))])
+        hdr = b.call(self.malloc_fn, [ir.Constant(I64_TY, 24)])
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        data_i = b.ptrtoint(data, I64_TY)
+        b.store(data_i, b.gep(hdr64, [z], inbounds=False))
+        b.store(ir.Constant(I64_TY, 0), b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False))
+        b.store(cap, b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        b.ret(b.ptrtoint(hdr, I64_TY))
+        return fn
+
+    def _set_find_slot(self, b, data_ptr, cap_val, val, include_empty=True):
+        """Helper to compute hash slot (not an IR function — inlined by callers)."""
+        # idx = (val % cap + cap) % cap  (positive modulo)
+        raw = b.srem(val, cap_val)
+        pos = b.add(raw, cap_val)
+        return b.srem(pos, cap_val)
+
+    def _build_set_add(self) -> ir.Function:
+        """set_add(s: i64, val: i64)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_set_add")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s_i, val = fn.args[0], fn.args[1]
+        hdr   = b.inttoptr(s_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        data_i  = b.load(b.gep(hdr64, [z], inbounds=False))
+        cap     = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_p  = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        # Linear probe from hash slot
+        start_slot = self._set_find_slot(b, data_p, cap, val)
+        idx_al = b.alloca(I64_TY); b.store(start_slot, idx_al)
+        probe_chk = fn.append_basic_block("probe_chk")
+        probe_bdy = fn.append_basic_block("probe_bdy")
+        probe_ins = fn.append_basic_block("probe_ins")
+        b.branch(probe_chk)
+        b.position_at_end(probe_chk)
+        idx = b.load(idx_al)
+        slot_p = b.gep(data_p, [b.trunc(idx, I32_TY)], inbounds=False)
+        slot_v = b.load(slot_p)
+        is_empty = b.icmp_signed("==", slot_v, ir.Constant(I64_TY, -1))
+        is_dupe  = b.icmp_signed("==", slot_v, val)
+        can_use  = b.or_(is_empty, is_dupe)
+        b.cbranch(can_use, probe_ins, probe_bdy)
+        b.position_at_end(probe_bdy)
+        next_idx = b.srem(b.add(idx, ir.Constant(I64_TY, 1)), cap)
+        b.store(next_idx, idx_al); b.branch(probe_chk)
+        b.position_at_end(probe_ins)
+        idx2 = b.load(idx_al)
+        slot_p2 = b.gep(data_p, [b.trunc(idx2, I32_TY)], inbounds=False)
+        cur_v = b.load(slot_p2)
+        is_new = b.icmp_signed("==", cur_v, ir.Constant(I64_TY, -1))
+        new_bb  = fn.append_basic_block("new_slot"); dup_bb = fn.append_basic_block("dup_done")
+        b.cbranch(is_new, new_bb, dup_bb)
+        b.position_at_end(new_bb)
+        b.store(val, slot_p2)
+        len_p = b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False)
+        b.store(b.add(b.load(len_p), ir.Constant(I64_TY, 1)), len_p)
+        b.branch(dup_bb)
+        b.position_at_end(dup_bb)
+        b.ret_void()
+        return fn
+
+    def _build_set_contains(self) -> ir.Function:
+        """set_contains(s: i64, val: i64) -> i1."""
+        fn = ir.Function(self.module, ir.FunctionType(I1_TY, [I64_TY, I64_TY]),
+                         name="__vx_set_contains")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s_i, val = fn.args[0], fn.args[1]
+        hdr   = b.inttoptr(s_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        data_i = b.load(b.gep(hdr64, [z], inbounds=False))
+        cap    = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_p = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        start_slot = self._set_find_slot(b, data_p, cap, val)
+        idx_al = b.alloca(I64_TY); b.store(start_slot, idx_al)
+        probe_chk = fn.append_basic_block("probe_chk")
+        probe_bdy = fn.append_basic_block("probe_bdy")
+        found_bb  = fn.append_basic_block("found")
+        miss_bb   = fn.append_basic_block("miss")
+        b.branch(probe_chk)
+        b.position_at_end(probe_chk)
+        idx = b.load(idx_al)
+        slot_p = b.gep(data_p, [b.trunc(idx, I32_TY)], inbounds=False)
+        slot_v = b.load(slot_p)
+        is_match = b.icmp_signed("==", slot_v, val)
+        is_empty = b.icmp_signed("==", slot_v, ir.Constant(I64_TY, -1))
+        b.cbranch(is_match, found_bb, probe_bdy)
+        b.position_at_end(probe_bdy)
+        b.cbranch(is_empty, miss_bb, fn.append_basic_block("cont_probe"))
+        cont = list(fn.blocks)[-1]
+        b.position_at_end(cont)
+        next_idx = b.srem(b.add(idx, ir.Constant(I64_TY, 1)), cap)
+        b.store(next_idx, idx_al); b.branch(probe_chk)
+        b.position_at_end(found_bb); b.ret(ir.Constant(I1_TY, 1))
+        b.position_at_end(miss_bb);  b.ret(ir.Constant(I1_TY, 0))
+        return fn
+
+    def _build_set_remove(self) -> ir.Function:
+        """set_remove(s: i64, val: i64) — tombstone removal (mark slot -2)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_set_remove")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s_i, val = fn.args[0], fn.args[1]
+        hdr   = b.inttoptr(s_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        data_i = b.load(b.gep(hdr64, [z], inbounds=False))
+        cap    = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_p = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        start_slot = self._set_find_slot(b, data_p, cap, val)
+        idx_al = b.alloca(I64_TY); b.store(start_slot, idx_al)
+        probe_chk = fn.append_basic_block("probe_chk")
+        probe_bdy = fn.append_basic_block("probe_bdy")
+        found_bb  = fn.append_basic_block("found")
+        miss_bb   = fn.append_basic_block("miss")
+        b.branch(probe_chk)
+        b.position_at_end(probe_chk)
+        idx = b.load(idx_al)
+        slot_p = b.gep(data_p, [b.trunc(idx, I32_TY)], inbounds=False)
+        slot_v = b.load(slot_p)
+        is_match = b.icmp_signed("==", slot_v, val)
+        is_empty = b.icmp_signed("==", slot_v, ir.Constant(I64_TY, -1))
+        b.cbranch(is_match, found_bb, probe_bdy)
+        b.position_at_end(probe_bdy)
+        b.cbranch(is_empty, miss_bb, fn.append_basic_block("cont_p"))
+        cont = list(fn.blocks)[-1]
+        b.position_at_end(cont)
+        next_idx = b.srem(b.add(idx, ir.Constant(I64_TY, 1)), cap)
+        b.store(next_idx, idx_al); b.branch(probe_chk)
+        b.position_at_end(found_bb)
+        # Mark as tombstone (-2) and decrement len
+        b.store(ir.Constant(I64_TY, -2), slot_p)
+        len_p = b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False)
+        b.store(b.sub(b.load(len_p), ir.Constant(I64_TY, 1)), len_p)
+        b.branch(miss_bb)
+        b.position_at_end(miss_bb); b.ret_void()
+        return fn
+
+    def _build_set_size(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_set_size")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s_i = fn.args[0]
+        hdr   = b.inttoptr(s_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        b.ret(b.load(b.gep(hdr64, [ir.Constant(I32_TY, 1)], inbounds=False)))
+        return fn
+
+    def _build_set_to_array(self) -> ir.Function:
+        """set_to_array(s: i64) -> vx_array* of i64 (returned as i8*)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_set_to_array")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        s_i = fn.args[0]
+        hdr   = b.inttoptr(s_i, I8PTR)
+        hdr64 = b.bitcast(hdr, ir.PointerType(I64_TY))
+        z = ir.Constant(I32_TY, 0)
+        data_i = b.load(b.gep(hdr64, [z], inbounds=False))
+        cap    = b.load(b.gep(hdr64, [ir.Constant(I32_TY, 2)], inbounds=False))
+        data_p = b.inttoptr(data_i, ir.PointerType(I64_TY))
+        # Build result vx_array
+        arr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        arr     = b.bitcast(arr_raw, self.arr_ptr_type)
+        out_data = b.call(self.malloc_fn, [b.mul(cap, ir.Constant(I64_TY, 8))])
+        az = ir.Constant(I32_TY, 0)
+        b.store(out_data, b.gep(arr, [az, az], inbounds=True))
+        out_len_p = b.gep(arr, [az, ir.Constant(I32_TY, 1)], inbounds=True)
+        b.store(ir.Constant(I64_TY, 0), out_len_p)
+        b.store(cap, b.gep(arr, [az, ir.Constant(I32_TY, 2)], inbounds=True))
+        out_data64 = b.bitcast(out_data, ir.PointerType(I64_TY))
+        # Iterate slots, copy non-empty non-tombstone entries
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        loop_chk = fn.append_basic_block("loop_chk")
+        loop_bdy = fn.append_basic_block("loop_bdy")
+        loop_ext = fn.append_basic_block("loop_ext")
+        b.branch(loop_chk)
+        b.position_at_end(loop_chk)
+        i = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", i, cap), loop_bdy, loop_ext)
+        b.position_at_end(loop_bdy)
+        slot_v = b.load(b.gep(data_p, [b.trunc(i, I32_TY)], inbounds=False))
+        is_empty    = b.icmp_signed("==", slot_v, ir.Constant(I64_TY, -1))
+        is_tombstone= b.icmp_signed("==", slot_v, ir.Constant(I64_TY, -2))
+        skip = b.or_(is_empty, is_tombstone)
+        copy_bb = fn.append_basic_block("copy_slot"); skip_bb = fn.append_basic_block("skip_slot")
+        b.cbranch(skip, skip_bb, copy_bb)
+        b.position_at_end(copy_bb)
+        out_len = b.load(out_len_p)
+        b.store(slot_v, b.gep(out_data64, [b.trunc(out_len, I32_TY)], inbounds=False))
+        b.store(b.add(out_len, ir.Constant(I64_TY, 1)), out_len_p)
+        b.branch(skip_bb)
+        b.position_at_end(skip_bb)
+        b.store(b.add(i, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(loop_chk)
+        b.position_at_end(loop_ext)
+        b.ret(arr_raw)
+        return fn
+
+    def _build_set_union(self) -> ir.Function:
+        """set_union(a: i64, b: i64) -> i64 — new set containing all elements of both."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I64_TY]),
+                         name="__vx_set_union")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        a_i, b_i = fn.args[0], fn.args[1]
+        new_fn  = self._get_helper("__vx_set_new")
+        add_fn  = self._get_helper("__vx_set_add")
+        to_arr  = self._get_helper("__vx_set_to_array")
+        result = b.call(new_fn, [])
+        for src_i in (a_i, b_i):
+            arr_raw = b.call(to_arr, [src_i])
+            arr     = b.bitcast(arr_raw, self.arr_ptr_type)
+            az = ir.Constant(I32_TY, 0)
+            arr_len = b.load(b.gep(arr, [az, ir.Constant(I32_TY, 1)], inbounds=True))
+            arr_data= b.load(b.gep(arr, [az, az], inbounds=True))
+            arr64   = b.bitcast(arr_data, ir.PointerType(I64_TY))
+            ci_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), ci_al)
+            lbl = "u_chk" if src_i is a_i else "u2_chk"
+            chk_bb = fn.append_basic_block(lbl)
+            bdy_bb = fn.append_basic_block(lbl.replace("chk","bdy"))
+            ext_bb = fn.append_basic_block(lbl.replace("chk","ext"))
+            b.branch(chk_bb)
+            b.position_at_end(chk_bb)
+            ci = b.load(ci_al)
+            b.cbranch(b.icmp_signed("<", ci, arr_len), bdy_bb, ext_bb)
+            b.position_at_end(bdy_bb)
+            elem = b.load(b.gep(arr64, [b.trunc(ci, I32_TY)], inbounds=False))
+            b.call(add_fn, [result, elem])
+            b.store(b.add(ci, ir.Constant(I64_TY, 1)), ci_al)
+            b.branch(chk_bb)
+            b.position_at_end(ext_bb)
+        b.ret(result)
+        return fn
+
+    def _build_set_intersect(self) -> ir.Function:
+        """set_intersect(a: i64, b_set: i64) -> i64 — elements in both a and b."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I64_TY]),
+                         name="__vx_set_intersect")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        a_i, b_i = fn.args[0], fn.args[1]
+        new_fn      = self._get_helper("__vx_set_new")
+        add_fn      = self._get_helper("__vx_set_add")
+        contains_fn = self._get_helper("__vx_set_contains")
+        to_arr      = self._get_helper("__vx_set_to_array")
+        result = b.call(new_fn, [])
+        arr_raw = b.call(to_arr, [a_i])
+        arr     = b.bitcast(arr_raw, self.arr_ptr_type)
+        az = ir.Constant(I32_TY, 0)
+        arr_len = b.load(b.gep(arr, [az, ir.Constant(I32_TY, 1)], inbounds=True))
+        arr_data= b.load(b.gep(arr, [az, az], inbounds=True))
+        arr64   = b.bitcast(arr_data, ir.PointerType(I64_TY))
+        ci_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), ci_al)
+        chk_bb = fn.append_basic_block("i_chk"); bdy_bb = fn.append_basic_block("i_bdy")
+        ext_bb = fn.append_basic_block("i_ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        ci = b.load(ci_al)
+        b.cbranch(b.icmp_signed("<", ci, arr_len), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        elem = b.load(b.gep(arr64, [b.trunc(ci, I32_TY)], inbounds=False))
+        in_b = b.call(contains_fn, [b_i, elem])
+        add_bb = fn.append_basic_block("i_add"); skip_bb = fn.append_basic_block("i_skip")
+        b.cbranch(b.zext(in_b, I64_TY) if False else in_b, add_bb, skip_bb)
+        b.position_at_end(add_bb); b.call(add_fn, [result, elem]); b.branch(skip_bb)
+        b.position_at_end(skip_bb)
+        b.store(b.add(ci, ir.Constant(I64_TY, 1)), ci_al); b.branch(chk_bb)
+        b.position_at_end(ext_bb); b.ret(result)
+        return fn
+
+    # --- UUID v1 (time-based, simplified) ---
+
+    def _build_uuid_v1(self) -> ir.Function:
+        """uuid_v1() -> str — generate a time-based UUID v1 string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_uuid_v1")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 64)])
+        null = ir.Constant(I8PTR, None)
+        ts = b.call(self.time_fn, [null])
+        rand_v = b.sext(b.call(self.rand_fn, []), I64_TY)
+        rand2  = b.sext(b.call(self.rand_fn, []), I64_TY)
+        rand3  = b.sext(b.call(self.rand_fn, []), I64_TY)
+        fmt_gv = self._global_str("%08llx-%04llx-1%03llx-%04llx-%012llx")
+        ts32   = b.and_(ts,    ir.Constant(I64_TY, 0xFFFFFFFF))
+        r1     = b.and_(rand_v, ir.Constant(I64_TY, 0xFFFF))
+        r2     = b.and_(rand2,  ir.Constant(I64_TY, 0x0FFF))
+        r3     = b.and_(rand3,  ir.Constant(I64_TY, 0xFFFF))
+        r4     = b.and_(b.add(rand_v, rand2), ir.Constant(I64_TY, 0xFFFFFFFFFFFF))
+        b.call(self.sprintf_fn, [buf, self._gstr_ptr_const(fmt_gv), ts32, r1, r2, r3, r4])
+        b.ret(buf)
+        return fn
+
+    # --- Condition variables ---
+
+    def _build_condvar_new(self) -> ir.Function:
+        """condvar_new() -> i64 handle (opaque condvar pointer)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_condvar_new")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        if _sys.platform == "win32":
+            # CONDITION_VARIABLE is a single pointer; malloc 8 bytes
+            buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 8)])
+            init_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            init_fn = self._get_or_declare_fn("InitializeConditionVariable", init_ty)
+            b.call(init_fn, [buf])
+        else:
+            # pthread_cond_t ~48 bytes
+            buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 48)])
+            null = ir.Constant(I8PTR, None)
+            init_ty = ir.FunctionType(I32_TY, [I8PTR, I8PTR])
+            init_fn = self._get_or_declare_fn("pthread_cond_init", init_ty)
+            b.call(init_fn, [buf, null])
+        b.ret(b.ptrtoint(buf, I64_TY))
+        return fn
+
+    def _build_condvar_wait(self) -> ir.Function:
+        """condvar_wait(cv: i64, mu: i64)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_condvar_wait")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cv_i, mu_i = fn.args[0], fn.args[1]
+        cv_ptr = b.inttoptr(cv_i, I8PTR)
+        mu_ptr = b.inttoptr(mu_i, I8PTR)
+        if _sys.platform == "win32":
+            # SleepConditionVariableCS(cv, mu, INFINITE=0xFFFFFFFF)
+            wait_ty = ir.FunctionType(I32_TY, [I8PTR, I8PTR, I32_TY])
+            wait_fn = self._get_or_declare_fn("SleepConditionVariableCS", wait_ty)
+            b.call(wait_fn, [cv_ptr, mu_ptr, ir.Constant(I32_TY, 0xFFFFFFFF)])
+        else:
+            wait_ty = ir.FunctionType(I32_TY, [I8PTR, I8PTR])
+            wait_fn = self._get_or_declare_fn("pthread_cond_wait", wait_ty)
+            b.call(wait_fn, [cv_ptr, mu_ptr])
+        b.ret_void()
+        return fn
+
+    def _build_condvar_signal(self) -> ir.Function:
+        """condvar_signal(cv: i64)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_condvar_signal")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cv_i = fn.args[0]
+        cv_ptr = b.inttoptr(cv_i, I8PTR)
+        if _sys.platform == "win32":
+            sig_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            sig_fn = self._get_or_declare_fn("WakeConditionVariable", sig_ty)
+        else:
+            sig_ty = ir.FunctionType(I32_TY, [I8PTR])
+            sig_fn = self._get_or_declare_fn("pthread_cond_signal", sig_ty)
+        b.call(sig_fn, [cv_ptr])
+        b.ret_void()
+        return fn
+
+    def _build_condvar_broadcast(self) -> ir.Function:
+        """condvar_broadcast(cv: i64)."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_condvar_broadcast")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        cv_i = fn.args[0]
+        cv_ptr = b.inttoptr(cv_i, I8PTR)
+        if _sys.platform == "win32":
+            bc_ty = ir.FunctionType(VOID_TY, [I8PTR])
+            bc_fn = self._get_or_declare_fn("WakeAllConditionVariable", bc_ty)
+        else:
+            bc_ty = ir.FunctionType(I32_TY, [I8PTR])
+            bc_fn = self._get_or_declare_fn("pthread_cond_broadcast", bc_ty)
+        b.call(bc_fn, [cv_ptr])
+        b.ret_void()
+        return fn
+
 
 # ================================================================== #
 #  JIT runner                                                          #
@@ -6651,7 +8804,9 @@ def jit_run(llvm_ir: str) -> int:
         import ctypes.util
         _crt = ctypes.CDLL("msvcrt")
         for _win, _vx in [("_popen", "popen"), ("_pclose", "pclose"),
-                           ("_fdopen", "fdopen"), ("_fileno", "fileno")]:
+                           ("_fdopen", "fdopen"), ("_fileno", "fileno"),
+                           ("_putenv", "putenv"), ("_getcwd", "getcwd"),
+                           ("_mkdir", "mkdir"), ("_rmdir", "rmdir")]:
             _fn = getattr(_crt, _win, None)
             if _fn:
                 binding.add_symbol(_vx, ctypes.cast(_fn, ctypes.c_void_p).value)

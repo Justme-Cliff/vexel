@@ -147,13 +147,29 @@ class Parser:
                 self._advance()
         self._expect(TT.RPAREN)
         ret = None
+        named_returns = []
         if self._match(TT.ARROW):
             self._advance()
-            ret = self._parse_type()
+            # Named return values: -> (q: int, r: int)
+            if self._match(TT.LPAREN) and self._peek(1).type == TT.IDENT \
+                    and self._peek(2).type == TT.COLON:
+                self._advance()  # consume (
+                while not self._match(TT.RPAREN):
+                    rname = self._expect(TT.IDENT).value
+                    self._expect(TT.COLON)
+                    rtype = self._parse_type()
+                    named_returns.append((rname, rtype))
+                    if self._match(TT.COMMA):
+                        self._advance()
+                self._expect(TT.RPAREN)
+                # Build tuple return type: (int, float)
+                ret = "(" + ",".join(t for _, t in named_returns) + ")"
+            else:
+                ret = self._parse_type()
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         body = self._parse_block()
-        node = FnDecl(name, params, ret, body, type_params)
+        node = FnDecl(name, params, ret, body, type_params, named_returns)
         node.line = start_line
         return node
 
@@ -332,11 +348,16 @@ class Parser:
                 return base + "?"
             return base
 
-        # Array: int[]
+        # Array: int[]  or  int[][]  (multi-dimensional)
         if self._match(TT.LBRACKET):
             self._advance()
             self._expect(TT.RBRACKET)
             base = name + "[]"
+            # Support additional [] for 2D/3D arrays: str[][]
+            while self._match(TT.LBRACKET):
+                self._advance()
+                self._expect(TT.RBRACKET)
+                base = base + "[]"
             if self._match(TT.QUESTION):
                 self._advance()
                 return base + "?"
@@ -373,7 +394,12 @@ class Parser:
                 fname = self._expect(TT.IDENT).value
                 self._expect(TT.COLON)
                 ftype = self._parse_type()
-                fields.append(StructField(fname, ftype))
+                # Default field value: host: str = "localhost"
+                fdefault = None
+                if self._match(TT.ASSIGN):
+                    self._advance()
+                    fdefault = self._parse_expr()
+                fields.append(StructField(fname, ftype, fdefault))
                 self._eat_newline()
         self._expect(TT.DEDENT)
         node = StructDecl(name, fields)
@@ -804,14 +830,20 @@ class Parser:
         self._expect(TT.IN)
         expr = self._parse_expr()
 
-        if self._match(TT.DOTDOT):
-            # Range loop: for i in start..end
+        if self._match(TT.DOTDOT) or self._match(TT.DOTDOT_EQ):
+            # Range loop: for i in start..end  or  for i in start..=end
+            inclusive = self._cur().type == TT.DOTDOT_EQ
             self._advance()
             end = self._parse_expr()
+            # Optional step: for i in 0..10 step 2
+            step = None
+            if self._match(TT.IDENT) and self._cur().value == "step":
+                self._advance()
+                step = self._parse_expr()
             self._expect(TT.COLON)
             self._expect(TT.NEWLINE)
             body = self._parse_block()
-            return ForStmt(var, expr, end, body)
+            return ForStmt(var, expr, end, body, step, inclusive)
         else:
             # For-each: for item in array
             self._expect(TT.COLON)
@@ -873,15 +905,20 @@ class Parser:
         return DoWhileStmt(body, cond)
 
     def _parse_defer(self) -> DeferStmt:
-        """defer expr  — or  defer print(...) / defer call()"""
+        """defer expr  — or  defer print(...) / defer call()  / defer_on_error call()"""
         self._expect(TT.DEFER)
+        # defer_on_error: contextual two-word keyword
+        on_error = False
+        if self._match(TT.IDENT) and self._cur().value == "on_error":
+            self._advance()
+            on_error = True
         # If next token is print keyword, parse as print statement stored in defer
         if self._match(TT.PRINT):
             stmt = self._parse_print()
-            return DeferStmt(stmt)
+            return DeferStmt(stmt, on_error)
         expr = self._parse_expr()
         self._eat_newline()
-        return DeferStmt(expr)
+        return DeferStmt(expr, on_error)
 
     def _parse_yield(self) -> YieldStmt:
         """yield [expr]"""
@@ -1013,7 +1050,24 @@ class Parser:
     # ------------------------------------------------------------------ #
 
     def _parse_expr(self) -> Node:
-        return self._parse_null_coalesce()
+        return self._parse_pipe()
+
+    def _parse_pipe(self) -> Node:
+        """value |> func  →  func(value)  (left-associative)"""
+        left = self._parse_null_coalesce()
+        while self._match(TT.PIPE_ARROW):
+            self._advance()
+            func_expr = self._parse_null_coalesce()
+            # Desugar: value |> f  →  f(value)
+            if isinstance(func_expr, Identifier):
+                left = Call(func_expr.name, [left])
+            elif isinstance(func_expr, Call):
+                # value |> f(extra)  →  f(value, extra)
+                func_expr.args.insert(0, left)
+                left = func_expr
+            else:
+                left = PipeExpr(left, func_expr)
+        return left
 
     def _parse_null_coalesce(self) -> Node:
         left = self._parse_ternary()
@@ -1169,8 +1223,12 @@ class Parser:
                 self._advance()
                 args = []
                 while not self._match(TT.RPAREN):
+                    # Spread argument: ...arr
+                    if self._match(TT.ELLIPSIS):
+                        self._advance()
+                        args.append(SpreadExpr(self._parse_expr()))
                     # Named argument: name = expr
-                    if (self._match(TT.IDENT) and self._peek(1).type == TT.ASSIGN):
+                    elif (self._match(TT.IDENT) and self._peek(1).type == TT.ASSIGN):
                         aname = self._advance().value
                         self._advance()  # consume =
                         aval = self._parse_expr()
@@ -1255,6 +1313,16 @@ class Parser:
                 var = self._expect(TT.IDENT).value
                 self._expect(TT.IN)
                 iterable = self._parse_expr()
+                # Support range iterable: [x for x in 0..n] or [x for x in 0..=n step 2]
+                if self._match(TT.DOTDOT) or self._match(TT.DOTDOT_EQ):
+                    inclusive = self._cur().type == TT.DOTDOT_EQ
+                    self._advance()
+                    range_end = self._parse_expr()
+                    step = None
+                    if self._match(TT.IDENT) and self._cur().value == "step":
+                        self._advance()
+                        step = self._parse_expr()
+                    iterable = RangeExpr(iterable, range_end, inclusive, step)
                 condition = None
                 if self._match(TT.IF):
                     self._advance()
@@ -1290,6 +1358,22 @@ class Parser:
 
         if t.type == TT.LBRACE:
             self._advance()
+            # Struct update syntax: { ...base, field: val }
+            if self._match(TT.ELLIPSIS):
+                self._advance()
+                base = self._parse_expr()
+                updates = []
+                while self._match(TT.COMMA):
+                    self._advance()
+                    if self._match(TT.RBRACE):
+                        break
+                    fname = self._expect(TT.IDENT).value
+                    self._expect(TT.COLON)
+                    fval  = self._parse_expr()
+                    updates.append((fname, fval))
+                self._expect(TT.RBRACE)
+                return StructUpdateExpr(base, updates)
+            # Normal dict literal
             pairs = []
             while not self._match(TT.RBRACE):
                 key = self._parse_expr()

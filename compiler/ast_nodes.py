@@ -72,6 +72,11 @@ class UnaryOp(Node):
     operand: Node
 
 @dataclass
+class SpreadExpr(Node):
+    """...arr — spread array into function call arguments."""
+    value: Node
+
+@dataclass
 class Call(Node):
     func: str
     args: List[Node]
@@ -155,10 +160,12 @@ class IfStmt(Node):
 
 @dataclass
 class ForStmt(Node):
-    var:   str
-    start: Node
-    end:   Node
-    body:  List[Node]
+    var:       str
+    start:     Node
+    end:       Node
+    body:      List[Node]
+    step:      Optional[Node] = None
+    inclusive: bool = False
 
 @dataclass
 class ForEach(Node):             # for item in array:
@@ -202,21 +209,29 @@ class Param(Node):
 
 @dataclass
 class FnDecl(Node):
-    name:        str
-    params:      List[Param]
-    return_type: Optional[str]
-    body:        List[Node]
-    type_params: List[str] = field(default_factory=list)  # [T, U, ...]
+    name:         str
+    params:       List[Param]
+    return_type:  Optional[str]
+    body:         List[Node]
+    type_params:  List[str] = field(default_factory=list)  # [T, U, ...]
+    named_returns: List[tuple] = field(default_factory=list)  # [(name, type), ...]
 
 @dataclass
 class StructField(Node):
     name: str
     type_name: str
+    default: Optional[Node] = None   # default value: host = "localhost"
 
 @dataclass
 class StructDecl(Node):
     name: str
     fields: List[StructField]
+
+@dataclass
+class StructUpdateExpr(Node):
+    """{ ...base, field: val }  — create copy of struct with some fields changed."""
+    base:   Node
+    fields: List[tuple]   # [(name_str, value_node), ...]
 
 @dataclass
 class GlobalLet(Node):
@@ -343,6 +358,7 @@ class ContinueLabel(Node):
 class DeferStmt(Node):
     """defer expr — run expr when the enclosing function returns."""
     expr: Node
+    on_error_only: bool = False   # defer_on_error: only runs if function throws
 
 @dataclass
 class YieldStmt(Node):
@@ -492,3 +508,23 @@ class SliceExpr(Node):
     start:     Optional[Node]
     end:       Optional[Node]
     inclusive: bool = False   # ..= vs ..
+
+@dataclass
+class RangeExpr(Node):
+    """start..end or start..=end with optional step — used in comprehensions/for loops."""
+    start:     Node
+    end:       Node
+    inclusive: bool = False
+    step:      Optional[Node] = None
+
+@dataclass
+class PipeExpr(Node):
+    """value |> func — syntactic sugar for func(value)."""
+    value: Node
+    func:  Node
+
+@dataclass
+class ChainedCompare(Node):
+    """a < b < c — desugared to (a < b) and (b < c), but b is only evaluated once."""
+    operands: List[Node]   # [a, b, c]
+    ops:      List[str]    # ["<", "<"]

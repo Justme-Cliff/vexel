@@ -76,14 +76,39 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "shell":        (["str"],                     VX_STR),
     "run":          (["str", "str[]"],            VX_INT),
     # v7 — string extras
-    "str_find":     (["str", "str"],              VX_INT),
-    "str_slice":    (["str", "int", "int"],       VX_STR),
-    "str_repeat":   (["str", "int"],              VX_STR),
-    "str_join":     (["str[]", "str"],            VX_STR),
-    "str_char_at":  (["str", "int"],              VX_INT),
-    "str_len_utf8": (["str"],                     VX_INT),
-    "char_to_int":  (["str"],                     VX_INT),
-    "int_to_char":  (["int"],                     VX_STR),
+    "str_find":         (["str", "str"],              VX_INT),
+    "str_slice":        (["str", "int", "int"],       VX_STR),
+    "str_repeat":       (["str", "int"],              VX_STR),
+    "str_join":         (["str[]", "str"],            VX_STR),
+    "str_char_at":      (["str", "int"],              VX_INT),
+    "str_len_utf8":     (["str"],                     VX_INT),
+    "char_to_int":      (["str"],                     VX_INT),
+    "int_to_char":      (["int"],                     VX_STR),
+    # B1/B8 fix — these were implemented in codegen but not registered here
+    "str_split":        (["str", "str"],              "str[]"),
+    "str_trim":         (["str"],                     VX_STR),
+    "str_contains":     (["str", "str"],              VX_BOOL),
+    "char_at":          (["str", "int"],              VX_STR),
+    "str_upper":        (["str"],                     VX_STR),
+    "str_lower":        (["str"],                     VX_STR),
+    "str_starts_with":  (["str", "str"],              VX_BOOL),
+    "str_ends_with":    (["str", "str"],              VX_BOOL),
+    "str_replace":      (["str", "str", "str"],       VX_STR),
+    # v8 — new stdlib
+    "rand_seed":        (["int"],                     VX_VOID),
+    "csv_write":        (["str[][]", "str"],          VX_STR),
+    "popcount":         (["int"],                     VX_INT),
+    "clz":              (["int"],                     VX_INT),
+    "ctz":              (["int"],                     VX_INT),
+    "bit_reverse":      (["int"],                     VX_INT),
+    "log_info":         (["str"],                     VX_VOID),
+    "log_warn":         (["str"],                     VX_VOID),
+    "log_error":        (["str"],                     VX_VOID),
+    "log_debug":        (["str"],                     VX_VOID),
+    "print_color":      (["str", "str"],              VX_VOID),
+    "print_bold":       (["str"],                     VX_VOID),
+    "dict_values":      (["any"],                     "any[]"),
+    "dict_items":       (["any"],                     "str[]"),
     # v7 — array extras
     "array_sort":   (["any[]"],                   VX_VOID),
     "array_sort_by":  (["any[]", "any"],          VX_VOID),
@@ -150,6 +175,72 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "db_exec":      (["int", "str"],              VX_VOID),
     "db_query":     (["int", "str"],              "str[][]"),
     "db_close":     (["int"],                     VX_VOID),
+    # v8 — date/time
+    "datetime_now":      ([],                     VX_STR),
+    "datetime_format":   (["str"],                VX_STR),
+    "datetime_timestamp":([],                     VX_INT),
+    "datetime_from_ts":  (["int"],                VX_STR),
+    "sleep_ms":          (["int"],                VX_VOID),
+    # v8 — signal handling
+    "signal_handle":     (["int", "any"],         VX_VOID),
+    "SIGINT":            ([],                     VX_INT),
+    "SIGTERM":           ([],                     VX_INT),
+    # v8 — process spawning
+    "process_spawn":     (["str", "str[]"],       VX_INT),
+    "process_wait":      (["int"],                VX_INT),
+    "process_kill":      (["int"],                VX_VOID),
+    # v8 — progress bars / terminal UI
+    "progress_new":      (["int"],                VX_INT),
+    "progress_update":   (["int", "int"],         VX_VOID),
+    "progress_finish":   (["int", "str"],         VX_VOID),
+    "term_clear":        ([],                     VX_VOID),
+    "term_move":         (["int", "int"],         VX_VOID),
+    "term_width":        ([],                     VX_INT),
+    # v8 — channels (thread messaging)
+    "channel_new":       ([],                     VX_INT),
+    "channel_send":      (["int", "int"],         VX_VOID),
+    "channel_recv":      (["int"],                VX_INT),
+    "channel_try_recv":  (["int"],                VX_INT),
+    "channel_close":     (["int"],                VX_VOID),
+    # v8 — rwlocks
+    "rwlock_new":        ([],                     VX_INT),
+    "rwlock_read_lock":  (["int"],                VX_VOID),
+    "rwlock_read_unlock":(["int"],                VX_VOID),
+    "rwlock_write_lock": (["int"],                VX_VOID),
+    "rwlock_write_unlock":(["int"],               VX_VOID),
+    # v8 — thread pool
+    "thread_pool_new":   (["int"],                VX_INT),
+    "thread_pool_submit":(["int", "any"],         VX_VOID),
+    "thread_pool_wait":  (["int"],                VX_VOID),
+    "thread_pool_destroy":(["int"],               VX_VOID),
+    # v8 — benchmarking
+    "benchmark":         (["any", "int"],         VX_STR),
+    "bench_ns":          (["any"],                VX_INT),
+    # v8 — JSON parsing (basic)
+    "json_parse_int":    (["str", "str"],         VX_INT),
+    "json_parse_str":    (["str", "str"],         VX_STR),
+    "json_parse_float":  (["str", "str"],         VX_FLOAT),
+    "json_parse_bool":   (["str", "str"],         VX_BOOL),
+    # v8 — .env config
+    "env_load":          (["str"],                VX_VOID),
+    # v8 — set operations
+    "set_new":           ([],                     VX_INT),
+    "set_add":           (["int", "int"],         VX_VOID),
+    "set_contains":      (["int", "int"],         VX_BOOL),
+    "set_remove":        (["int", "int"],         VX_VOID),
+    "set_size":          (["int"],                VX_INT),
+    "set_to_array":      (["int"],                "int[]"),
+    "set_union":         (["int", "int"],         VX_INT),
+    "set_intersect":     (["int", "int"],         VX_INT),
+    # v8 — UUID extras
+    "uuid_v1":           ([],                     VX_STR),
+    # v8 — bounds checking helpers (debug mode)
+    "bounds_check":      (["int", "int"],         VX_VOID),
+    # v8 — condition variables
+    "condvar_new":       ([],                     VX_INT),
+    "condvar_wait":      (["int", "int"],         VX_VOID),
+    "condvar_signal":    (["int"],                VX_VOID),
+    "condvar_broadcast": (["int"],                VX_VOID),
 }
 
 
@@ -334,6 +425,28 @@ class Analyzer:
         line = getattr(node, 'line', 0) if node else 0
         prefix = f"Line {line}: " if line else ""
         self._errors.append(prefix + msg)
+
+    @staticmethod
+    def _edit_distance(a: str, b: str) -> int:
+        """Compute Levenshtein distance between two strings."""
+        if len(a) > len(b): a, b = b, a
+        row = list(range(len(a) + 1))
+        for j, cb in enumerate(b):
+            new_row = [j + 1]
+            for i, ca in enumerate(a):
+                new_row.append(min(row[i+1]+1, new_row[i]+1,
+                                   row[i] + (0 if ca == cb else 1)))
+            row = new_row
+        return row[-1]
+
+    def _suggest(self, name: str, candidates: list[str], max_dist: int = 2) -> str | None:
+        """Return closest candidate within max_dist edits, or None."""
+        best, best_d = None, max_dist + 1
+        for c in candidates:
+            d = self._edit_distance(name, c)
+            if d < best_d:
+                best, best_d = c, d
+        return best if best_d <= max_dist else None
 
     # ------------------------------------------------------------------ #
     #  Functions                                                           #
@@ -582,6 +695,9 @@ class Analyzer:
     # ------------------------------------------------------------------ #
 
     def _infer_expr(self, node: Node) -> str:
+        from compiler.ast_nodes import RangeExpr as _RangeExpr, PipeExpr as _PipeExpr
+        if isinstance(node, _RangeExpr):        return "int[]"   # range produces ints
+        if isinstance(node, _PipeExpr):         return self._infer_expr(node.func)
         if isinstance(node, TypePattern):       return VX_BOOL
         if isinstance(node, IntLiteral):        return VX_INT
         if isinstance(node, CharLiteral):       return VX_INT   # char is an int code point
@@ -600,7 +716,17 @@ class Analyzer:
             ot = self._infer_expr(node.obj)
             return ot   # slice of str→str, arr→arr
         if isinstance(node, ListComp):
+            # B3 fix: push scope and declare loop variable before inferring body
+            self._push()
+            from compiler.ast_nodes import RangeExpr as _RangeExpr
+            if isinstance(node.iterable, _RangeExpr):
+                elem_t = VX_INT
+            else:
+                it_t = self._infer_expr(node.iterable)
+                elem_t = it_t[:-2] if it_t.endswith("[]") else VX_INT
+            self._declare(node.var, elem_t)
             et = self._infer_expr(node.expr)
+            self._pop()
             return et + "[]"
         if isinstance(node, AwaitExpr):
             return self._infer_expr(node.expr)
@@ -647,14 +773,21 @@ class Analyzer:
 
         if isinstance(node, Identifier):
             # Built-in constants
-            if node.name in ("PI", "E"):
+            if node.name in ("PI", "TAU", "E", "INF", "NAN"):
                 return VX_FLOAT
             # Namespace name used as value? Return special marker
             if node.name in self._namespaces:
                 return f"__namespace__{node.name}"
             t = self._lookup(node.name)
             if t is None:
-                self._err(f"Undefined variable '{node.name}'", node)
+                # Collect all visible names for suggestion
+                all_names: list[str] = []
+                for scope in self._scopes:
+                    all_names.extend(scope.keys())
+                all_names.extend(self._fn_sigs.keys())
+                suggestion = self._suggest(node.name, all_names)
+                hint = f" — did you mean '{suggestion}'?" if suggestion else ""
+                self._err(f"Undefined variable '{node.name}'{hint}", node)
                 return VX_INT
             return t
 
@@ -682,7 +815,10 @@ class Analyzer:
                     arrow_idx = var_t.rindex("->")
                     for a in node.args: self._infer_expr(a)
                     return var_t[arrow_idx+2:]
-                self._err(f"Undefined function '{node.func}'", node)
+                all_fns = list(self._fn_sigs.keys())
+                suggestion = self._suggest(node.func, all_fns)
+                hint = f" — did you mean '{suggestion}'?" if suggestion else ""
+                self._err(f"Undefined function '{node.func}'{hint}", node)
                 return VX_VOID
             # For overloaded builtins, infer return type from args
             if node.func in ("abs", "min", "max", "clamp"):

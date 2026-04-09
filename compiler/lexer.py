@@ -115,6 +115,7 @@ class TT(Enum):
     QUESTION     = auto()   # ?
     NULL_COALESCE = auto()  # ??
     AT           = auto()   # @   for attributes
+    PIPE_ARROW   = auto()   # |>  pipe operator
 
     # Punctuation
     LPAREN       = auto()   # (
@@ -213,14 +214,85 @@ class Lexer:
     #  Preprocessing (f-strings and triple-quoted strings)               #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _preprocess_conditional(source: str) -> str:
+        """
+        Handle #if / #elif / #else / #end conditional compilation.
+        Evaluates conditions against OS / platform constants and strips
+        the inactive branches before the main preprocess pass.
+        """
+        import sys as _sys
+        _os  = "windows" if _sys.platform == "win32" \
+               else "linux" if _sys.platform.startswith("linux") else "macos"
+        _env = {
+            "OS":      _os,
+            "WINDOWS": "true" if _os == "windows" else "false",
+            "LINUX":   "true" if _os == "linux"   else "false",
+            "MACOS":   "true" if _os == "macos"   else "false",
+            "DEBUG":   "true" if "--debug" in _sys.argv else "false",
+        }
+
+        def _eval(cond: str) -> bool:
+            cond = cond.strip()
+            # OS == "windows"
+            m = re.match(r'(\w+)\s*==\s*"([^"]*)"', cond)
+            if m:
+                return _env.get(m.group(1), "") == m.group(2)
+            m = re.match(r'(\w+)\s*!=\s*"([^"]*)"', cond)
+            if m:
+                return _env.get(m.group(1), "") != m.group(2)
+            # Bare: WINDOWS, DEBUG
+            return _env.get(cond, "false") == "true"
+
+        lines  = source.splitlines(keepends=True)
+        out    = []
+        stack  = []   # [(active: bool, seen_true: bool)]
+
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#if "):
+                cond = stripped[4:].rstrip()
+                result = _eval(cond)
+                stack.append([result, result])
+                if not result:
+                    out.append("\n")   # preserve line count
+                continue
+            if stripped.startswith("#elif ") and stack:
+                cond = stripped[6:].rstrip()
+                prev = stack[-1]
+                result = (not prev[1]) and _eval(cond)
+                prev[0] = result
+                if result:
+                    prev[1] = True
+                out.append("\n")
+                continue
+            if stripped.startswith("#else") and stack:
+                prev = stack[-1]
+                prev[0] = not prev[1]
+                out.append("\n")
+                continue
+            if stripped.startswith("#end") and stack:
+                stack.pop()
+                out.append("\n")
+                continue
+            # Only emit line if all active conditions are true
+            if all(s[0] for s in stack):
+                out.append(line)
+            else:
+                out.append("\n")
+
+        return "".join(out)
+
     def _preprocess(self, source: str) -> str:
         """
-        Two passes over the raw source:
+        Three passes over the raw source:
+          0. Conditional compilation: #if / #elif / #else / #end
           1. Replace triple-quoted strings with single-line equivalents
              (literal newlines become the two-char sequence \\n so the
              normal escape handler turns them back into real newlines).
           2. Replace f"..." with a parenthesised concatenation expression.
         """
+        source = self._preprocess_conditional(source)
         result = []
         i, n = 0, len(source)
         while i < n:
@@ -462,6 +534,7 @@ class Lexer:
             "<<": TT.LSHIFT,       ">>": TT.RSHIFT,
             "**": TT.STAR_STAR,
             "??": TT.NULL_COALESCE,
+            "|>": TT.PIPE_ARROW,
         }
         if two in two_map:
             return Token(two_map[two], two, self.line), pos + 2
