@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('SDL2.dll', '.'), ('stdlib', 'stdlib')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

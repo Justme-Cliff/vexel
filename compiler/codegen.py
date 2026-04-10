@@ -47,8 +47,10 @@ class CodegenError(Exception):
 
 class Compiler:
     def __init__(self, analysis: AnalysisResult,
-                 target_triple: str | None = None):
-        self.analysis  = analysis
+                 target_triple: str | None = None,
+                 debug_mode: bool = False):
+        self.analysis   = analysis
+        self.debug_mode = debug_mode   # enable runtime bounds checks (#101)
         self.module    = ir.Module(name="vexel_module")
         self.module.triple = target_triple or binding.get_default_triple()
         self.builder:    ir.IRBuilder | None = None
@@ -1651,19 +1653,43 @@ class Compiler:
 
     def _register_defer(self, node: 'DeferStmt'):
         """Queue a deferred statement/expression to run before each return."""
-        self._defer_stack[-1].append(node.expr)
+        # Store tuple (expr, on_error_only)
+        self._defer_stack[-1].append((node.expr, node.on_error_only))
 
     def _emit_defers(self):
-        """Emit all queued defer expressions/stmts (LIFO order)."""
+        """Emit all queued defer expressions/stmts (LIFO order).
+
+        For defer_on_error (#119): only emits if the error buffer is non-empty.
+        """
         if not self._defer_stack:
             return
-        for item in reversed(self._defer_stack[-1]):
-            # If it's a statement node (e.g. PrintStmt), compile as stmt
-            if isinstance(item, (PrintStmt, IfStmt, ForStmt, WhileStmt,
-                                 AssignStmt, LetStmt, ExprStmt)):
-                self._compile_stmt(item)
+        for item, on_error_only in reversed(self._defer_stack[-1]):
+            if on_error_only:
+                # Only run if error buffer has been set (first byte != 0)
+                ep0 = self.builder.gep(self._vx_error_buf,
+                                       [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                                       inbounds=True)
+                first = self.builder.load(ep0)
+                has_err = self.builder.icmp_unsigned("!=", first, ir.Constant(I8_TY, 0))
+                fn = self.current_fn
+                run_bb  = fn.append_basic_block("defer_err_run")
+                skip_bb = fn.append_basic_block("defer_err_skip")
+                self.builder.cbranch(has_err, run_bb, skip_bb)
+                self.builder.position_at_end(run_bb)
+                if isinstance(item, (PrintStmt, IfStmt, ForStmt, WhileStmt,
+                                     AssignStmt, LetStmt, ExprStmt)):
+                    self._compile_stmt(item)
+                else:
+                    self._compile_expr(item)
+                if not self.builder.block.is_terminated:
+                    self.builder.branch(skip_bb)
+                self.builder.position_at_end(skip_bb)
             else:
-                self._compile_expr(item)
+                if isinstance(item, (PrintStmt, IfStmt, ForStmt, WhileStmt,
+                                     AssignStmt, LetStmt, ExprStmt)):
+                    self._compile_stmt(item)
+                else:
+                    self._compile_expr(item)
 
     def _compile_throw(self, node: 'ThrowStmt'):
         """throw expr — set global error buffer and return zero."""
@@ -1904,6 +1930,13 @@ class Compiler:
             # Array indexing
             elem_vt = obj_t[:-2] if obj_t.endswith("[]") else "int"
             elem_lt = self._vx_to_llvm(elem_vt)
+            # Debug mode: emit bounds check (#101)
+            if self.debug_mode:
+                lp  = self.builder.gep(obj_v, [ir.Constant(I32_TY, 0),
+                                               ir.Constant(I32_TY, 1)], inbounds=True)
+                arr_len = self.builder.load(lp)
+                fn_bc = self._get_helper("__vx_bounds_check")
+                self.builder.call(fn_bc, [idx_v, arr_len])
             dp  = self._arr_data_ptr(obj_v, elem_lt)
             ep  = self.builder.gep(dp, [idx_v], inbounds=True)
             return self.builder.load(ep), elem_vt
@@ -2590,6 +2623,23 @@ class Compiler:
             "__vx_condvar_wait":         self._build_condvar_wait,
             "__vx_condvar_signal":       self._build_condvar_signal,
             "__vx_condvar_broadcast":    self._build_condvar_broadcast,
+            "__vx_bounds_check":         self._build_bounds_check_helper,
+            # v9 — sockets / pipes / IPC
+            "__vx_tcp_connect":          self._build_tcp_connect,
+            "__vx_tcp_send":             self._build_tcp_send,
+            "__vx_tcp_recv":             self._build_tcp_recv,
+            "__vx_tcp_close":            self._build_tcp_close,
+            "__vx_tcp_listen":           self._build_tcp_listen,
+            "__vx_tcp_accept":           self._build_tcp_accept,
+            "__vx_udp_socket":           self._build_udp_socket,
+            "__vx_udp_send_to":          self._build_udp_send_to,
+            "__vx_udp_recv_from":        self._build_udp_recv_from,
+            "__vx_file_watch":           self._build_file_watch,
+            "__vx_pipe_open":            self._build_pipe_open,
+            "__vx_pipe_write":           self._build_pipe_write,
+            "__vx_pipe_read":            self._build_pipe_read,
+            "__vx_pipe_close":           self._build_pipe_close,
+            "__vx_chan_select":           self._build_chan_select,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -4633,6 +4683,80 @@ class Compiler:
             fn_h = self._get_helper("__vx_condvar_broadcast")
             self.builder.call(fn_h, [cv_v])
             return ir.Constant(I64_TY, 0), "void"
+
+        # --- v9: TCP/UDP sockets (#54), pipes (#64), file-watch (#58) ---
+        if name == "tcp_connect":
+            host_v, _ = self._compile_expr(node.args[0])
+            port_v, _ = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_tcp_connect"), [host_v, port_v]), "int"
+
+        if name == "tcp_send":
+            sock_v, _ = self._compile_expr(node.args[0])
+            data_v, _ = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_tcp_send"), [sock_v, data_v]), "int"
+
+        if name == "tcp_recv":
+            sock_v, _ = self._compile_expr(node.args[0])
+            buf_v, _  = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_tcp_recv"), [sock_v, buf_v]), "str"
+
+        if name == "tcp_close":
+            sock_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(self._get_helper("__vx_tcp_close"), [sock_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "tcp_listen":
+            port_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self._get_helper("__vx_tcp_listen"), [port_v]), "int"
+
+        if name == "tcp_accept":
+            srv_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self._get_helper("__vx_tcp_accept"), [srv_v]), "int"
+
+        if name == "udp_socket":
+            return self.builder.call(self._get_helper("__vx_udp_socket"), []), "int"
+
+        if name == "udp_send_to":
+            s_v, _ = self._compile_expr(node.args[0])
+            h_v, _ = self._compile_expr(node.args[1])
+            p_v, _ = self._compile_expr(node.args[2])
+            d_v, _ = self._compile_expr(node.args[3])
+            return self.builder.call(self._get_helper("__vx_udp_send_to"), [s_v, h_v, p_v, d_v]), "int"
+
+        if name == "udp_recv_from":
+            s_v, _ = self._compile_expr(node.args[0])
+            m_v, _ = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_udp_recv_from"), [s_v, m_v]), "str"
+
+        if name == "file_watch":
+            path_v, _ = self._compile_expr(node.args[0])
+            cb_v, _   = self._compile_expr(node.args[1])
+            self.builder.call(self._get_helper("__vx_file_watch"), [path_v, cb_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "pipe_open":
+            n_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self._get_helper("__vx_pipe_open"), [n_v]), "int"
+
+        if name == "pipe_write":
+            fd_v, _   = self._compile_expr(node.args[0])
+            data_v, _ = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_pipe_write"), [fd_v, data_v]), "int"
+
+        if name == "pipe_read":
+            fd_v, _ = self._compile_expr(node.args[0])
+            mb_v, _ = self._compile_expr(node.args[1])
+            return self.builder.call(self._get_helper("__vx_pipe_read"), [fd_v, mb_v]), "str"
+
+        if name == "pipe_close":
+            fd_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(self._get_helper("__vx_pipe_close"), [fd_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        if name == "chan_select":
+            arr_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self._get_helper("__vx_chan_select"),
+                                     [self.builder.bitcast(arr_v, I8PTR)]), "int"
 
         # --- ADT enum constructor calls: EnumName.Variant(...) handled via FieldAccess at call site ---
 
@@ -8762,6 +8886,425 @@ class Compiler:
             bc_fn = self._get_or_declare_fn("pthread_cond_broadcast", bc_ty)
         b.call(bc_fn, [cv_ptr])
         b.ret_void()
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v9 — debug bounds check helper (#101)                              #
+    # ------------------------------------------------------------------ #
+
+    def _build_bounds_check_helper(self) -> ir.Function:
+        """__vx_bounds_check(idx, len) — abort with message if out of bounds."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY, I64_TY]),
+                         name="__vx_bounds_check")
+        fn.linkage = "private"
+        b  = ir.IRBuilder(fn.append_basic_block("entry"))
+        idx, length = fn.args
+        ok1 = b.icmp_signed(">=", idx, ir.Constant(I64_TY, 0))
+        ok2 = b.icmp_signed("<",  idx, length)
+        ok  = b.and_(ok1, ok2)
+        ok_bb   = fn.append_basic_block("ok")
+        fail_bb = fn.append_basic_block("fail")
+        b.cbranch(ok, ok_bb, fail_bb)
+        b.position_at_end(fail_bb)
+        fmt_gv = self._global_str("vexel: index out of bounds (index=%lld, len=%lld)\n")
+        b.call(self.printf, [self._gstr_ptr_const(fmt_gv), idx, length])
+        b.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+        b.unreachable()
+        b.position_at_end(ok_bb)
+        b.ret_void()
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v9 — TCP / UDP sockets (#54), pipes (#64), file-watch (#58)        #
+    # ------------------------------------------------------------------ #
+
+    def _build_tcp_connect(self) -> ir.Function:
+        """tcp_connect(host, port) -> int fd."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I64_TY]),
+                         name="__vx_tcp_connect")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        host, port = fn.args
+        I16 = ir.IntType(16)
+        # WSAStartup on Win32
+        if _sys.platform == "win32":
+            wsa_al  = b.alloca(ir.ArrayType(I8_TY, 408))
+            wsastartup_ty = ir.FunctionType(I32_TY, [I32_TY, I8PTR])
+            b.call(self._get_or_declare_fn("WSAStartup", wsastartup_ty),
+                   [ir.Constant(I32_TY, 0x0202), b.bitcast(wsa_al, I8PTR)])
+            sock_ty = ir.FunctionType(I64_TY, [I32_TY, I32_TY, I32_TY])
+            sock    = b.call(self._get_or_declare_fn("socket", sock_ty),
+                             [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 1), ir.Constant(I32_TY, 6)])
+        else:
+            sock_ty = ir.FunctionType(I32_TY, [I32_TY, I32_TY, I32_TY])
+            sock    = b.sext(b.call(self._get_or_declare_fn("socket", sock_ty),
+                                    [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 1), ir.Constant(I32_TY, 6)]), I64_TY)
+        # Build sockaddr_in (16 bytes)
+        addr_al  = b.alloca(ir.ArrayType(I8_TY, 16))
+        addr_raw = b.bitcast(addr_al, I8PTR)
+        memset_ty = ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY])
+        b.call(self._get_or_declare_fn("memset", memset_ty),
+               [addr_raw, ir.Constant(I32_TY, 0), ir.Constant(I64_TY, 16)])
+        b.store(ir.Constant(I16, 2), b.bitcast(addr_raw, ir.PointerType(I16)))
+        htons_ty = ir.FunctionType(I16, [I16])
+        pnet = b.call(self._get_or_declare_fn("htons", htons_ty), [b.trunc(port, I16)])
+        b.store(pnet, b.bitcast(b.gep(addr_raw, [ir.Constant(I64_TY, 2)], inbounds=False), ir.PointerType(I16)))
+        inet_addr_ty = ir.FunctionType(I32_TY, [I8PTR])
+        sin_addr = b.call(self._get_or_declare_fn("inet_addr", inet_addr_ty), [host])
+        b.store(sin_addr, b.bitcast(b.gep(addr_raw, [ir.Constant(I64_TY, 4)], inbounds=False), ir.PointerType(I32_TY)))
+        # connect
+        neg1 = ir.Constant(I32_TY, 0xFFFFFFFF)
+        if _sys.platform == "win32":
+            conn_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY])
+            rc = b.call(self._get_or_declare_fn("connect", conn_ty),
+                        [sock, addr_raw, ir.Constant(I32_TY, 16)])
+        else:
+            conn_ty = ir.FunctionType(I32_TY, [I32_TY, I8PTR, I32_TY])
+            rc = b.call(self._get_or_declare_fn("connect", conn_ty),
+                        [b.trunc(sock, I32_TY), addr_raw, ir.Constant(I32_TY, 16)])
+        fail_bb = fn.append_basic_block("fail"); ok_bb = fn.append_basic_block("ok")
+        b.cbranch(b.icmp_signed("==", rc, neg1), fail_bb, ok_bb)
+        b.position_at_end(fail_bb); b.ret(ir.Constant(I64_TY, -1))
+        b.position_at_end(ok_bb);   b.ret(sock)
+        return fn
+
+    def _build_tcp_send(self) -> ir.Function:
+        """tcp_send(sock, data) -> int bytes sent."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR]),
+                         name="__vx_tcp_send")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sock, data = fn.args
+        dlen = b.call(self.strlen_fn, [data])
+        if _sys.platform == "win32":
+            snd_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, I32_TY])
+            rc = b.sext(b.call(self._get_or_declare_fn("send", snd_ty),
+                               [sock, data, b.trunc(dlen, I32_TY), ir.Constant(I32_TY, 0)]), I64_TY)
+        else:
+            snd_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY, I32_TY])
+            rc = b.call(self._get_or_declare_fn("send", snd_ty),
+                        [b.trunc(sock, I32_TY), data, dlen, ir.Constant(I32_TY, 0)])
+        b.ret(rc)
+        return fn
+
+    def _build_tcp_recv(self) -> ir.Function:
+        """tcp_recv(sock, max_bytes) -> str."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY, I64_TY]),
+                         name="__vx_tcp_recv")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sock, max_b = fn.args
+        buf = b.call(self.malloc_fn, [b.add(max_b, ir.Constant(I64_TY, 1))])
+        if _sys.platform == "win32":
+            rcv_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, I32_TY])
+            n = b.sext(b.call(self._get_or_declare_fn("recv", rcv_ty),
+                              [sock, buf, b.trunc(max_b, I32_TY), ir.Constant(I32_TY, 0)]), I64_TY)
+        else:
+            rcv_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY, I32_TY])
+            n = b.call(self._get_or_declare_fn("recv", rcv_ty),
+                       [b.trunc(sock, I32_TY), buf, max_b, ir.Constant(I32_TY, 0)])
+        neg1 = ir.Constant(I64_TY, 0xFFFFFFFFFFFFFFFF)
+        safe_n = b.select(b.icmp_signed("==", n, neg1), ir.Constant(I64_TY, 0), n)
+        b.store(ir.Constant(I8_TY, 0), b.gep(buf, [safe_n], inbounds=False))
+        b.ret(buf)
+        return fn
+
+    def _build_tcp_close(self) -> ir.Function:
+        """tcp_close(sock) -> void."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_tcp_close")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sock = fn.args[0]
+        if _sys.platform == "win32":
+            cs_ty = ir.FunctionType(I32_TY, [I64_TY])
+            b.call(self._get_or_declare_fn("closesocket", cs_ty), [sock])
+        else:
+            cl_ty = ir.FunctionType(I32_TY, [I32_TY])
+            b.call(self._get_or_declare_fn("close", cl_ty), [b.trunc(sock, I32_TY)])
+        b.ret_void()
+        return fn
+
+    def _build_tcp_listen(self) -> ir.Function:
+        """tcp_listen(port) -> int server fd."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_tcp_listen")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        port = fn.args[0]
+        I16 = ir.IntType(16)
+        if _sys.platform == "win32":
+            sock_ty = ir.FunctionType(I64_TY, [I32_TY, I32_TY, I32_TY])
+            srv = b.call(self._get_or_declare_fn("socket", sock_ty),
+                         [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 1), ir.Constant(I32_TY, 6)])
+        else:
+            sock_ty = ir.FunctionType(I32_TY, [I32_TY, I32_TY, I32_TY])
+            srv = b.sext(b.call(self._get_or_declare_fn("socket", sock_ty),
+                                [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 1), ir.Constant(I32_TY, 6)]), I64_TY)
+        addr_al  = b.alloca(ir.ArrayType(I8_TY, 16))
+        addr_raw = b.bitcast(addr_al, I8PTR)
+        memset_ty = ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY])
+        b.call(self._get_or_declare_fn("memset", memset_ty),
+               [addr_raw, ir.Constant(I32_TY, 0), ir.Constant(I64_TY, 16)])
+        b.store(ir.Constant(I16, 2), b.bitcast(addr_raw, ir.PointerType(I16)))
+        htons_ty = ir.FunctionType(I16, [I16])
+        pnet = b.call(self._get_or_declare_fn("htons", htons_ty), [b.trunc(port, I16)])
+        b.store(pnet, b.bitcast(b.gep(addr_raw, [ir.Constant(I64_TY, 2)], inbounds=False), ir.PointerType(I16)))
+        if _sys.platform == "win32":
+            bind_ty   = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY])
+            listen_ty = ir.FunctionType(I32_TY, [I64_TY, I32_TY])
+            b.call(self._get_or_declare_fn("bind",   bind_ty),   [srv, addr_raw, ir.Constant(I32_TY, 16)])
+            b.call(self._get_or_declare_fn("listen", listen_ty), [srv, ir.Constant(I32_TY, 10)])
+        else:
+            srv32 = b.trunc(srv, I32_TY)
+            bind_ty   = ir.FunctionType(I32_TY, [I32_TY, I8PTR, I32_TY])
+            listen_ty = ir.FunctionType(I32_TY, [I32_TY, I32_TY])
+            b.call(self._get_or_declare_fn("bind",   bind_ty),   [srv32, addr_raw, ir.Constant(I32_TY, 16)])
+            b.call(self._get_or_declare_fn("listen", listen_ty), [srv32, ir.Constant(I32_TY, 10)])
+        b.ret(srv)
+        return fn
+
+    def _build_tcp_accept(self) -> ir.Function:
+        """tcp_accept(server_sock) -> int client fd."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_tcp_accept")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        srv = fn.args[0]
+        addr_al     = b.alloca(ir.ArrayType(I8_TY, 16))
+        addr_raw    = b.bitcast(addr_al, I8PTR)
+        addr_len_al = b.alloca(I32_TY)
+        b.store(ir.Constant(I32_TY, 16), addr_len_al)
+        if _sys.platform == "win32":
+            acc_ty = ir.FunctionType(I64_TY, [I64_TY, I8PTR, ir.PointerType(I32_TY)])
+            client = b.call(self._get_or_declare_fn("accept", acc_ty),
+                            [srv, addr_raw, addr_len_al])
+        else:
+            acc_ty = ir.FunctionType(I32_TY, [I32_TY, I8PTR, ir.PointerType(I32_TY)])
+            client = b.sext(b.call(self._get_or_declare_fn("accept", acc_ty),
+                                   [b.trunc(srv, I32_TY), addr_raw, addr_len_al]), I64_TY)
+        b.ret(client)
+        return fn
+
+    def _build_udp_socket(self) -> ir.Function:
+        """udp_socket() -> int."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, []),
+                         name="__vx_udp_socket")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        if _sys.platform == "win32":
+            sock_ty = ir.FunctionType(I64_TY, [I32_TY, I32_TY, I32_TY])
+            s = b.call(self._get_or_declare_fn("socket", sock_ty),
+                       [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 17)])
+        else:
+            sock_ty = ir.FunctionType(I32_TY, [I32_TY, I32_TY, I32_TY])
+            s = b.sext(b.call(self._get_or_declare_fn("socket", sock_ty),
+                              [ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 2), ir.Constant(I32_TY, 17)]), I64_TY)
+        b.ret(s)
+        return fn
+
+    def _build_udp_send_to(self) -> ir.Function:
+        """udp_send_to(sock, host, port, data) -> int."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR, I64_TY, I8PTR]),
+                         name="__vx_udp_send_to")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sock, host, port, data = fn.args
+        I16 = ir.IntType(16)
+        addr_al  = b.alloca(ir.ArrayType(I8_TY, 16))
+        addr_raw = b.bitcast(addr_al, I8PTR)
+        memset_ty = ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY])
+        b.call(self._get_or_declare_fn("memset", memset_ty),
+               [addr_raw, ir.Constant(I32_TY, 0), ir.Constant(I64_TY, 16)])
+        b.store(ir.Constant(I16, 2), b.bitcast(addr_raw, ir.PointerType(I16)))
+        htons_ty = ir.FunctionType(I16, [I16])
+        pnet = b.call(self._get_or_declare_fn("htons", htons_ty), [b.trunc(port, I16)])
+        b.store(pnet, b.bitcast(b.gep(addr_raw, [ir.Constant(I64_TY, 2)], inbounds=False), ir.PointerType(I16)))
+        inet_ty = ir.FunctionType(I32_TY, [I8PTR])
+        b.store(b.call(self._get_or_declare_fn("inet_addr", inet_ty), [host]),
+                b.bitcast(b.gep(addr_raw, [ir.Constant(I64_TY, 4)], inbounds=False), ir.PointerType(I32_TY)))
+        dlen = b.call(self.strlen_fn, [data])
+        if _sys.platform == "win32":
+            snd_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, I32_TY, I8PTR, I32_TY])
+            rc = b.sext(b.call(self._get_or_declare_fn("sendto", snd_ty),
+                               [sock, data, b.trunc(dlen, I32_TY), ir.Constant(I32_TY, 0),
+                                addr_raw, ir.Constant(I32_TY, 16)]), I64_TY)
+        else:
+            snd_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY, I32_TY, I8PTR, I32_TY])
+            rc = b.call(self._get_or_declare_fn("sendto", snd_ty),
+                        [b.trunc(sock, I32_TY), data, dlen, ir.Constant(I32_TY, 0),
+                         addr_raw, ir.Constant(I32_TY, 16)])
+        b.ret(rc)
+        return fn
+
+    def _build_udp_recv_from(self) -> ir.Function:
+        """udp_recv_from(sock, max_bytes) -> str."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY, I64_TY]),
+                         name="__vx_udp_recv_from")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sock, max_b = fn.args
+        buf = b.call(self.malloc_fn, [b.add(max_b, ir.Constant(I64_TY, 1))])
+        addr_al     = b.alloca(ir.ArrayType(I8_TY, 16))
+        addr_raw    = b.bitcast(addr_al, I8PTR)
+        addr_len_al = b.alloca(I32_TY)
+        b.store(ir.Constant(I32_TY, 16), addr_len_al)
+        if _sys.platform == "win32":
+            rcv_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, I32_TY, I8PTR, ir.PointerType(I32_TY)])
+            n = b.sext(b.call(self._get_or_declare_fn("recvfrom", rcv_ty),
+                              [sock, buf, b.trunc(max_b, I32_TY), ir.Constant(I32_TY, 0),
+                               addr_raw, addr_len_al]), I64_TY)
+        else:
+            rcv_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY, I32_TY, I8PTR, ir.PointerType(I32_TY)])
+            n = b.call(self._get_or_declare_fn("recvfrom", rcv_ty),
+                       [b.trunc(sock, I32_TY), buf, max_b, ir.Constant(I32_TY, 0), addr_raw, addr_len_al])
+        neg1 = ir.Constant(I64_TY, 0xFFFFFFFFFFFFFFFF)
+        safe_n = b.select(b.icmp_signed("==", n, neg1), ir.Constant(I64_TY, 0), n)
+        b.store(ir.Constant(I8_TY, 0), b.gep(buf, [safe_n], inbounds=False))
+        b.ret(buf)
+        return fn
+
+    def _build_file_watch(self) -> ir.Function:
+        """file_watch(path, callback) — invokes callback immediately (polling requires a thread)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR, I8PTR]),
+                         name="__vx_file_watch")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        _path, cb = fn.args
+        cb_ty = ir.FunctionType(VOID_TY, [])
+        b.call(b.bitcast(cb, ir.PointerType(cb_ty)), [])
+        b.ret_void()
+        return fn
+
+    def _build_pipe_open(self) -> ir.Function:
+        """pipe_open(name) -> int fd."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_pipe_open")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        name_v = fn.args[0]
+        if _sys.platform == "win32":
+            cf_ty = ir.FunctionType(I64_TY, [I8PTR, I32_TY, I32_TY, I8PTR, I32_TY, I32_TY, I8PTR])
+            null  = ir.Constant(I8PTR, None)
+            fd = b.call(self._get_or_declare_fn("CreateFileA", cf_ty),
+                        [name_v, ir.Constant(I32_TY, 0xC0000000),
+                         ir.Constant(I32_TY, 0), null, ir.Constant(I32_TY, 3),
+                         ir.Constant(I32_TY, 128), null])
+            b.ret(fd)
+        else:
+            open_ty = ir.FunctionType(I32_TY, [I8PTR, I32_TY])
+            b.ret(b.sext(b.call(self._get_or_declare_fn("open", open_ty),
+                                [name_v, ir.Constant(I32_TY, 2)]), I64_TY))
+        return fn
+
+    def _build_pipe_write(self) -> ir.Function:
+        """pipe_write(fd, data) -> int bytes written."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR]),
+                         name="__vx_pipe_write")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fd, data = fn.args
+        dlen = b.call(self.strlen_fn, [data])
+        if _sys.platform == "win32":
+            written_al = b.alloca(I32_TY)
+            b.store(ir.Constant(I32_TY, 0), written_al)
+            wf_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, ir.PointerType(I32_TY), I8PTR])
+            b.call(self._get_or_declare_fn("WriteFile", wf_ty),
+                   [fd, data, b.trunc(dlen, I32_TY), written_al, ir.Constant(I8PTR, None)])
+            b.ret(b.sext(b.load(written_al), I64_TY))
+        else:
+            wr_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY])
+            b.ret(b.call(self._get_or_declare_fn("write", wr_ty),
+                         [b.trunc(fd, I32_TY), data, dlen]))
+        return fn
+
+    def _build_pipe_read(self) -> ir.Function:
+        """pipe_read(fd, max_bytes) -> str."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY, I64_TY]),
+                         name="__vx_pipe_read")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fd, max_b = fn.args
+        buf = b.call(self.malloc_fn, [b.add(max_b, ir.Constant(I64_TY, 1))])
+        if _sys.platform == "win32":
+            rd_al = b.alloca(I32_TY)
+            b.store(ir.Constant(I32_TY, 0), rd_al)
+            rf_ty = ir.FunctionType(I32_TY, [I64_TY, I8PTR, I32_TY, ir.PointerType(I32_TY), I8PTR])
+            b.call(self._get_or_declare_fn("ReadFile", rf_ty),
+                   [fd, buf, b.trunc(max_b, I32_TY), rd_al, ir.Constant(I8PTR, None)])
+            n = b.sext(b.load(rd_al), I64_TY)
+        else:
+            rd_ty = ir.FunctionType(I64_TY, [I32_TY, I8PTR, I64_TY])
+            n = b.call(self._get_or_declare_fn("read", rd_ty),
+                       [b.trunc(fd, I32_TY), buf, max_b])
+        safe_n = b.select(b.icmp_signed("<", n, ir.Constant(I64_TY, 0)),
+                          ir.Constant(I64_TY, 0), n)
+        b.store(ir.Constant(I8_TY, 0), b.gep(buf, [safe_n], inbounds=False))
+        b.ret(buf)
+        return fn
+
+    def _build_pipe_close(self) -> ir.Function:
+        """pipe_close(fd) -> void."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_pipe_close")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        fd = fn.args[0]
+        if _sys.platform == "win32":
+            ch_ty = ir.FunctionType(I32_TY, [I64_TY])
+            b.call(self._get_or_declare_fn("CloseHandle", ch_ty), [fd])
+        else:
+            cl_ty = ir.FunctionType(I32_TY, [I32_TY])
+            b.call(self._get_or_declare_fn("close", cl_ty), [b.trunc(fd, I32_TY)])
+        b.ret_void()
+        return fn
+
+    def _build_chan_select(self) -> ir.Function:
+        """chan_select(channels: int[]) -> int  — spin-poll all channels, return index of first ready."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_chan_select")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw = fn.args[0]
+        arr_v   = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        arr_len  = b.load(b.gep(arr_v, [z, ir.Constant(I32_TY, 1)], inbounds=True))
+        data_raw = b.load(b.gep(arr_v, [z, z], inbounds=True))
+        arr64    = b.bitcast(data_raw, ir.PointerType(I64_TY))
+        try_recv = self._get_helper("__vx_channel_try_recv")
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb   = fn.append_basic_block("sel_chk")
+        body_bb  = fn.append_basic_block("sel_body")
+        next_bb  = fn.append_basic_block("sel_next")
+        found_bb = fn.append_basic_block("sel_found")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, arr_len), body_bb, chk_bb)
+        b.position_at_end(body_bb)
+        ch_i = b.load(b.gep(arr64, [b.trunc(iv, I32_TY)], inbounds=False))
+        val  = b.call(try_recv, [ch_i])
+        b.cbranch(b.icmp_signed(">=", val, ir.Constant(I64_TY, 0)), found_bb, next_bb)
+        b.position_at_end(next_bb)
+        iv2 = b.add(iv, ir.Constant(I64_TY, 1))
+        b.store(b.select(b.icmp_signed(">=", iv2, arr_len), ir.Constant(I64_TY, 0), iv2), i_al)
+        b.branch(chk_bb)
+        b.position_at_end(found_bb)
+        b.ret(b.load(i_al))
         return fn
 
 

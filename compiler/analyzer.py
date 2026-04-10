@@ -241,6 +241,27 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "condvar_wait":      (["int", "int"],         VX_VOID),
     "condvar_signal":    (["int"],                VX_VOID),
     "condvar_broadcast": (["int"],                VX_VOID),
+    # v9 — TCP/UDP sockets (#54)
+    "tcp_connect":       (["str", "int"],         VX_INT),
+    "tcp_send":          (["int", "str"],         VX_INT),
+    "tcp_recv":          (["int", "int"],         VX_STR),
+    "tcp_close":         (["int"],                VX_VOID),
+    "tcp_listen":        (["int"],                VX_INT),
+    "tcp_accept":        (["int"],                VX_INT),
+    "udp_socket":        ([],                     VX_INT),
+    "udp_send_to":       (["int", "str", "int", "str"], VX_INT),
+    "udp_recv_from":     (["int", "int"],         VX_STR),
+    # v9 — file watching (#58)
+    "file_watch":        (["str", "any"],         VX_VOID),
+    # v9 — named pipes / IPC (#64)
+    "pipe_open":         (["str"],                VX_INT),
+    "pipe_write":        (["int", "str"],         VX_INT),
+    "pipe_read":         (["int", "int"],         VX_STR),
+    "pipe_close":        (["int"],                VX_VOID),
+    # v9 — SHA-256 (real implementation)
+    "sha256_real":       (["str"],                VX_STR),
+    # v9 — select/multiplex (#70)
+    "chan_select":       (["int[]"],              VX_INT),
 }
 
 
