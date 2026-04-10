@@ -106,6 +106,8 @@ class Parser:
             return self._parse_extern_fn()
         if self._match(TT.TEST):
             return self._parse_test()
+        if self._match(TT.ERROR):
+            return self._parse_error_decl()
         return self._parse_stmt()
 
     # ------------------------------------------------------------------ #
@@ -457,18 +459,25 @@ class Parser:
         return EnumDecl(name, variants)
 
     def _parse_enum_or_adt(self) -> Node:
-        """Parse enum — detects ADT (variants with fields) vs plain enum."""
+        """Parse enum — detects ADT (variants with fields) vs plain enum.
+        Supports method blocks (#13): fn method(self) -> T: body inside enum."""
         self._expect(TT.ENUM)
         name = self._expect(TT.IDENT).value
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         self._expect(TT.INDENT)
         variants = []
+        methods = []
         is_adt = False
         while not self._match(TT.DEDENT) and not self._match(TT.EOF):
             self._skip_newlines()
             if self._match(TT.DEDENT):
                 break
+            # Method inside enum body (#13) — bare 'self' is i64
+            if self._match(TT.FN):
+                m = self._parse_impl_fn(name)   # handles bare 'self'
+                methods.append(m)
+                continue
             vname = self._expect(TT.IDENT).value
             fields = []
             if self._match(TT.LPAREN):
@@ -486,9 +495,13 @@ class Parser:
             self._eat_newline()
         self._expect(TT.DEDENT)
         if is_adt or any(v.fields for v in variants):
-            return EnumDeclADT(name, variants)
-        # Plain enum — fall back to the old representation
-        return EnumDecl(name, [v.name for v in variants])
+            node = EnumDeclADT(name, variants)
+            node.methods = methods
+            return node
+        # Plain enum
+        node = EnumDecl(name, [v.name for v in variants])
+        node.methods = methods
+        return node
 
     def _parse_async_fn(self) -> FnDecl:
         """async fn name(...) -> ret: body — parsed as a regular FnDecl for now."""
@@ -528,6 +541,24 @@ class Parser:
         body = self._parse_block()
         return TestDecl(name, body)
 
+    def _parse_error_decl(self) -> 'ErrorDecl':
+        """error Name(field: type, ...) — named error type (#29)."""
+        self._expect(TT.ERROR)
+        name = self._expect(TT.IDENT).value
+        fields = []
+        if self._match(TT.LPAREN):
+            self._advance()
+            while not self._match(TT.RPAREN):
+                fname = self._expect(TT.IDENT).value
+                self._expect(TT.COLON)
+                ftype = self._parse_type()
+                fields.append(StructField(fname, ftype))
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RPAREN)
+        self._eat_newline()
+        return ErrorDecl(name, fields)
+
     def _parse_comptime(self) -> ComptimeDecl:
         """comptime let name = expr"""
         self._expect(TT.COMPTIME)
@@ -553,10 +584,9 @@ class Parser:
         self._eat_newline()
         # Parse the decorated declaration and carry attribute as metadata
         decl = self._parse_top_level()
-        if isinstance(decl, FnDecl):
-            if not hasattr(decl, 'attributes'):
-                decl.attributes = []
-            decl.attributes.append(AttributeNode(attr_name, args))
+        if not hasattr(decl, 'attributes'):
+            decl.attributes = []
+        decl.attributes.append(AttributeNode(attr_name, args))
         return decl
 
     def _parse_block(self) -> list[Node]:

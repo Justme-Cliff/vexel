@@ -71,6 +71,7 @@ class TT(Enum):
     UNSAFE       = auto()
     WHERE        = auto()
     RAISE        = auto()
+    ERROR        = auto()   # error keyword for error type declarations
 
     # Arithmetic operators
     PLUS         = auto()
@@ -185,6 +186,7 @@ KEYWORDS: dict[str, TT] = {
     "extern":    TT.EXTERN,
     "unsafe":    TT.UNSAFE,
     "where":     TT.WHERE,
+    "error":     TT.ERROR,
 }
 
 

@@ -249,6 +249,7 @@ class GlobalConst(Node):
 class EnumDecl(Node):
     name: str
     variants: List[str]
+    methods: List['FnDecl'] = field(default_factory=list)
 
 @dataclass
 class MatchCase(Node):
@@ -471,6 +472,7 @@ class EnumDeclADT(Node):
     """Algebraic Data Type enum with per-variant payload fields."""
     name:     str
     variants: List[EnumVariant]
+    methods:  List['FnDecl'] = field(default_factory=list)
 
 @dataclass
 class MatchCaseADT(Node):
@@ -528,3 +530,14 @@ class ChainedCompare(Node):
     """a < b < c — desugared to (a < b) and (b < c), but b is only evaluated once."""
     operands: List[Node]   # [a, b, c]
     ops:      List[str]    # ["<", "<"]
+
+
+# ============================================================
+# v10 — Error type hierarchy and serialization
+# ============================================================
+
+@dataclass
+class ErrorDecl(Node):
+    """error IOError(path: str) — named error type with payload fields (#29)."""
+    name:   str
+    fields: List['StructField']  # may be empty for simple errors

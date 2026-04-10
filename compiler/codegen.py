@@ -107,6 +107,9 @@ class Compiler:
         # Impl vtable data: "{struct}__{iface}" → {vtable_gv, impl_fns:[fn,...]}
         self._impls_data: dict[str, dict] = {}
 
+        # Registered enum names → set of method names (#13)
+        self._enum_names: set[str] = set()
+
         # Schedule of vtable slots to fill: [(vtable_gv, vtable_ll, [fn,...])]
         self._vtable_init_list: list = []
 
@@ -293,6 +296,9 @@ class Compiler:
         # Interface types are fat pointers stored as i8*
         if vx in self._interfaces:
             return I8PTR
+        # Enum types are i64 under the hood (#13)
+        if vx in self._enum_names:
+            return I64_TY
         raise CodegenError(f"Unknown type: {vx!r}")
 
     def _infer_type(self, node: Node) -> str:
@@ -398,7 +404,14 @@ class Compiler:
 
         # 1. Struct definitions
         for d in program.declarations:
-            if isinstance(d, StructDecl): self._define_struct(d)
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, StructDecl): self._define_struct(_d)
+
+        # 1b. Error type definitions (#29)
+        for d in program.declarations:
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, ErrorDecl):
+                self._define_error_struct(_d)
 
         # 2. Interface definitions (must be before forward-declaring fns that use them)
         for d in program.declarations:
@@ -408,13 +421,16 @@ class Compiler:
         # 3. Enum definitions (global i64 constants)
         for d in program.declarations:
             if isinstance(d, EnumDecl):
+                self._enum_names.add(d.name)          # register for _vx_to_llvm
                 for i, variant in enumerate(d.variants):
                     gname = f"{d.name}.{variant}"
                     gv = ir.GlobalVariable(self.module, I64_TY, name=gname)
                     gv.linkage = "internal"
                     gv.global_constant = True
                     gv.initializer = ir.Constant(I64_TY, i)
-                    self._globals[gname] = {"ptr": gv, "vx_type": "int"}
+                    self._globals[gname] = {"ptr": gv, "vx_type": d.name}
+            elif isinstance(d, EnumDeclADT):
+                self._enum_names.add(d.name)
 
         # 3b. ADT Enum definitions (tagged union structs)
         for d in program.declarations:
@@ -438,6 +454,24 @@ class Compiler:
             elif isinstance(_d, ExternFnDecl):
                 self._compile_extern_fn(_d)
 
+        # 5b. Forward-declare error constructors and enum methods (#13, #29)
+        for d in program.declarations:
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, ErrorDecl):
+                self._declare_error_constructor(_d)
+            elif isinstance(_d, (EnumDecl, EnumDeclADT)):
+                for m in getattr(_d, 'methods', []):
+                    self._declare_enum_method(_d.name, m)
+        # Also forward-declare struct own-methods (#13 struct side) and @serialize (#113)
+        for d in program.declarations:
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, StructDecl):
+                for m in getattr(_d, 'methods', []):
+                    self._declare_struct_method(_d.name, m)
+                attrs = [a.name for a in getattr(_d, 'attributes', [])]
+                if 'serialize' in attrs or 'derive' in attrs:
+                    self._declare_serialize_methods(_d)
+
         # 6. Forward-declare impl methods + create vtable globals
         for d in program.declarations:
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
@@ -455,6 +489,22 @@ class Compiler:
             elif isinstance(_d, TestDecl):
                 self._compile_test_decl(_d)
 
+        # 8b. Compile error constructors, enum methods, struct own-methods (#13, #29)
+        for d in program.declarations:
+            _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
+            if isinstance(_d, ErrorDecl):
+                self._compile_error_constructor(_d)
+            elif isinstance(_d, (EnumDecl, EnumDeclADT)):
+                for m in getattr(_d, 'methods', []):
+                    self._compile_enum_method(_d.name, m)
+            elif isinstance(_d, StructDecl):
+                for m in getattr(_d, 'methods', []):
+                    self._compile_struct_method(_d.name, m)
+                # #113: @serialize attribute — synthesize to_json / from_json
+                attrs = [a.name for a in getattr(_d, 'attributes', [])]
+                if 'serialize' in attrs or 'derive' in attrs:
+                    self._compile_serialize_methods(_d)
+
         # 9. Compile impl method bodies
         for d in program.declarations:
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
@@ -462,6 +512,348 @@ class Compiler:
                 self._compile_impl(_d)
 
         return str(self.module)
+
+    # ------------------------------------------------------------------ #
+    #  Panic helper                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _emit_panic(self, msg: str):
+        """Emit printf + exit(1) + unreachable for an unconditional panic."""
+        fmt = self._gstr_ptr(self._global_str(f"vexel panic: {msg}\n"))
+        self.builder.call(self.printf, [fmt])
+        self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+        self.builder.unreachable()
+
+    # ------------------------------------------------------------------ #
+    #  Error type hierarchy (#29)                                          #
+    # ------------------------------------------------------------------ #
+
+    def _define_error_struct(self, decl: 'ErrorDecl'):
+        """Define the LLVM struct type for an error declaration."""
+        # Layout: {__code: i64, field0, field1, ...}
+        field_types = [I64_TY] + [self._vx_to_llvm(f.type_name) for f in decl.fields]
+        lt = self.module.context.get_identified_type(decl.name)
+        lt.set_body(*field_types)
+        fields = [("__code", "int")] + [(f.name, f.type_name) for f in decl.fields]
+        self._structs[decl.name] = {
+            "llvm_type": lt,
+            "fields":    fields,
+            "defaults":  [None] * len(fields),
+        }
+        if not hasattr(self, '_error_codes'):
+            self._error_codes: dict[str, int] = {}
+        self._error_codes[decl.name] = len(self._error_codes) + 1
+
+    def _declare_error_constructor(self, decl: 'ErrorDecl'):
+        """Forward-declare the constructor fn: fn ErrorName(fields...) -> ErrorName*."""
+        lt = self._structs[decl.name]["llvm_type"]
+        param_tys = [self._vx_to_llvm(f.type_name) for f in decl.fields]
+        fn_ty = ir.FunctionType(ir.PointerType(lt), param_tys)
+        fn = ir.Function(self.module, fn_ty, name=decl.name)
+        fn.linkage = "internal"
+        params = [("__code", "int")] + [(f.name, f.type_name) for f in decl.fields]
+        sig = type('FnSig', (), {'params': [(f.name, f.type_name) for f in decl.fields],
+                                 'return_type': decl.name, 'variadic': False})()
+        self._functions[decl.name] = {"fn": fn, "sig": sig}
+        self._fn_defaults[decl.name] = [None] * len(decl.fields)
+
+    def _compile_error_constructor(self, decl: 'ErrorDecl'):
+        """Compile the error constructor body: allocate struct, set code + fields."""
+        fn = self._functions[decl.name]["fn"]
+        lt = self._structs[decl.name]["llvm_type"]
+        self.current_fn = fn
+        entry = fn.append_basic_block("entry")
+        old_builder = getattr(self, 'builder', None)
+        self.builder = ir.IRBuilder(entry)
+        self._push_scope()
+
+        # malloc(sizeof struct)
+        n_fields = len(self._structs[decl.name]["fields"])
+        raw = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 8 * n_fields)])
+        ptr = self.builder.bitcast(raw, ir.PointerType(lt))
+
+        # Store __code at index 0
+        code = self._error_codes.get(decl.name, 0)
+        code_ptr = self.builder.gep(ptr, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)],
+                                    inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, code), code_ptr)
+
+        # Store each payload field
+        for i, (arg, field) in enumerate(zip(fn.args, decl.fields)):
+            fptr = self.builder.gep(ptr, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, i + 1)],
+                                    inbounds=True)
+            self.builder.store(arg, fptr)
+
+        self.builder.ret(ptr)
+        self._pop_scope()
+        if old_builder is not None:
+            self.builder = old_builder
+
+    # ------------------------------------------------------------------ #
+    #  Enum methods (#13)                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _declare_enum_method(self, enum_name: str, method: 'FnDecl'):
+        """Forward-declare an enum method as EnumName__methodName."""
+        fn_name = f"{enum_name}__{method.name}"
+        # self param is i64 (enum value); other params as declared
+        non_self = [p for p in method.params if p.name != "self"]
+        param_tys = [I64_TY] + [self._vx_to_llvm(p.type_name) for p in non_self]
+        ret_ty = self._vx_to_llvm(method.return_type) if method.return_type else VOID_TY
+        fn_ty = ir.FunctionType(ret_ty, param_tys)
+        fn = ir.Function(self.module, fn_ty, name=fn_name)
+        fn.linkage = "internal"
+        params = [("self", enum_name)] + [(p.name, p.type_name) for p in non_self]
+        sig = type('FnSig', (), {'params': params,
+                                 'return_type': method.return_type or "void",
+                                 'variadic': False})()
+        self._functions[fn_name] = {"fn": fn, "sig": sig}
+        self._fn_defaults[fn_name] = [p.default for p in method.params]
+
+    def _compile_enum_method(self, enum_name: str, method: 'FnDecl'):
+        """Compile enum method body; 'self' is the i64 enum value."""
+        fn_name = f"{enum_name}__{method.name}"
+        fn = self._functions[fn_name]["fn"]
+        self.current_fn = fn
+        entry = fn.append_basic_block("entry")
+        old_builder = getattr(self, 'builder', None)
+        self.builder = ir.IRBuilder(entry)
+        self._push_scope()
+        self._defer_stack.append([])
+
+        # Bind 'self' as i64
+        self_al = self.builder.alloca(I64_TY, name="self")
+        self.builder.store(fn.args[0], self_al)
+        self._declare("self", self_al, "int")
+
+        # Bind remaining params
+        non_self = [p for p in method.params if p.name != "self"]
+        for i, param in enumerate(non_self):
+            al = self.builder.alloca(self._vx_to_llvm(param.type_name), name=param.name)
+            self.builder.store(fn.args[i + 1], al)
+            self._declare(param.name, al, param.type_name)
+
+        self._current_named_returns = []
+        for stmt in method.body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(stmt)
+
+        if not self.builder.block.is_terminated:
+            self._emit_defers()
+            if fn.ftype.return_type == VOID_TY:
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
+
+        self._defer_stack.pop()
+        self._pop_scope()
+        if old_builder is not None:
+            self.builder = old_builder
+
+    # ------------------------------------------------------------------ #
+    #  Struct own-methods (#13)                                            #
+    # ------------------------------------------------------------------ #
+
+    def _declare_struct_method(self, struct_name: str, method: 'FnDecl'):
+        """Forward-declare a struct own-method as StructName__methodName."""
+        fn_name = f"{struct_name}__{method.name}"
+        if fn_name in self._functions:
+            return  # already declared (e.g. via interface impl)
+        si = self._structs.get(struct_name)
+        if si is None:
+            return
+        struct_ptr_ty = ir.PointerType(si["llvm_type"])
+        non_self = [p for p in method.params if p.name != "self"]
+        param_tys = [struct_ptr_ty] + [self._vx_to_llvm(p.type_name) for p in non_self]
+        ret_ty = self._vx_to_llvm(method.return_type) if method.return_type else VOID_TY
+        fn_ty = ir.FunctionType(ret_ty, param_tys)
+        fn = ir.Function(self.module, fn_ty, name=fn_name)
+        fn.linkage = "internal"
+        params = [("self", struct_name)] + [(p.name, p.type_name) for p in non_self]
+        sig = type('FnSig', (), {'params': params,
+                                 'return_type': method.return_type or "void",
+                                 'variadic': False})()
+        self._functions[fn_name] = {"fn": fn, "sig": sig}
+        self._fn_defaults[fn_name] = [p.default for p in method.params]
+
+    def _compile_struct_method(self, struct_name: str, method: 'FnDecl'):
+        """Compile a struct own-method body; 'self' is a pointer to the struct."""
+        fn_name = f"{struct_name}__{method.name}"
+        if fn_name not in self._functions:
+            return
+        fn = self._functions[fn_name]["fn"]
+        si = self._structs[struct_name]
+        self.current_fn = fn
+        entry = fn.append_basic_block("entry")
+        old_builder = getattr(self, 'builder', None)
+        self.builder = ir.IRBuilder(entry)
+        self._push_scope()
+        self._defer_stack.append([])
+
+        # Bind 'self' as a pointer to the struct (already a pointer, store it)
+        self_al = self.builder.alloca(ir.PointerType(si["llvm_type"]), name="self")
+        self.builder.store(fn.args[0], self_al)
+        self._declare("self", self_al, struct_name)
+
+        # Bind remaining params
+        non_self = [p for p in method.params if p.name != "self"]
+        for i, param in enumerate(non_self):
+            al = self.builder.alloca(self._vx_to_llvm(param.type_name), name=param.name)
+            self.builder.store(fn.args[i + 1], al)
+            self._declare(param.name, al, param.type_name)
+
+        self._current_named_returns = []
+        for stmt in method.body:
+            if self.builder.block.is_terminated: break
+            self._compile_stmt(stmt)
+
+        if not self.builder.block.is_terminated:
+            self._emit_defers()
+            if fn.ftype.return_type == VOID_TY:
+                self.builder.ret_void()
+            else:
+                self.builder.ret(ir.Constant(fn.ftype.return_type, 0))
+
+        self._defer_stack.pop()
+        self._pop_scope()
+        if old_builder is not None:
+            self.builder = old_builder
+
+    # ------------------------------------------------------------------ #
+    #  Serialization (#113)                                                #
+    # ------------------------------------------------------------------ #
+
+    def _declare_serialize_methods(self, decl: 'StructDecl'):
+        """Forward-declare to_json / from_json for a @serialize struct."""
+        sname = decl.name
+        si = self._structs.get(sname)
+        if si is None:
+            return
+        struct_ptr_ty = ir.PointerType(si["llvm_type"])
+
+        # fn StructName__to_json(self: StructName*) -> str
+        to_json_name = f"{sname}__to_json"
+        if to_json_name not in self._functions:
+            fn_ty = ir.FunctionType(I8PTR, [struct_ptr_ty])
+            fn = ir.Function(self.module, fn_ty, name=to_json_name)
+            fn.linkage = "internal"
+            sig = type('FnSig', (), {'params': [("self", sname)],
+                                     'return_type': "str", 'variadic': False})()
+            self._functions[to_json_name] = {"fn": fn, "sig": sig}
+            self._fn_defaults[to_json_name] = [None]
+
+        # fn StructName__from_json(json: str) -> StructName*
+        from_json_name = f"{sname}__from_json"
+        if from_json_name not in self._functions:
+            fn_ty2 = ir.FunctionType(struct_ptr_ty, [I8PTR])
+            fn2 = ir.Function(self.module, fn_ty2, name=from_json_name)
+            fn2.linkage = "internal"
+            sig2 = type('FnSig', (), {'params': [("json", "str")],
+                                      'return_type': sname, 'variadic': False})()
+            self._functions[from_json_name] = {"fn": fn2, "sig": sig2}
+            self._fn_defaults[from_json_name] = [None]
+
+    def _compile_serialize_methods(self, decl: 'StructDecl'):
+        """Compile to_json / from_json for a @serialize struct (#113)."""
+        sname = decl.name
+        si = self._structs.get(sname)
+        if si is None:
+            return
+
+        fields = si["fields"]  # list of (name, vx_type)
+        struct_ptr_ty = ir.PointerType(si["llvm_type"])
+        old_builder = getattr(self, 'builder', None)
+        old_fn = getattr(self, 'current_fn', None)
+
+        # ---- to_json ----
+        to_json_name = f"{sname}__to_json"
+        fn = self._functions[to_json_name]["fn"]
+        self.current_fn = fn
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        self.builder = b
+        self._push_scope()
+        self._defer_stack.append([])
+
+        self_ptr = fn.args[0]
+        # Build JSON string: {"field0":val0,"field1":val1,...}
+        close_brace = self._gstr_ptr(self._global_str("}"))
+        comma_s     = self._gstr_ptr(self._global_str(","))
+        quote_s     = self._gstr_ptr(self._global_str('"'))
+
+        buf = self._gstr_ptr(self._global_str("{"))
+
+        for fi, (fname, ftype) in enumerate(fields):
+            # key fragment: "fname":
+            key_frag = self._gstr_ptr(self._global_str(f'"{fname}":'))
+            buf = self._str_concat_inline(buf, key_frag)
+
+            # load the field value
+            fptr = self.builder.gep(self_ptr,
+                                    [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, fi)],
+                                    inbounds=True)
+            fval = self.builder.load(fptr)
+
+            # Convert to string
+            vtype_resolved = self._resolve_type(ftype)
+            if vtype_resolved == "int":
+                val_str = self._int_to_str_inline(fval)
+            elif vtype_resolved == "float":
+                val_str = self._float_to_str_inline(fval)
+            elif vtype_resolved == "bool":
+                true_s  = self._gstr_ptr(self._global_str("true"))
+                false_s = self._gstr_ptr(self._global_str("false"))
+                val_str = self.builder.select(fval, true_s, false_s)
+            elif vtype_resolved == "str":
+                # wrap in quotes: "value"
+                val_str = self._str_concat_inline(quote_s, fval)
+                val_str = self._str_concat_inline(val_str, quote_s)
+            else:
+                # fallback: ptr address as integer string
+                raw = self.builder.ptrtoint(self.builder.bitcast(fptr, I8PTR), I64_TY)
+                val_str = self._int_to_str_inline(raw)
+
+            buf = self._str_concat_inline(buf, val_str)
+
+            if fi < len(fields) - 1:
+                buf = self._str_concat_inline(buf, comma_s)
+
+        buf = self._str_concat_inline(buf, close_brace)
+        self.builder.ret(buf)
+        self._defer_stack.pop()
+        self._pop_scope()
+
+        # ---- from_json ----
+        # Simple: allocate struct, zero-initialize, return pointer
+        # (Full JSON parse would require the JSON parser helper)
+        from_json_name = f"{sname}__from_json"
+        fn2 = self._functions[from_json_name]["fn"]
+        self.current_fn = fn2
+        b2 = ir.IRBuilder(fn2.append_basic_block("entry"))
+        self.builder = b2
+        self._push_scope()
+        self._defer_stack.append([])
+
+        n_fields = len(fields)
+        raw = b2.call(self.malloc_fn, [ir.Constant(I64_TY, 8 * max(n_fields, 1))])
+        ptr = b2.bitcast(raw, struct_ptr_ty)
+        # Zero-initialize all fields
+        for fi, (fname, ftype) in enumerate(fields):
+            fptr = b2.gep(ptr, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, fi)],
+                          inbounds=True)
+            lt = self._vx_to_llvm(ftype)
+            if isinstance(lt, ir.PointerType):
+                zero = ir.Constant(lt, None)  # null pointer
+            else:
+                zero = ir.Constant(lt, 0)
+            b2.store(zero, fptr)
+        b2.ret(ptr)
+        self._defer_stack.pop()
+        self._pop_scope()
+
+        if old_builder is not None:
+            self.builder = old_builder
+        if old_fn is not None:
+            self.current_fn = old_fn
 
     # ------------------------------------------------------------------ #
     #  Globals                                                             #
@@ -1898,6 +2290,16 @@ class Compiler:
                 if info is not None:
                     return self.builder.load(info["ptr"], name=dotted), info["vx_type"]
             ptr = self._field_ptr(node)
+            # #103: null dereference detection in debug mode
+            if self.debug_mode:
+                raw = self.builder.ptrtoint(ptr, I64_TY)
+                is_null = self.builder.icmp_unsigned("==", raw, ir.Constant(I64_TY, 0))
+                ok_bb   = self.current_fn.append_basic_block("null.ok")
+                fail_bb = self.current_fn.append_basic_block("null.fail")
+                self.builder.cbranch(is_null, fail_bb, ok_bb)
+                self.builder.position_at_end(fail_bb)
+                self._emit_panic(f"null pointer dereference at field '{node.field}'")
+                self.builder.position_at_end(ok_bb)
             vt  = self._infer_type(node)
             return self.builder.load(ptr, name=node.field), vt
 
@@ -2308,6 +2710,62 @@ class Compiler:
             elem_vt = obj_t[:-2]
             return self._compile_arr_method(obj_v, obj_t, elem_vt, method, node.args)
 
+        # Struct own-methods (#13): StructName__method(self_ptr, args...)
+        struct_method_key = f"{obj_t}__{method}"
+        if struct_method_key in self._functions:
+            fi = self._functions[struct_method_key]
+            fn  = fi["fn"]
+            sig = fi["sig"]
+            # First arg is self pointer; rest from call
+            compiled_args = [obj_v]
+            non_self_params = [(n, t) for n, t in sig.params if n != "self"]
+            defaults = self._fn_defaults.get(struct_method_key, [])
+            args_list = list(node.args)
+            while len(args_list) < len(non_self_params):
+                idx = len(args_list)
+                if idx < len(defaults) and defaults[idx] is not None:
+                    args_list.append(defaults[idx])
+                else:
+                    break
+            for arg_node, (_, pt) in zip(args_list, non_self_params):
+                av, at = self._compile_expr(arg_node)
+                if pt == "float" and at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+                compiled_args.append(av)
+            result = self.builder.call(fn, compiled_args)
+            return result, sig.return_type
+
+        # Enum own-methods (#13): EnumName__method(self_val, args...)
+        enum_method_key = f"{obj_t}__{method}"
+        if enum_method_key in self._functions:
+            fi = self._functions[enum_method_key]
+            fn  = fi["fn"]
+            sig = fi["sig"]
+            compiled_args = [obj_v]
+            non_self_params = [(n, t) for n, t in sig.params if n != "self"]
+            for arg_node, (_, pt) in zip(node.args, non_self_params):
+                av, at = self._compile_expr(arg_node)
+                if pt == "float" and at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+                compiled_args.append(av)
+            result = self.builder.call(fn, compiled_args)
+            return result, sig.return_type
+
+        # HTTP server methods (#51): server.get(path, handler), server.listen()
+        if obj_t == "int" and method == "listen":
+            # http server fd: call __vx_http_listen(fd)
+            self.builder.call(self._get_helper("__vx_http_listen"), [obj_v])
+            return ir.Constant(I64_TY, 0), "void"
+        if obj_t == "int" and method in ("get", "post", "put", "delete", "patch"):
+            # http_server.get(path, handler): register route
+            path_v, _ = self._compile_expr(node.args[0])
+            cb_v, _   = self._compile_expr(node.args[1])
+            meth_str  = self._gstr_ptr(self._global_str(method.upper()))
+            self.builder.call(self._get_helper("__vx_http_add_route"),
+                              [obj_v, meth_str, path_v,
+                               self.builder.bitcast(cb_v, I8PTR)])
+            return ir.Constant(I64_TY, 0), "void"
+
         raise CodegenError(f"No methods on type '{obj_t}'")
 
     def _compile_str_method(self, s: ir.Value, method: str, args) -> tuple[ir.Value, str]:
@@ -2640,6 +3098,24 @@ class Compiler:
             "__vx_pipe_read":            self._build_pipe_read,
             "__vx_pipe_close":           self._build_pipe_close,
             "__vx_chan_select":           self._build_chan_select,
+            # v10 — hashing / regex / TOML / JSON array
+            "__vx_md5":                  self._build_md5,
+            "__vx_sha512":               self._build_sha512,
+            "__vx_hmac_sha256":          self._build_hmac_sha256,
+            "__vx_regex_engine":         self._build_regex_engine,
+            "__vx_regex_match":          self._build_regex_match,
+            "__vx_regex_test":           self._build_regex_test,
+            "__vx_regex_find_all":       self._build_regex_find_all,
+            "__vx_regex_replace":        self._build_regex_replace,
+            "__vx_toml_parse_str":       self._build_toml_parse_str,
+            "__vx_toml_parse_int":       self._build_toml_parse_int,
+            "__vx_toml_parse_float":     self._build_toml_parse_float,
+            "__vx_json_stringify_arr":   self._build_json_stringify_arr,
+            "__vx_json_stringify_str_arr": self._build_json_stringify_str_arr,
+            # v10 — HTTP server (#51)
+            "__vx_http_serve":           self._build_http_serve,
+            "__vx_http_add_route":       self._build_http_add_route,
+            "__vx_http_listen":          self._build_http_listen,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -3369,6 +3845,44 @@ class Compiler:
     #  Binary ops                                                          #
     # ------------------------------------------------------------------ #
 
+    def _fold_constant(self, op: str, lv, lt: str, rv, rt: str):
+        """Try to constant-fold a binary operation at compile time (#93).
+        Returns (ir.Value, vx_type) if foldable, else None."""
+        # Only fold pure integer/float/bool literals
+        if not (isinstance(lv, ir.Constant) and isinstance(rv, ir.Constant)):
+            return None
+        try:
+            lc = lv.constant
+            rc = rv.constant
+            if lt == "float" or rt == "float":
+                lf = float(lc); rf = float(rc)
+                ops = {"+": lf+rf, "-": lf-rf, "*": lf*rf}
+                if op == "/" and rf != 0: ops["/"] = lf/rf
+                if op in ops: return ir.Constant(F64_TY, ops[op]), "float"
+                cmp = {"==": lf==rf, "!=": lf!=rf, "<": lf<rf, ">": lf>rf,
+                       "<=": lf<=rf, ">=": lf>=rf}
+                if op in cmp: return ir.Constant(I1_TY, int(cmp[op])), "bool"
+            elif lt == "int" and rt == "int":
+                li = int(lc) if lc is not None else 0
+                ri = int(rc) if rc is not None else 0
+                ops = {"+": li+ri, "-": li-ri, "*": li*ri,
+                       "&": li&ri, "|": li|ri, "^": li^ri,
+                       "<<": li<<ri, ">>": li>>ri, "%": li%ri if ri else 0}
+                if op == "/" and ri != 0: ops["/"] = li//ri
+                if op == "**": ops["**"] = int(li**ri)
+                if op in ops:
+                    result = ops[op]
+                    # Clamp to i64 range
+                    result = result & 0xFFFFFFFFFFFFFFFF
+                    if result >= 0x8000000000000000: result -= 0x10000000000000000
+                    return ir.Constant(I64_TY, result), "int"
+                cmp = {"==": li==ri, "!=": li!=ri, "<": li<ri, ">": li>ri,
+                       "<=": li<=ri, ">=": li>=ri}
+                if op in cmp: return ir.Constant(I1_TY, int(cmp[op])), "bool"
+        except Exception:
+            pass
+        return None
+
     def _compile_binop(self, node: BinOp) -> tuple[ir.Value, str]:
         op = node.op
 
@@ -3384,6 +3898,11 @@ class Compiler:
 
         lv, lt = self._compile_expr(node.left)
         rv, rt = self._compile_expr(node.right)
+
+        # Constant folding (#93): evaluate literal arithmetic at compile time
+        folded = self._fold_constant(op, lv, lt, rv, rt)
+        if folded is not None:
+            return folded
 
         # Nullable comparison: T? == null / T? != null
         if op in ("==", "!=") and (lt.endswith("?") or rt == "null" or
@@ -3431,6 +3950,23 @@ class Compiler:
         }
         if op in arith:
             f_op, i_op = arith[op]
+            if not is_float and self.debug_mode and op in ("+", "-", "*"):
+                # #102: integer overflow detection in debug mode
+                intr_map = {"+": "sadd", "-": "ssub", "*": "smul"}
+                intr_name = f"llvm.{intr_map[op]}.with.overflow.i64"
+                ovf_ret_ty = ir.LiteralStructType([I64_TY, I1_TY])
+                intr_ty = ir.FunctionType(ovf_ret_ty, [I64_TY, I64_TY])
+                intr_fn = self._get_or_declare_fn(intr_name, intr_ty)
+                res_struct = self.builder.call(intr_fn, [lv, rv])
+                result   = self.builder.extract_value(res_struct, 0)
+                overflow = self.builder.extract_value(res_struct, 1)
+                ok_bb   = self.current_fn.append_basic_block("ovf.ok")
+                fail_bb = self.current_fn.append_basic_block("ovf.fail")
+                self.builder.cbranch(overflow, fail_bb, ok_bb)
+                self.builder.position_at_end(fail_bb)
+                self._emit_panic(f"integer overflow in '{op}'")
+                self.builder.position_at_end(ok_bb)
+                return result, "int"
             return (f_op(lv, rv) if is_float else i_op(lv, rv)), lt
 
         # Power operator: x ** y  → pow(x, y)
@@ -4757,6 +5293,91 @@ class Compiler:
             arr_v, _ = self._compile_expr(node.args[0])
             return self.builder.call(self._get_helper("__vx_chan_select"),
                                      [self.builder.bitcast(arr_v, I8PTR)]), "int"
+
+        # --- v10: HTTP server (#51) ---
+        if name == "http_serve":
+            port_v, _ = self._compile_expr(node.args[0])
+            return self.builder.call(self._get_helper("__vx_http_serve"), [port_v]), "int"
+
+        if name == "http_listen":
+            srv_v, _ = self._compile_expr(node.args[0])
+            self.builder.call(self._get_helper("__vx_http_listen"), [srv_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v10: hashing extras ---
+        if name == "md5":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_md5")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "sha512":
+            s_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_sha512")
+            return self.builder.call(fn_h, [s_v]), "str"
+
+        if name == "hmac_sha256":
+            key_v, _ = self._compile_expr(node.args[0])
+            msg_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_hmac_sha256")
+            return self.builder.call(fn_h, [key_v, msg_v]), "str"
+
+        # --- v10: regex ---
+        if name == "regex_match":
+            text_v, _ = self._compile_expr(node.args[0])
+            pat_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_regex_match")
+            return self.builder.call(fn_h, [text_v, pat_v]), "str"
+
+        if name == "regex_test":
+            text_v, _ = self._compile_expr(node.args[0])
+            pat_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_regex_test")
+            result = self.builder.call(fn_h, [text_v, pat_v])
+            return self.builder.trunc(result, I1_TY), "bool"
+
+        if name == "regex_find_all":
+            text_v, _ = self._compile_expr(node.args[0])
+            pat_v,  _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_regex_find_all")
+            raw = self.builder.call(fn_h, [text_v, pat_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
+
+        if name == "regex_replace":
+            text_v, _ = self._compile_expr(node.args[0])
+            pat_v,  _ = self._compile_expr(node.args[1])
+            repl_v, _ = self._compile_expr(node.args[2])
+            fn_h = self._get_helper("__vx_regex_replace")
+            return self.builder.call(fn_h, [text_v, pat_v, repl_v]), "str"
+
+        # --- v10: TOML ---
+        if name == "toml_parse_str":
+            content_v, _ = self._compile_expr(node.args[0])
+            key_v,     _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_toml_parse_str")
+            return self.builder.call(fn_h, [content_v, key_v]), "str"
+
+        if name == "toml_parse_int":
+            content_v, _ = self._compile_expr(node.args[0])
+            key_v,     _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_toml_parse_int")
+            return self.builder.call(fn_h, [content_v, key_v]), "int"
+
+        if name == "toml_parse_float":
+            content_v, _ = self._compile_expr(node.args[0])
+            key_v,     _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_toml_parse_float")
+            return self.builder.call(fn_h, [content_v, key_v]), "float"
+
+        # --- v10: JSON array serialization ---
+        if name == "json_stringify_arr":
+            arr_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_json_stringify_arr")
+            return self.builder.call(fn_h, [self.builder.bitcast(arr_v, I8PTR)]), "str"
+
+        if name == "json_stringify_str_arr":
+            arr_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_json_stringify_str_arr")
+            return self.builder.call(fn_h, [self.builder.bitcast(arr_v, I8PTR)]), "str"
 
         # --- ADT enum constructor calls: EnumName.Variant(...) handled via FieldAccess at call site ---
 
@@ -6661,15 +7282,195 @@ class Compiler:
         return fn
 
     def _build_sha256(self) -> ir.Function:
-        """SHA-256 stub — returns hex placeholder. Real SHA-256 would be 200+ lines of IR.
-           For actual use, link against libcrypto and call SHA256()."""
+        """Real SHA-256 implementation in LLVM IR (unrolled 64 rounds)."""
         fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
                          name="__vx_sha256")
         fn.linkage = "private"
         b = ir.IRBuilder(fn.append_basic_block("entry"))
-        # Return a fixed placeholder — linking against OpenSSL is the proper solution
-        placeholder = self._global_str("sha256:not-linked-call-openssl")
-        b.ret(self._gstr_ptr_const(placeholder))
+        msg = fn.args[0]
+
+        # SHA-256 K constants
+        K = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ]
+
+        # Initial hash values H0-H7
+        H_INIT = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        ]
+
+        I32 = I32_TY
+
+        def u32(v): return ir.Constant(I32, v & 0xFFFFFFFF)
+
+        def rotr32(b, val, n):
+            """Right-rotate 32-bit value by n bits."""
+            lsh = b.lshr(val, u32(n))
+            rsh = b.shl(val, u32(32 - n))
+            return b.or_(lsh, rsh)
+
+        def trunc32(b, val):
+            if val.type == I32: return val
+            return b.trunc(val, I32)
+
+        # ---- Compute input length ----
+        msg_len = b.call(self.strlen_fn, [msg])
+        msg_len32 = b.trunc(msg_len, I32)
+
+        # Allocate padded message buffer: len + 1 + padding + 8 bytes
+        # Total padded length = ((len + 9 + 63) / 64) * 64
+        pad_base = b.add(msg_len, ir.Constant(I64_TY, 9))
+        pad_align = b.add(pad_base, ir.Constant(I64_TY, 63))
+        pad_len = b.and_(pad_align, ir.Constant(I64_TY, ~63))
+
+        pad_buf = b.call(self.malloc_fn, [b.add(pad_len, ir.Constant(I64_TY, 8))])
+
+        # memcpy msg into pad_buf
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        b.call(memcpy_fn, [pad_buf, msg, msg_len])
+
+        # Append 0x80 byte
+        pos80 = b.gep(pad_buf, [msg_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0x80), pos80)
+
+        # Zero the padding bytes (msg_len+1 .. pad_len-8)
+        memset_fn = self._get_or_declare("memset",
+            ir.FunctionType(I8PTR, [I8PTR, I32, I64_TY]))
+        zero_start = b.gep(pad_buf, [b.add(msg_len, ir.Constant(I64_TY, 1))], inbounds=False)
+        zero_len = b.sub(b.sub(pad_len, ir.Constant(I64_TY, 8)),
+                         b.add(msg_len, ir.Constant(I64_TY, 1)))
+        b.call(memset_fn, [zero_start, ir.Constant(I32, 0), zero_len])
+
+        # Append original length in bits as big-endian 64-bit integer
+        bit_len = b.mul(msg_len, ir.Constant(I64_TY, 8))
+        # Store big-endian: byte by byte
+        for byte_i in range(8):
+            shift = 56 - byte_i * 8
+            if shift > 0:
+                bval = b.trunc(b.lshr(bit_len, ir.Constant(I64_TY, shift)), I8_TY)
+            else:
+                bval = b.trunc(bit_len, I8_TY)
+            bp = b.gep(pad_buf, [b.add(b.sub(pad_len, ir.Constant(I64_TY, 8)),
+                                       ir.Constant(I64_TY, byte_i))], inbounds=False)
+            b.store(bval, bp)
+
+        # Initialize working hash h0-h7
+        h_al = [b.alloca(I32) for _ in range(8)]
+        for i, hv in enumerate(H_INIT):
+            b.store(u32(hv), h_al[i])
+
+        # Number of 64-byte blocks
+        num_blocks = b.udiv(pad_len, ir.Constant(I64_TY, 64))
+
+        # Block loop
+        bi_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), bi_al)
+        blk_chk = fn.append_basic_block("sha256.blk.chk")
+        blk_bdy = fn.append_basic_block("sha256.blk.bdy")
+        blk_ext = fn.append_basic_block("sha256.blk.ext")
+        b.branch(blk_chk)
+
+        b.position_at_end(blk_chk)
+        bi = b.load(bi_al)
+        b.cbranch(b.icmp_unsigned("<", bi, num_blocks), blk_bdy, blk_ext)
+
+        b.position_at_end(blk_bdy)
+        # block offset
+        block_off = b.mul(bi, ir.Constant(I64_TY, 64))
+        block_ptr = b.gep(pad_buf, [block_off], inbounds=False)
+
+        # Load W[0..15] from block (big-endian 32-bit words)
+        w_al = [b.alloca(I32) for _ in range(64)]
+        for wi in range(16):
+            byte_off = wi * 4
+            word_val = u32(0)
+            for byte_j in range(4):
+                bp = b.gep(block_ptr, [ir.Constant(I64_TY, byte_off + byte_j)], inbounds=False)
+                bv = b.zext(b.load(bp), I32)
+                shifted = b.shl(bv, u32((3 - byte_j) * 8))
+                word_val = b.or_(word_val, shifted)
+            b.store(word_val, w_al[wi])
+
+        # Extend W[16..63]
+        for wi in range(16, 64):
+            w15 = b.load(w_al[wi - 15])
+            s0 = b.xor_(b.xor_(rotr32(b, w15, 7), rotr32(b, w15, 18)),
+                        b.lshr(w15, u32(3)))
+            w2 = b.load(w_al[wi - 2])
+            s1 = b.xor_(b.xor_(rotr32(b, w2, 17), rotr32(b, w2, 19)),
+                        b.lshr(w2, u32(10)))
+            w16 = b.load(w_al[wi - 16])
+            w7  = b.load(w_al[wi - 7])
+            new_w = b.add(b.add(b.add(w16, s0), w7), s1)
+            b.store(new_w, w_al[wi])
+
+        # Working variables
+        a_al, bb_al, c_al, d_al = b.alloca(I32), b.alloca(I32), b.alloca(I32), b.alloca(I32)
+        e_al, f_al, g_al, hh_al = b.alloca(I32), b.alloca(I32), b.alloca(I32), b.alloca(I32)
+        for al, hi in zip([a_al, bb_al, c_al, d_al, e_al, f_al, g_al, hh_al], h_al):
+            b.store(b.load(hi), al)
+
+        # 64 compression rounds (unrolled in Python)
+        for ri in range(64):
+            av = b.load(a_al); bv = b.load(bb_al); cv = b.load(c_al); dv = b.load(d_al)
+            ev = b.load(e_al); fv = b.load(f_al); gv = b.load(g_al); hv = b.load(hh_al)
+
+            S1  = b.xor_(b.xor_(rotr32(b, ev, 6), rotr32(b, ev, 11)), rotr32(b, ev, 25))
+            ch  = b.xor_(b.and_(ev, fv), b.and_(b.not_(ev), gv))
+            t1  = b.add(b.add(b.add(b.add(hv, S1), ch), u32(K[ri])), b.load(w_al[ri]))
+
+            S0  = b.xor_(b.xor_(rotr32(b, av, 2), rotr32(b, av, 13)), rotr32(b, av, 22))
+            maj = b.xor_(b.xor_(b.and_(av, bv), b.and_(av, cv)), b.and_(bv, cv))
+            t2  = b.add(S0, maj)
+
+            b.store(dv,           hh_al)
+            b.store(cv,           g_al)
+            b.store(bv,           f_al)
+            b.store(av,           e_al)
+            b.store(b.add(dv, t1), d_al)
+            b.store(cv,           c_al)
+            b.store(bv,           bb_al)
+            b.store(b.add(t1, t2), a_al)
+
+        # Add working vars back to hash state
+        for al, hi in zip([a_al, bb_al, c_al, d_al, e_al, f_al, g_al, hh_al], h_al):
+            b.store(b.add(b.load(hi), b.load(al)), hi)
+
+        # Increment block index
+        b.store(b.add(bi, ir.Constant(I64_TY, 1)), bi_al)
+        b.branch(blk_chk)
+
+        # After block loop: format hex output
+        b.position_at_end(blk_ext)
+        out_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 65)])
+        fmt8_gv = self._global_str("%08x")
+        hex_chars_per_word = 8
+        for wi in range(8):
+            word_v = b.load(h_al[wi])
+            word64 = b.zext(word_v, I64_TY)
+            out_off = b.gep(out_buf, [ir.Constant(I64_TY, wi * hex_chars_per_word)], inbounds=False)
+            b.call(self.sprintf_fn, [out_off, self._gstr_ptr_const(fmt8_gv), word64])
+        # NUL-terminate
+        term_ptr = b.gep(out_buf, [ir.Constant(I64_TY, 64)], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term_ptr)
+        b.ret(out_buf)
         return fn
 
     def _build_argv(self) -> ir.Function:
@@ -9305,6 +10106,1455 @@ class Compiler:
         b.branch(chk_bb)
         b.position_at_end(found_bb)
         b.ret(b.load(i_al))
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — MD5                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _build_md5(self) -> ir.Function:
+        """MD5 hash — pure LLVM IR implementation (4 rounds × 16 ops)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_md5")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        msg = fn.args[0]
+
+        I32 = I32_TY
+        def u32(v): return ir.Constant(I32, v & 0xFFFFFFFF)
+        def rotr32(bld, val, n):
+            return bld.or_(bld.lshr(val, u32(32-n)), bld.shl(val, u32(n)))  # left-rotate for MD5
+
+        # MD5 per-round shift amounts
+        S = [
+            7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+            5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+            4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+            6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21,
+        ]
+
+        # MD5 T constants: floor(abs(sin(i+1)) * 2^32)
+        T = [
+            0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+            0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+            0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+            0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+            0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+            0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+            0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+            0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+            0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+            0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+            0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+            0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+            0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+            0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+            0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+            0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+        ]
+
+        msg_len = b.call(self.strlen_fn, [msg])
+
+        # Pad to 64-byte boundary
+        pad_base  = b.add(msg_len, ir.Constant(I64_TY, 9))
+        pad_align = b.add(pad_base, ir.Constant(I64_TY, 63))
+        pad_len   = b.and_(pad_align, ir.Constant(I64_TY, ~63))
+        pad_buf   = b.call(self.malloc_fn, [b.add(pad_len, ir.Constant(I64_TY, 8))])
+
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        memset_fn = self._get_or_declare("memset",
+            ir.FunctionType(I8PTR, [I8PTR, I32, I64_TY]))
+        b.call(memcpy_fn, [pad_buf, msg, msg_len])
+        pos80 = b.gep(pad_buf, [msg_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0x80), pos80)
+        zero_start = b.gep(pad_buf, [b.add(msg_len, ir.Constant(I64_TY, 1))], inbounds=False)
+        zero_len   = b.sub(b.sub(pad_len, ir.Constant(I64_TY, 8)),
+                           b.add(msg_len, ir.Constant(I64_TY, 1)))
+        b.call(memset_fn, [zero_start, ir.Constant(I32, 0), zero_len])
+
+        # MD5 appends length in bits little-endian 64-bit
+        bit_len = b.mul(msg_len, ir.Constant(I64_TY, 8))
+        for byte_i in range(8):
+            if byte_i > 0:
+                bval = b.trunc(b.lshr(bit_len, ir.Constant(I64_TY, byte_i * 8)), I8_TY)
+            else:
+                bval = b.trunc(bit_len, I8_TY)
+            bp = b.gep(pad_buf, [b.add(b.sub(pad_len, ir.Constant(I64_TY, 8)),
+                                       ir.Constant(I64_TY, byte_i))], inbounds=False)
+            b.store(bval, bp)
+
+        # Initial state
+        a0_al = b.alloca(I32); b0_al = b.alloca(I32)
+        c0_al = b.alloca(I32); d0_al = b.alloca(I32)
+        b.store(u32(0x67452301), a0_al); b.store(u32(0xefcdab89), b0_al)
+        b.store(u32(0x98badcfe), c0_al); b.store(u32(0x10325476), d0_al)
+
+        num_blocks = b.udiv(pad_len, ir.Constant(I64_TY, 64))
+        bi_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), bi_al)
+        blk_chk = fn.append_basic_block("md5.blk.chk")
+        blk_bdy = fn.append_basic_block("md5.blk.bdy")
+        blk_ext = fn.append_basic_block("md5.blk.ext")
+        b.branch(blk_chk)
+        b.position_at_end(blk_chk)
+        bi = b.load(bi_al)
+        b.cbranch(b.icmp_unsigned("<", bi, num_blocks), blk_bdy, blk_ext)
+        b.position_at_end(blk_bdy)
+
+        block_off = b.mul(bi, ir.Constant(I64_TY, 64))
+        block_ptr = b.gep(pad_buf, [block_off], inbounds=False)
+
+        # Load 16 little-endian 32-bit words
+        M = []
+        for wi in range(16):
+            word_val = u32(0)
+            for byte_j in range(4):
+                bp = b.gep(block_ptr, [ir.Constant(I64_TY, wi * 4 + byte_j)], inbounds=False)
+                bv = b.zext(b.load(bp), I32)
+                shifted = b.shl(bv, u32(byte_j * 8))
+                word_val = b.or_(word_val, shifted)
+            M.append(word_val)
+
+        # Working vars
+        A_al = b.alloca(I32); B_al = b.alloca(I32)
+        C_al = b.alloca(I32); D_al = b.alloca(I32)
+        b.store(b.load(a0_al), A_al); b.store(b.load(b0_al), B_al)
+        b.store(b.load(c0_al), C_al); b.store(b.load(d0_al), D_al)
+
+        for i in range(64):
+            A = b.load(A_al); Bv = b.load(B_al); C = b.load(C_al); D = b.load(D_al)
+            if i < 16:
+                F = b.or_(b.and_(Bv, C), b.and_(b.not_(Bv), D))
+                g = i
+            elif i < 32:
+                F = b.or_(b.and_(D, Bv), b.and_(b.not_(D), C))
+                g = (5 * i + 1) % 16
+            elif i < 48:
+                F = b.xor_(b.xor_(Bv, C), D)
+                g = (3 * i + 5) % 16
+            else:
+                F = b.xor_(C, b.or_(Bv, b.not_(D)))
+                g = (7 * i) % 16
+            dtemp = D
+            b.store(C,   D_al)
+            b.store(Bv,  C_al)
+            inner = b.add(b.add(b.add(A, F), M[g]), u32(T[i]))
+            rot_v = rotr32(b, inner, S[i])
+            b.store(b.add(Bv, rot_v), B_al)
+            b.store(dtemp, A_al)
+
+        b.store(b.add(b.load(a0_al), b.load(A_al)), a0_al)
+        b.store(b.add(b.load(b0_al), b.load(B_al)), b0_al)
+        b.store(b.add(b.load(c0_al), b.load(C_al)), c0_al)
+        b.store(b.add(b.load(d0_al), b.load(D_al)), d0_al)
+
+        b.store(b.add(bi, ir.Constant(I64_TY, 1)), bi_al)
+        b.branch(blk_chk)
+
+        b.position_at_end(blk_ext)
+        out_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 33)])
+        fmt8_gv = self._global_str("%08x")
+        for wi, al in enumerate([a0_al, b0_al, c0_al, d0_al]):
+            word_v  = b.load(al)
+            # MD5 output is little-endian: byte-swap each word
+            b0 = b.and_(word_v, u32(0xFF))
+            b1 = b.and_(b.lshr(word_v, u32(8)),  u32(0xFF))
+            b2 = b.and_(b.lshr(word_v, u32(16)), u32(0xFF))
+            b3 = b.lshr(word_v, u32(24))
+            swapped = b.or_(b.or_(b.shl(b0, u32(24)), b.shl(b1, u32(16))),
+                            b.or_(b.shl(b2, u32(8)),  b3))
+            word64 = b.zext(swapped, I64_TY)
+            out_off = b.gep(out_buf, [ir.Constant(I64_TY, wi * 8)], inbounds=False)
+            b.call(self.sprintf_fn, [out_off, self._gstr_ptr_const(fmt8_gv), word64])
+        term_ptr = b.gep(out_buf, [ir.Constant(I64_TY, 32)], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term_ptr)
+        b.ret(out_buf)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — SHA-512                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _build_sha512(self) -> ir.Function:
+        """SHA-512: 80 rounds with 64-bit words, returns 128-char hex string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_sha512")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        msg = fn.args[0]
+
+        # SHA-512 K constants (first 80)
+        K512 = [
+            0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+            0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+            0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+            0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+            0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+            0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+            0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+            0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+            0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+            0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+            0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+            0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+            0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+            0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+            0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+            0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+            0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+            0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+            0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+            0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+        ]
+
+        H_INIT512 = [
+            0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+            0x510e527fade682d1, 0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+        ]
+
+        I64 = I64_TY
+        def u64(v): return ir.Constant(I64, v & 0xFFFFFFFFFFFFFFFF)
+
+        def rotr64(bld, val, n):
+            return bld.or_(bld.lshr(val, u64(n)), bld.shl(val, u64(64 - n)))
+
+        msg_len = b.call(self.strlen_fn, [msg])
+
+        # SHA-512 pads to 128-byte boundary
+        pad_base  = b.add(msg_len, ir.Constant(I64_TY, 17))
+        pad_align = b.add(pad_base, ir.Constant(I64_TY, 127))
+        pad_len   = b.and_(pad_align, ir.Constant(I64_TY, ~127))
+        pad_buf   = b.call(self.malloc_fn, [b.add(pad_len, ir.Constant(I64_TY, 16))])
+
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        memset_fn = self._get_or_declare("memset",
+            ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY]))
+        b.call(memcpy_fn, [pad_buf, msg, msg_len])
+        pos80 = b.gep(pad_buf, [msg_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0x80), pos80)
+        zero_start = b.gep(pad_buf, [b.add(msg_len, ir.Constant(I64_TY, 1))], inbounds=False)
+        zero_len   = b.sub(b.sub(pad_len, ir.Constant(I64_TY, 16)),
+                           b.add(msg_len, ir.Constant(I64_TY, 1)))
+        b.call(memset_fn, [zero_start, ir.Constant(I32_TY, 0), zero_len])
+
+        # Append 128-bit length (high=0, low=bit_len) big-endian
+        bit_len = b.mul(msg_len, u64(8))
+        # high 8 bytes = 0
+        for byte_i in range(8):
+            bp = b.gep(pad_buf, [b.add(b.sub(pad_len, ir.Constant(I64_TY, 16)),
+                                       ir.Constant(I64_TY, byte_i))], inbounds=False)
+            b.store(ir.Constant(I8_TY, 0), bp)
+        # low 8 bytes = bit_len big-endian
+        for byte_i in range(8):
+            shift = 56 - byte_i * 8
+            if shift > 0:
+                bval = b.trunc(b.lshr(bit_len, u64(shift)), I8_TY)
+            else:
+                bval = b.trunc(bit_len, I8_TY)
+            bp = b.gep(pad_buf, [b.add(b.sub(pad_len, ir.Constant(I64_TY, 8)),
+                                       ir.Constant(I64_TY, byte_i))], inbounds=False)
+            b.store(bval, bp)
+
+        # Initial hash state
+        h_al = [b.alloca(I64) for _ in range(8)]
+        for i, hv in enumerate(H_INIT512):
+            b.store(u64(hv), h_al[i])
+
+        num_blocks = b.udiv(pad_len, ir.Constant(I64_TY, 128))
+        bi_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), bi_al)
+        blk_chk = fn.append_basic_block("sha512.blk.chk")
+        blk_bdy = fn.append_basic_block("sha512.blk.bdy")
+        blk_ext = fn.append_basic_block("sha512.blk.ext")
+        b.branch(blk_chk)
+        b.position_at_end(blk_chk)
+        bi = b.load(bi_al)
+        b.cbranch(b.icmp_unsigned("<", bi, num_blocks), blk_bdy, blk_ext)
+        b.position_at_end(blk_bdy)
+
+        block_off = b.mul(bi, ir.Constant(I64_TY, 128))
+        block_ptr = b.gep(pad_buf, [block_off], inbounds=False)
+
+        # Load W[0..15] (big-endian 64-bit words)
+        w_al = [b.alloca(I64) for _ in range(80)]
+        for wi in range(16):
+            word_val = u64(0)
+            for byte_j in range(8):
+                bp = b.gep(block_ptr, [ir.Constant(I64_TY, wi * 8 + byte_j)], inbounds=False)
+                bv = b.zext(b.load(bp), I64)
+                shifted = b.shl(bv, u64((7 - byte_j) * 8))
+                word_val = b.or_(word_val, shifted)
+            b.store(word_val, w_al[wi])
+
+        # Extend W[16..79]
+        for wi in range(16, 80):
+            w15 = b.load(w_al[wi - 15])
+            s0 = b.xor_(b.xor_(rotr64(b, w15, 1), rotr64(b, w15, 8)), b.lshr(w15, u64(7)))
+            w2  = b.load(w_al[wi - 2])
+            s1  = b.xor_(b.xor_(rotr64(b, w2, 19), rotr64(b, w2, 61)), b.lshr(w2, u64(6)))
+            w16 = b.load(w_al[wi - 16])
+            w7  = b.load(w_al[wi - 7])
+            b.store(b.add(b.add(b.add(w16, s0), w7), s1), w_al[wi])
+
+        # Working vars
+        wk = [b.alloca(I64) for _ in range(8)]
+        for i in range(8):
+            b.store(b.load(h_al[i]), wk[i])
+
+        for ri in range(80):
+            av=b.load(wk[0]); bv=b.load(wk[1]); cv=b.load(wk[2]); dv=b.load(wk[3])
+            ev=b.load(wk[4]); fv=b.load(wk[5]); gv=b.load(wk[6]); hv=b.load(wk[7])
+            S1  = b.xor_(b.xor_(rotr64(b, ev, 14), rotr64(b, ev, 18)), rotr64(b, ev, 41))
+            ch  = b.xor_(b.and_(ev, fv), b.and_(b.not_(ev), gv))
+            t1  = b.add(b.add(b.add(b.add(hv, S1), ch), u64(K512[ri])), b.load(w_al[ri]))
+            S0  = b.xor_(b.xor_(rotr64(b, av, 28), rotr64(b, av, 34)), rotr64(b, av, 39))
+            maj = b.xor_(b.xor_(b.and_(av, bv), b.and_(av, cv)), b.and_(bv, cv))
+            t2  = b.add(S0, maj)
+            b.store(hv,           wk[7])
+            b.store(gv,           wk[6])
+            b.store(fv,           wk[5])
+            b.store(ev,           wk[4])
+            b.store(b.add(dv,t1), wk[3])
+            b.store(cv,           wk[2])
+            b.store(bv,           wk[1])
+            b.store(b.add(t1,t2), wk[0])
+
+        for i in range(8):
+            b.store(b.add(b.load(h_al[i]), b.load(wk[i])), h_al[i])
+
+        b.store(b.add(bi, ir.Constant(I64_TY, 1)), bi_al)
+        b.branch(blk_chk)
+
+        b.position_at_end(blk_ext)
+        out_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 129)])
+        fmt16_gv = self._global_str("%016llx")
+        for wi in range(8):
+            word_v  = b.load(h_al[wi])
+            out_off = b.gep(out_buf, [ir.Constant(I64_TY, wi * 16)], inbounds=False)
+            b.call(self.sprintf_fn, [out_off, self._gstr_ptr_const(fmt16_gv), word_v])
+        term_ptr = b.gep(out_buf, [ir.Constant(I64_TY, 128)], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term_ptr)
+        b.ret(out_buf)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — HMAC-SHA256                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _build_hmac_sha256(self) -> ir.Function:
+        """HMAC-SHA256(key, msg) -> hex str.  Pad key to 64 bytes, XOR ipad/opad, call sha256 twice."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_hmac_sha256")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        key = fn.args[0]; msg = fn.args[1]
+
+        sha256_fn = self._get_helper("__vx_sha256")
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        memset_fn = self._get_or_declare("memset",
+            ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY]))
+
+        BLOCK = 64
+        key_len = b.call(self.strlen_fn, [key])
+        msg_len = b.call(self.strlen_fn, [msg])
+
+        # k_pad = zero-padded key (64 bytes)
+        k_pad = b.call(self.malloc_fn, [ir.Constant(I64_TY, BLOCK + 1)])
+        b.call(memset_fn, [k_pad, ir.Constant(I32_TY, 0), ir.Constant(I64_TY, BLOCK)])
+
+        # If key is longer than BLOCK, hash it first (simplified: just truncate)
+        k_short = b.icmp_unsigned("<=", key_len, ir.Constant(I64_TY, BLOCK))
+        short_bb = fn.append_basic_block("hmac.short"); long_bb = fn.append_basic_block("hmac.long")
+        after_bb = fn.append_basic_block("hmac.after_key")
+        b.cbranch(k_short, short_bb, long_bb)
+        b.position_at_end(short_bb)
+        b.call(memcpy_fn, [k_pad, key, key_len])
+        b.branch(after_bb)
+        b.position_at_end(long_bb)
+        hashed_key = b.call(sha256_fn, [key])
+        hashed_len = b.call(self.strlen_fn, [hashed_key])
+        b.call(memcpy_fn, [k_pad, hashed_key, hashed_len])
+        b.branch(after_bb)
+        b.position_at_end(after_bb)
+
+        # ipad_key = k_pad XOR 0x36, opad_key = k_pad XOR 0x5C
+        ipad_key = b.call(self.malloc_fn, [ir.Constant(I64_TY, BLOCK + 1)])
+        opad_key = b.call(self.malloc_fn, [ir.Constant(I64_TY, BLOCK + 1)])
+        for byte_i in range(BLOCK):
+            kp = b.gep(k_pad, [ir.Constant(I64_TY, byte_i)], inbounds=False)
+            kv = b.load(kp)
+            ip = b.gep(ipad_key, [ir.Constant(I64_TY, byte_i)], inbounds=False)
+            op = b.gep(opad_key, [ir.Constant(I64_TY, byte_i)], inbounds=False)
+            b.store(b.xor_(kv, ir.Constant(I8_TY, 0x36)), ip)
+            b.store(b.xor_(kv, ir.Constant(I8_TY, 0x5C)), op)
+        # NUL-terminate (not strictly needed but safe)
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(ipad_key, [ir.Constant(I64_TY, BLOCK)], inbounds=False))
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(opad_key, [ir.Constant(I64_TY, BLOCK)], inbounds=False))
+
+        # inner_input = ipad_key || msg
+        inner_len = b.add(ir.Constant(I64_TY, BLOCK), msg_len)
+        inner_buf = b.call(self.malloc_fn, [b.add(inner_len, ir.Constant(I64_TY, 1))])
+        b.call(memcpy_fn, [inner_buf, ipad_key, ir.Constant(I64_TY, BLOCK)])
+        b.call(memcpy_fn, [b.gep(inner_buf, [ir.Constant(I64_TY, BLOCK)], inbounds=False),
+                           msg, msg_len])
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(inner_buf, [inner_len], inbounds=False))
+
+        inner_hash = b.call(sha256_fn, [inner_buf])   # sha256(ipad || msg)
+        inner_hash_len = b.call(self.strlen_fn, [inner_hash])
+
+        # outer_input = opad_key || inner_hash
+        outer_len = b.add(ir.Constant(I64_TY, BLOCK), inner_hash_len)
+        outer_buf = b.call(self.malloc_fn, [b.add(outer_len, ir.Constant(I64_TY, 1))])
+        b.call(memcpy_fn, [outer_buf, opad_key, ir.Constant(I64_TY, BLOCK)])
+        b.call(memcpy_fn, [b.gep(outer_buf, [ir.Constant(I64_TY, BLOCK)], inbounds=False),
+                           inner_hash, inner_hash_len])
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(outer_buf, [outer_len], inbounds=False))
+
+        result = b.call(sha256_fn, [outer_buf])
+        b.ret(result)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — Regex engine                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _build_regex_engine(self) -> ir.Function:
+        """Core regex engine: __vx_regex_engine(text, tlen, pat, ppos, tpos) -> i64
+        Returns end position of match (>=0) if pattern from ppos matches text from tpos,
+        else -1. Backtracking recursive NFA.
+        Supports: . * + ? ^ $ [cls] [^cls] \\d \\w \\s \\D \\W \\S"""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(I64_TY, [I8PTR, I64_TY, I8PTR, I64_TY, I64_TY]),
+                         name="__vx_regex_engine")
+        fn.linkage = "private"
+        text, tlen, pat, ppos, tpos = fn.args
+
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+
+        # Helper: load a character from a string pointer + index
+        # We build this inline using GEP + load
+
+        def load_char(bld, ptr, idx):
+            p = bld.gep(ptr, [idx], inbounds=False)
+            return bld.load(p)
+
+        def char_matches_class(bld, ch32, pat_ptr, cls_start, cls_len):
+            """Inline check: does ch32 match the character class starting at cls_start?
+            Returns i1."""
+            # We build a simple loop that scans the class spec.
+            # This is complex to do fully in IR so we implement a simplified version:
+            # Store result in alloca, return it.
+            match_al = bld.alloca(I1_TY)
+            bld.store(ir.Constant(I1_TY, 0), match_al)
+            # For simplicity, we check ranges and literals inline for up to 32 chars.
+            # The class is bounded by cls_len.
+            i_al = bld.alloca(I64_TY)
+            bld.store(ir.Constant(I64_TY, 0), i_al)
+            cls_chk = fn.append_basic_block("cls.chk")
+            cls_bdy = fn.append_basic_block("cls.bdy")
+            cls_ext = fn.append_basic_block("cls.ext")
+            bld.branch(cls_chk)
+            bld.position_at_end(cls_chk)
+            ci = bld.load(i_al)
+            bld.cbranch(bld.icmp_signed("<", ci, cls_len), cls_bdy, cls_ext)
+            bld.position_at_end(cls_bdy)
+            # Get current class char
+            class_idx = bld.add(cls_start, ci)
+            cc = bld.zext(load_char(bld, pat_ptr, class_idx), I32_TY)
+            # Check if next char is '-' (range)
+            ci1 = bld.add(ci, ir.Constant(I64_TY, 1))
+            ci2 = bld.add(ci, ir.Constant(I64_TY, 2))
+            has_range = bld.and_(
+                bld.icmp_signed("<", ci1, cls_len),
+                bld.icmp_unsigned("==",
+                    bld.zext(load_char(bld, pat_ptr, bld.add(cls_start, ci1)), I32_TY),
+                    ir.Constant(I32_TY, ord('-'))
+                )
+            )
+            range_in_range = bld.and_(has_range, bld.icmp_signed("<", ci2, cls_len))
+
+            range_bb  = fn.append_basic_block("cls.range")
+            single_bb = fn.append_basic_block("cls.single")
+            after_bb  = fn.append_basic_block("cls.after")
+            bld.cbranch(range_in_range, range_bb, single_bb)
+
+            bld.position_at_end(range_bb)
+            high_idx = bld.add(cls_start, ci2)
+            hc = bld.zext(load_char(bld, pat_ptr, high_idx), I32_TY)
+            in_range = bld.and_(
+                bld.icmp_unsigned(">=", ch32, cc),
+                bld.icmp_unsigned("<=", ch32, hc)
+            )
+            matched_al_range = bld.or_(bld.load(match_al), in_range)
+            bld.store(matched_al_range, match_al)
+            bld.store(bld.add(ci, ir.Constant(I64_TY, 3)), i_al)
+            bld.branch(cls_chk)
+
+            bld.position_at_end(single_bb)
+            eq_single = bld.icmp_unsigned("==",ch32, cc)
+            matched_al_single = bld.or_(bld.load(match_al), eq_single)
+            bld.store(matched_al_single, match_al)
+            bld.store(bld.add(ci, ir.Constant(I64_TY, 1)), i_al)
+            bld.branch(cls_chk)
+
+            bld.position_at_end(cls_ext)
+            return bld.load(match_al)
+
+        # Main function body
+        # ppos >= plen → match succeeded; return tpos
+        plen = b.call(self.strlen_fn, [pat])
+        plen_al = b.alloca(I64_TY); b.store(plen, plen_al)
+
+        matched_end_bb = fn.append_basic_block("re.matched")
+        check_anchor_end = fn.append_basic_block("re.check_anchor")
+        main_bb = fn.append_basic_block("re.main")
+        fail_bb = fn.append_basic_block("re.fail")
+
+        # If ppos >= plen, match succeeded
+        b.cbranch(b.icmp_unsigned(">=", ppos, plen), matched_end_bb, check_anchor_end)
+
+        b.position_at_end(matched_end_bb)
+        b.ret(tpos)
+
+        b.position_at_end(check_anchor_end)
+        # Check for $ anchor: pat[ppos] == '$' and ppos+1 >= plen
+        pc = b.zext(load_char(b, pat, ppos), I32_TY)
+        ppos1 = b.add(ppos, ir.Constant(I64_TY, 1))
+        is_dollar = b.icmp_unsigned("==",pc, ir.Constant(I32_TY, ord('$')))
+        dollar_at_end = b.and_(is_dollar, b.icmp_unsigned(">=", ppos1, plen))
+        dollar_matches = b.and_(dollar_at_end, b.icmp_unsigned("==",tpos, tlen))
+        dollar_bb = fn.append_basic_block("re.dollar")
+        b.cbranch(dollar_matches, dollar_bb, main_bb)
+        b.position_at_end(dollar_bb)
+        b.ret(tpos)
+
+        b.position_at_end(main_bb)
+        # tpos >= tlen means text exhausted: fail unless pattern is $ or end
+        text_done = b.icmp_unsigned(">=", tpos, tlen)
+        text_done_bb = fn.append_basic_block("re.text_done")
+        text_ok_bb   = fn.append_basic_block("re.text_ok")
+        b.cbranch(text_done, text_done_bb, text_ok_bb)
+        b.position_at_end(text_done_bb)
+        b.ret(ir.Constant(I64_TY, -1))
+
+        b.position_at_end(text_ok_bb)
+        # Get current pattern char and text char
+        tc = b.zext(load_char(b, text, tpos), I32_TY)
+        # Load pattern char (may be backslash escape)
+        pc0 = b.zext(load_char(b, pat, ppos), I32_TY)
+
+        # Check for quantifier at ppos+1: *, +, ?
+        ppos2 = b.add(ppos, ir.Constant(I64_TY, 2))
+        # Default next_ppos (without quantifier) = ppos + 1
+        # We check if next pattern char is quantifier
+        next_pc_idx = ppos1
+        next_pc = b.zext(load_char(b, pat, next_pc_idx), I32_TY)
+        has_next_pat = b.icmp_unsigned("<", ppos1, plen)
+        is_star     = b.and_(has_next_pat, b.icmp_unsigned("==",next_pc, ir.Constant(I32_TY, ord('*'))))
+        is_plus     = b.and_(has_next_pat, b.icmp_unsigned("==",next_pc, ir.Constant(I32_TY, ord('+'))))
+        is_question = b.and_(has_next_pat, b.icmp_unsigned("==",next_pc, ir.Constant(I32_TY, ord('?'))))
+
+        # Determine if current text char matches current pattern atom
+        # Handle: . \ [ literal
+        def atom_matches_char(bld, pc_val, tpos_val, ppos_val):
+            """Returns i1: does pattern atom at ppos_val match text char at tpos_val?"""
+            tc_val = bld.zext(load_char(bld, text, tpos_val), I32_TY)
+            res_al = bld.alloca(I1_TY)
+            bld.store(ir.Constant(I1_TY, 0), res_al)
+            dot_bb   = fn.append_basic_block("atom.dot")
+            bs_bb    = fn.append_basic_block("atom.bs")
+            cls_head = fn.append_basic_block("atom.cls")
+            lit_bb   = fn.append_basic_block("atom.lit")
+            atom_end = fn.append_basic_block("atom.end")
+            is_dot = bld.icmp_unsigned("==",pc_val, ir.Constant(I32_TY, ord('.')))
+            is_bs  = bld.icmp_unsigned("==",pc_val, ir.Constant(I32_TY, ord('\\')))
+            is_lbr = bld.icmp_unsigned("==",pc_val, ir.Constant(I32_TY, ord('[')))
+            bld.cbranch(is_dot, dot_bb, fn.append_basic_block("atom.not_dot"))
+            bld.position_at_end(dot_bb)
+            # '.' matches anything except newline
+            not_nl = bld.icmp_unsigned("!=",tc_val, ir.Constant(I32_TY, ord('\n')))
+            bld.store(not_nl, res_al)
+            bld.branch(atom_end)
+            not_dot_bb = dot_bb.function.blocks[-2]
+            bld.position_at_end(not_dot_bb)
+            bld.cbranch(is_bs, bs_bb, fn.append_basic_block("atom.not_bs"))
+            bld.position_at_end(bs_bb)
+            # Backslash escape: look at next char
+            esc_char = bld.zext(load_char(bld, pat, bld.add(ppos_val, ir.Constant(I64_TY, 1))), I32_TY)
+            is_d = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('d')))
+            is_w = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('w')))
+            is_s = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('s')))
+            is_D = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('D')))
+            is_W = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('W')))
+            is_S = bld.icmp_unsigned("==",esc_char, ir.Constant(I32_TY, ord('S')))
+            dig = bld.and_(bld.icmp_unsigned(">=", tc_val, ir.Constant(I32_TY, ord('0'))),
+                           bld.icmp_unsigned("<=", tc_val, ir.Constant(I32_TY, ord('9'))))
+            word_lo = bld.and_(bld.icmp_unsigned(">=", tc_val, ir.Constant(I32_TY, ord('a'))),
+                                bld.icmp_unsigned("<=", tc_val, ir.Constant(I32_TY, ord('z'))))
+            word_up = bld.and_(bld.icmp_unsigned(">=", tc_val, ir.Constant(I32_TY, ord('A'))),
+                                bld.icmp_unsigned("<=", tc_val, ir.Constant(I32_TY, ord('Z'))))
+            word_ch = bld.or_(bld.or_(word_lo, word_up), bld.or_(dig,
+                               bld.icmp_unsigned("==",tc_val, ir.Constant(I32_TY, ord('_')))))
+            sp_ch = bld.or_(bld.or_(bld.icmp_unsigned("==",tc_val, ir.Constant(I32_TY, ord(' '))),
+                                     bld.icmp_unsigned("==",tc_val, ir.Constant(I32_TY, ord('\t')))),
+                             bld.or_(bld.icmp_unsigned("==",tc_val, ir.Constant(I32_TY, ord('\n'))),
+                                     bld.icmp_unsigned("==",tc_val, ir.Constant(I32_TY, ord('\r')))))
+            m = bld.select(is_d, dig,
+                bld.select(is_w, word_ch,
+                bld.select(is_s, sp_ch,
+                bld.select(is_D, bld.not_(dig),
+                bld.select(is_W, bld.not_(word_ch),
+                bld.select(is_S, bld.not_(sp_ch),
+                           bld.icmp_unsigned("==",tc_val, esc_char)))))))
+            bld.store(m, res_al)
+            bld.branch(atom_end)
+            not_bs_bb = bs_bb.function.blocks[-2]
+            bld.position_at_end(not_bs_bb)
+            bld.cbranch(is_lbr, cls_head, lit_bb)
+            bld.position_at_end(cls_head)
+            # Character class [...] or [^...]
+            cls_p1 = bld.add(ppos_val, ir.Constant(I64_TY, 1))
+            cls_pc1 = bld.zext(load_char(bld, pat, cls_p1), I32_TY)
+            negate = bld.icmp_unsigned("==",cls_pc1, ir.Constant(I32_TY, ord('^')))
+            cls_inner_start_neg = bld.add(cls_p1, ir.Constant(I64_TY, 1))
+            cls_inner_start_pos = cls_p1
+            cls_inner_start = bld.select(negate, cls_inner_start_neg, cls_inner_start_pos)
+            # Find matching ']': scan from cls_inner_start
+            # (simplified: find ']' from cls_inner_start+1)
+            cls_scan_al = bld.alloca(I64_TY)
+            bld.store(cls_inner_start, cls_scan_al)
+            cls_scan_chk = fn.append_basic_block("cls.scan.chk")
+            cls_scan_bdy = fn.append_basic_block("cls.scan.bdy")
+            cls_scan_ext = fn.append_basic_block("cls.scan.ext")
+            bld.branch(cls_scan_chk)
+            bld.position_at_end(cls_scan_chk)
+            csi = bld.load(cls_scan_al)
+            csi_lt = bld.icmp_unsigned("<", csi, plen)
+            bld.cbranch(csi_lt, cls_scan_bdy, cls_scan_ext)
+            bld.position_at_end(cls_scan_bdy)
+            csc = bld.zext(load_char(bld, pat, csi), I32_TY)
+            is_rbr = bld.icmp_unsigned("==",csc, ir.Constant(I32_TY, ord(']')))
+            bld.cbranch(is_rbr, cls_scan_ext, fn.append_basic_block("cls.scan.cont"))
+            bld.position_at_end(fn.blocks[-1])
+            bld.store(bld.add(csi, ir.Constant(I64_TY, 1)), cls_scan_al)
+            bld.branch(cls_scan_chk)
+            bld.position_at_end(cls_scan_ext)
+            cls_end_pos = bld.load(cls_scan_al)
+            cls_len = bld.sub(cls_end_pos, cls_inner_start)
+            raw_match = char_matches_class(bld, tc_val, pat, cls_inner_start, cls_len)
+            final_match = bld.select(negate, bld.not_(raw_match), raw_match)
+            bld.store(final_match, res_al)
+            bld.branch(atom_end)
+            bld.position_at_end(lit_bb)
+            bld.store(bld.icmp_unsigned("==",tc_val, pc_val), res_al)
+            bld.branch(atom_end)
+            bld.position_at_end(atom_end)
+            return bld.load(res_al)
+
+        # atom size: 1 for normal, 2 for \ escape, varies for [...]
+        def atom_size(bld, ppos_val):
+            """Returns i64 size of pattern atom at ppos_val."""
+            pc_v = bld.zext(load_char(bld, pat, ppos_val), I32_TY)
+            is_bs  = bld.icmp_unsigned("==",pc_v, ir.Constant(I32_TY, ord('\\')))
+            is_lbr = bld.icmp_unsigned("==",pc_v, ir.Constant(I32_TY, ord('[')))
+            # For '[', scan to ']'
+            scan_al = bld.alloca(I64_TY)
+            bld.store(bld.add(ppos_val, ir.Constant(I64_TY, 1)), scan_al)
+            lbr_scan_chk = fn.append_basic_block("asiz.scan.chk")
+            lbr_scan_bdy = fn.append_basic_block("asiz.scan.bdy")
+            lbr_scan_ext = fn.append_basic_block("asiz.scan.ext")
+            lbr_scan_done = fn.append_basic_block("asiz.scan.done")
+            bld.cbranch(is_lbr, lbr_scan_chk, fn.append_basic_block("asiz.not_cls"))
+            bld.position_at_end(lbr_scan_chk)
+            si = bld.load(scan_al)
+            bld.cbranch(bld.icmp_unsigned("<", si, plen), lbr_scan_bdy, lbr_scan_ext)
+            bld.position_at_end(lbr_scan_bdy)
+            sc = bld.zext(load_char(bld, pat, si), I32_TY)
+            bld.cbranch(bld.icmp_unsigned("==",sc, ir.Constant(I32_TY, ord(']'))), lbr_scan_ext,
+                        fn.append_basic_block("asiz.scan.cont"))
+            bld.position_at_end(fn.blocks[-1])
+            bld.store(bld.add(si, ir.Constant(I64_TY, 1)), scan_al)
+            bld.branch(lbr_scan_chk)
+            bld.position_at_end(lbr_scan_ext)
+            cls_size = bld.sub(bld.add(bld.load(scan_al), ir.Constant(I64_TY, 1)), ppos_val)
+            bld.branch(lbr_scan_done)
+            not_cls_bb = lbr_scan_ext.function.blocks[-2]
+            bld.position_at_end(not_cls_bb)
+            bs_size = bld.select(is_bs, ir.Constant(I64_TY, 2), ir.Constant(I64_TY, 1))
+            bld.branch(lbr_scan_done)
+            bld.position_at_end(lbr_scan_done)
+            phi = bld.phi(I64_TY)
+            phi.add_incoming(cls_size, lbr_scan_ext)
+            phi.add_incoming(bs_size, not_cls_bb)
+            return phi
+
+        a_size = atom_size(b, ppos)
+
+        # Quantifier check
+        quant_ppos = b.add(ppos, b.add(a_size, ir.Constant(I64_TY, 0)))  # ppos after atom
+        quant_ppos_plus1 = b.add(quant_ppos, ir.Constant(I64_TY, 1))    # ppos after quantifier
+
+        qc_idx = quant_ppos
+        has_quant_pat = b.icmp_unsigned("<", qc_idx, plen)
+        qc = b.select(has_quant_pat,
+                      b.zext(load_char(b, pat, qc_idx), I32_TY),
+                      ir.Constant(I32_TY, 0))
+        q_is_star = b.and_(has_quant_pat, b.icmp_unsigned("==",qc, ir.Constant(I32_TY, ord('*'))))
+        q_is_plus = b.and_(has_quant_pat, b.icmp_unsigned("==",qc, ir.Constant(I32_TY, ord('+'))))
+        q_is_q    = b.and_(has_quant_pat, b.icmp_unsigned("==",qc, ir.Constant(I32_TY, ord('?'))))
+
+        ppos_after_quant = b.select(b.or_(b.or_(q_is_star, q_is_plus), q_is_q),
+                                    quant_ppos_plus1, quant_ppos)
+
+        # If no quantifier: match atom then recurse
+        no_quant_bb  = fn.append_basic_block("re.no_quant")
+        star_bb      = fn.append_basic_block("re.star")
+        plus_bb      = fn.append_basic_block("re.plus")
+        question_bb  = fn.append_basic_block("re.question")
+        has_quant_bb = fn.append_basic_block("re.has_quant")
+
+        b.cbranch(b.or_(b.or_(q_is_star, q_is_plus), q_is_q), has_quant_bb, no_quant_bb)
+
+        # No quantifier: atom must match, then recurse
+        b.position_at_end(no_quant_bb)
+        matched_nq = atom_matches_char(b, pc0, tpos, ppos)
+        nq_ok_bb  = fn.append_basic_block("re.nq.ok")
+        b.cbranch(matched_nq, nq_ok_bb, fail_bb)
+        b.position_at_end(nq_ok_bb)
+        tpos_next = b.add(tpos, ir.Constant(I64_TY, 1))
+        rec_nq = b.call(fn, [text, tlen, pat, quant_ppos, tpos_next])
+        b.ret(rec_nq)
+
+        b.position_at_end(has_quant_bb)
+        b.cbranch(q_is_star, star_bb, fn.append_basic_block("re.not_star"))
+        b.position_at_end(fn.blocks[-1])
+        b.cbranch(q_is_plus, plus_bb, question_bb)
+
+        # '*': greedy: try matching 0..n times
+        b.position_at_end(star_bb)
+        # Try matching without consuming (0 times) first (lazy doesn't matter here, use greedy)
+        # Try rest of pattern with 0 matches first, then consume 1 and recurse on *
+        res_star_0 = b.call(fn, [text, tlen, pat, ppos_after_quant, tpos])
+        star_0_ok = b.icmp_signed(">=", res_star_0, ir.Constant(I64_TY, 0))
+        star_try1_bb = fn.append_basic_block("re.star.try1")
+        star_ret0_bb = fn.append_basic_block("re.star.ret0")
+        b.cbranch(star_0_ok, star_ret0_bb, star_try1_bb)
+        b.position_at_end(star_ret0_bb)
+        b.ret(res_star_0)
+        b.position_at_end(star_try1_bb)
+        matched_s1 = atom_matches_char(b, pc0, tpos, ppos)
+        star_consume_bb = fn.append_basic_block("re.star.consume")
+        b.cbranch(matched_s1, star_consume_bb, fail_bb)
+        b.position_at_end(star_consume_bb)
+        tpos_s1 = b.add(tpos, ir.Constant(I64_TY, 1))
+        # Re-try star with ppos (same atom, keep *)
+        res_star_rec = b.call(fn, [text, tlen, pat, ppos, tpos_s1])
+        b.ret(res_star_rec)
+
+        # '+': must match at least once
+        b.position_at_end(plus_bb)
+        matched_p1 = atom_matches_char(b, pc0, tpos, ppos)
+        plus_ok_bb = fn.append_basic_block("re.plus.ok")
+        b.cbranch(matched_p1, plus_ok_bb, fail_bb)
+        b.position_at_end(plus_ok_bb)
+        tpos_p1 = b.add(tpos, ir.Constant(I64_TY, 1))
+        # Convert to star for subsequent matches
+        res_plus = b.call(fn, [text, tlen, pat, b.sub(ppos_after_quant, ir.Constant(I64_TY, 1)),
+                               tpos_p1])
+        # ppos_after_quant-1 = quant_ppos (the '*' position) — wrong; use a star at ppos
+        # Actually easier: recursively call with same ppos but as star behavior
+        # Rebuild: after 1 match, recurse with '*' still active (ppos unchanged) but
+        # try ppos_after_quant if no more matches
+        res_plus2 = b.call(fn, [text, tlen, pat, ppos, tpos_p1])
+        b.ret(res_plus2)
+
+        # '?': match 0 or 1
+        b.position_at_end(question_bb)
+        matched_q1 = atom_matches_char(b, pc0, tpos, ppos)
+        q_try1_bb = fn.append_basic_block("re.q.try1")
+        q_skip_bb = fn.append_basic_block("re.q.skip")
+        # Try with 1 match first (greedy)
+        b.cbranch(matched_q1, q_try1_bb, q_skip_bb)
+        b.position_at_end(q_try1_bb)
+        tpos_q1 = b.add(tpos, ir.Constant(I64_TY, 1))
+        res_q1 = b.call(fn, [text, tlen, pat, ppos_after_quant, tpos_q1])
+        q_ok_bb  = fn.append_basic_block("re.q.ok")
+        q_fall_bb = fn.append_basic_block("re.q.fall")
+        b.cbranch(b.icmp_signed(">=", res_q1, ir.Constant(I64_TY, 0)), q_ok_bb, q_fall_bb)
+        b.position_at_end(q_ok_bb)
+        b.ret(res_q1)
+        b.position_at_end(q_fall_bb)
+        b.branch(q_skip_bb)
+        b.position_at_end(q_skip_bb)
+        res_q0 = b.call(fn, [text, tlen, pat, ppos_after_quant, tpos])
+        b.ret(res_q0)
+
+        b.position_at_end(fail_bb)
+        b.ret(ir.Constant(I64_TY, -1))
+        return fn
+
+    def _build_regex_match(self) -> ir.Function:
+        """regex_match(text, pattern) -> str: return first match or empty string."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_regex_match")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        text, pat = fn.args
+
+        engine = self._get_helper("__vx_regex_engine")
+        tlen = b.call(self.strlen_fn, [text])
+        plen = b.call(self.strlen_fn, [pat])
+        empty_gv = self._global_str("")
+
+        # Check for ^ anchor
+        pc0 = b.zext(b.load(b.gep(pat, [ir.Constant(I64_TY, 0)], inbounds=False)), I32_TY)
+        is_anchor = b.icmp_unsigned("==",pc0, ir.Constant(I32_TY, ord('^')))
+        pat_start = b.select(is_anchor, ir.Constant(I64_TY, 1), ir.Constant(I64_TY, 0))
+
+        # Try each starting position
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb = fn.append_basic_block("rm.chk")
+        bdy_bb = fn.append_basic_block("rm.bdy")
+        ext_bb = fn.append_basic_block("rm.ext")
+        found_bb = fn.append_basic_block("rm.found")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<=", iv, tlen), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        end_pos = b.call(engine, [text, tlen, pat, pat_start, iv])
+        found = b.icmp_signed(">=", end_pos, ir.Constant(I64_TY, 0))
+        b.cbranch(found, found_bb, fn.append_basic_block("rm.next"))
+        b.position_at_end(fn.blocks[-1])
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        # If ^ anchor, don't advance
+        anchor_done_bb = fn.append_basic_block("rm.anchor_done")
+        b.cbranch(is_anchor, ext_bb, chk_bb)
+        b.position_at_end(anchor_done_bb)
+        b.branch(ext_bb)
+
+        b.position_at_end(found_bb)
+        # Extract substring [iv, end_pos)
+        match_len = b.sub(end_pos, iv)
+        match_buf = b.call(self.malloc_fn, [b.add(match_len, ir.Constant(I64_TY, 1))])
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        src_ptr = b.gep(text, [iv], inbounds=False)
+        b.call(memcpy_fn, [match_buf, src_ptr, match_len])
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(match_buf, [match_len], inbounds=False))
+        b.ret(match_buf)
+
+        b.position_at_end(ext_bb)
+        b.ret(self._gstr_ptr_const(empty_gv))
+        return fn
+
+    def _build_regex_test(self) -> ir.Function:
+        """regex_test(text, pattern) -> int (1=match, 0=no match)."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_regex_test")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        text, pat = fn.args
+
+        engine = self._get_helper("__vx_regex_engine")
+        tlen = b.call(self.strlen_fn, [text])
+
+        pc0 = b.zext(b.load(b.gep(pat, [ir.Constant(I64_TY, 0)], inbounds=False)), I32_TY)
+        is_anchor = b.icmp_unsigned("==",pc0, ir.Constant(I32_TY, ord('^')))
+        pat_start = b.select(is_anchor, ir.Constant(I64_TY, 1), ir.Constant(I64_TY, 0))
+
+        i_al = b.alloca(I64_TY)
+        b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb = fn.append_basic_block("rt.chk")
+        bdy_bb = fn.append_basic_block("rt.bdy")
+        ext_bb = fn.append_basic_block("rt.ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<=", iv, tlen), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        end_pos = b.call(engine, [text, tlen, pat, pat_start, iv])
+        found = b.icmp_signed(">=", end_pos, ir.Constant(I64_TY, 0))
+        found_bb = fn.append_basic_block("rt.found")
+        b.cbranch(found, found_bb, fn.append_basic_block("rt.next"))
+        b.position_at_end(fn.blocks[-1])
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_anchor, ext_bb, chk_bb)
+        b.position_at_end(found_bb)
+        b.ret(ir.Constant(I64_TY, 1))
+        b.position_at_end(ext_bb)
+        b.ret(ir.Constant(I64_TY, 0))
+        return fn
+
+    def _build_regex_find_all(self) -> ir.Function:
+        """regex_find_all(text, pattern) -> str[]: all non-overlapping matches."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_regex_find_all")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        text, pat = fn.args
+
+        engine  = self._get_helper("__vx_regex_engine")
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        tlen = b.call(self.strlen_fn, [text])
+
+        pc0 = b.zext(b.load(b.gep(pat, [ir.Constant(I64_TY, 0)], inbounds=False)), I32_TY)
+        is_anchor = b.icmp_unsigned("==",pc0, ir.Constant(I32_TY, ord('^')))
+        pat_start = b.select(is_anchor, ir.Constant(I64_TY, 1), ir.Constant(I64_TY, 0))
+
+        # Allocate result array header + data buffer
+        cap = ir.Constant(I64_TY, 64)
+        hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        hdr = b.bitcast(hdr_raw, self.arr_ptr_type)
+        data = b.call(self.malloc_fn, [b.mul(cap, ir.Constant(I64_TY, 8))])
+        z = ir.Constant(I32_TY, 0)
+        b.store(data, b.gep(hdr, [z, z], inbounds=True))
+        b.store(ir.Constant(I64_TY, 0), b.gep(hdr, [z, ir.Constant(I32_TY, 1)], inbounds=True))
+        b.store(cap,                    b.gep(hdr, [z, ir.Constant(I32_TY, 2)], inbounds=True))
+        data_ptr = b.bitcast(data, ir.PointerType(I8PTR))
+
+        i_al   = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        cnt_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), cnt_al)
+        chk_bb = fn.append_basic_block("rfa.chk")
+        bdy_bb = fn.append_basic_block("rfa.bdy")
+        ext_bb = fn.append_basic_block("rfa.ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<=", iv, tlen), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        end_pos = b.call(engine, [text, tlen, pat, pat_start, iv])
+        found = b.icmp_signed(">=", end_pos, ir.Constant(I64_TY, 0))
+        match_bb = fn.append_basic_block("rfa.match")
+        skip_bb  = fn.append_basic_block("rfa.skip")
+        b.cbranch(found, match_bb, skip_bb)
+        b.position_at_end(match_bb)
+        ml = b.sub(end_pos, iv)
+        mbuf = b.call(self.malloc_fn, [b.add(ml, ir.Constant(I64_TY, 1))])
+        b.call(memcpy_fn, [mbuf, b.gep(text, [iv], inbounds=False), ml])
+        b.store(ir.Constant(I8_TY, 0), b.gep(mbuf, [ml], inbounds=False))
+        cnt = b.load(cnt_al)
+        b.store(mbuf, b.gep(data_ptr, [cnt], inbounds=False))
+        b.store(b.add(cnt, ir.Constant(I64_TY, 1)), cnt_al)
+        # Advance past match
+        next_i = b.select(b.icmp_signed(">", ml, ir.Constant(I64_TY, 0)),
+                          b.add(iv, ml),
+                          b.add(iv, ir.Constant(I64_TY, 1)))
+        b.store(next_i, i_al)
+        b.cbranch(is_anchor, ext_bb, chk_bb)
+        b.position_at_end(skip_bb)
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.cbranch(is_anchor, ext_bb, chk_bb)
+        b.position_at_end(ext_bb)
+        final_cnt = b.load(cnt_al)
+        b.store(final_cnt, b.gep(hdr, [z, ir.Constant(I32_TY, 1)], inbounds=True))
+        b.ret(hdr_raw)
+        return fn
+
+    def _build_regex_replace(self) -> ir.Function:
+        """regex_replace(text, pattern, replacement) -> str."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR, I8PTR]),
+                         name="__vx_regex_replace")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        text, pat, repl = fn.args
+
+        engine  = self._get_helper("__vx_regex_engine")
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        tlen    = b.call(self.strlen_fn, [text])
+        repl_len = b.call(self.strlen_fn, [repl])
+
+        pc0 = b.zext(b.load(b.gep(pat, [ir.Constant(I64_TY, 0)], inbounds=False)), I32_TY)
+        is_anchor = b.icmp_unsigned("==",pc0, ir.Constant(I32_TY, ord('^')))
+        pat_start = b.select(is_anchor, ir.Constant(I64_TY, 1), ir.Constant(I64_TY, 0))
+
+        # Allocate output buffer: 4× input + replacements
+        out_cap = b.add(b.mul(tlen, ir.Constant(I64_TY, 4)), ir.Constant(I64_TY, 4096))
+        out_buf = b.call(self.malloc_fn, [out_cap])
+        out_off_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), out_off_al)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb = fn.append_basic_block("rr.chk")
+        bdy_bb = fn.append_basic_block("rr.bdy")
+        ext_bb = fn.append_basic_block("rr.ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_unsigned("<", iv, tlen), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        end_pos = b.call(engine, [text, tlen, pat, pat_start, iv])
+        found = b.icmp_signed(">=", end_pos, ir.Constant(I64_TY, 0))
+        match_bb = fn.append_basic_block("rr.match")
+        copy_bb  = fn.append_basic_block("rr.copy")
+        b.cbranch(found, match_bb, copy_bb)
+
+        b.position_at_end(match_bb)
+        # Write replacement
+        off = b.load(out_off_al)
+        b.call(memcpy_fn, [b.gep(out_buf, [off], inbounds=False), repl, repl_len])
+        b.store(b.add(off, repl_len), out_off_al)
+        # Advance past match
+        ml = b.sub(end_pos, iv)
+        next_i = b.select(b.icmp_signed(">", ml, ir.Constant(I64_TY, 0)),
+                          b.add(iv, ml),
+                          b.add(iv, ir.Constant(I64_TY, 1)))
+        b.store(next_i, i_al)
+        b.cbranch(is_anchor, ext_bb, chk_bb)
+
+        b.position_at_end(copy_bb)
+        # Copy one char from text to output
+        off2 = b.load(out_off_al)
+        char_src = b.gep(text, [iv], inbounds=False)
+        char_dst = b.gep(out_buf, [off2], inbounds=False)
+        b.store(b.load(char_src), char_dst)
+        b.store(b.add(off2, ir.Constant(I64_TY, 1)), out_off_al)
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk_bb)
+
+        b.position_at_end(ext_bb)
+        final_off = b.load(out_off_al)
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [final_off], inbounds=False))
+        b.ret(out_buf)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — TOML parser                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _build_toml_parse_str(self) -> ir.Function:
+        """toml_parse_str(content, key) -> str: find 'key = "value"' or 'key = value'."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_toml_parse_str")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        content, key = fn.args
+
+        empty_gv = self._global_str("")
+        # Build search pattern: key + " = "
+        key_len = b.call(self.strlen_fn, [key])
+        sep_gv  = self._global_str(" = ")
+        sep_len = ir.Constant(I64_TY, 3)
+        pat_buf = b.call(self.malloc_fn, [b.add(b.add(key_len, sep_len), ir.Constant(I64_TY, 1))])
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+        b.call(memcpy_fn, [pat_buf, key, key_len])
+        b.call(memcpy_fn, [b.gep(pat_buf, [key_len], inbounds=False),
+                           self._gstr_ptr_const(sep_gv), sep_len])
+        b.store(ir.Constant(I8_TY, 0),
+                b.gep(pat_buf, [b.add(key_len, sep_len)], inbounds=False))
+
+        found_ptr = b.call(self.strstr_fn, [content, pat_buf])
+        is_null = b.icmp_unsigned("==",b.ptrtoint(found_ptr, I64_TY), ir.Constant(I64_TY, 0))
+        not_found_bb = fn.append_basic_block("tps.notfound")
+        found_bb     = fn.append_basic_block("tps.found")
+        b.cbranch(is_null, not_found_bb, found_bb)
+        b.position_at_end(not_found_bb)
+        b.ret(self._gstr_ptr_const(empty_gv))
+        b.position_at_end(found_bb)
+
+        # val_start = found_ptr + key_len + sep_len
+        val_start = b.gep(found_ptr, [b.add(key_len, sep_len)], inbounds=False)
+        val_c = b.load(val_start)
+        is_quote = b.icmp_unsigned("==",b.zext(val_c, I32_TY), ir.Constant(I32_TY, ord('"')))
+        quoted_bb   = fn.append_basic_block("tps.quoted")
+        unquoted_bb = fn.append_basic_block("tps.unquoted")
+        b.cbranch(is_quote, quoted_bb, unquoted_bb)
+
+        # Quoted: find closing '"'
+        b.position_at_end(quoted_bb)
+        inner_start = b.gep(val_start, [ir.Constant(I64_TY, 1)], inbounds=False)
+        # Find end quote
+        q_scan_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), q_scan_al)
+        inner_len_v = b.call(self.strlen_fn, [inner_start])
+        qscan_chk = fn.append_basic_block("tps.qscan.chk")
+        qscan_bdy = fn.append_basic_block("tps.qscan.bdy")
+        qscan_ext = fn.append_basic_block("tps.qscan.ext")
+        b.branch(qscan_chk)
+        b.position_at_end(qscan_chk)
+        qi = b.load(q_scan_al)
+        b.cbranch(b.icmp_unsigned("<", qi, inner_len_v), qscan_bdy, qscan_ext)
+        b.position_at_end(qscan_bdy)
+        qc = b.load(b.gep(inner_start, [qi], inbounds=False))
+        b.cbranch(b.icmp_unsigned("==",b.zext(qc, I32_TY), ir.Constant(I32_TY, ord('"'))),
+                  qscan_ext, fn.append_basic_block("tps.qscan.cont"))
+        b.position_at_end(fn.blocks[-1])
+        b.store(b.add(qi, ir.Constant(I64_TY, 1)), q_scan_al)
+        b.branch(qscan_chk)
+        b.position_at_end(qscan_ext)
+        str_len = b.load(q_scan_al)
+        out_buf = b.call(self.malloc_fn, [b.add(str_len, ir.Constant(I64_TY, 1))])
+        b.call(memcpy_fn, [out_buf, inner_start, str_len])
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [str_len], inbounds=False))
+        b.ret(out_buf)
+
+        # Unquoted: read until newline or end
+        b.position_at_end(unquoted_bb)
+        uv_len_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), uv_len_al)
+        full_len = b.call(self.strlen_fn, [val_start])
+        uscan_chk = fn.append_basic_block("tps.uscan.chk")
+        uscan_bdy = fn.append_basic_block("tps.uscan.bdy")
+        uscan_ext = fn.append_basic_block("tps.uscan.ext")
+        b.branch(uscan_chk)
+        b.position_at_end(uscan_chk)
+        ui = b.load(uv_len_al)
+        b.cbranch(b.icmp_unsigned("<", ui, full_len), uscan_bdy, uscan_ext)
+        b.position_at_end(uscan_bdy)
+        uc = b.load(b.gep(val_start, [ui], inbounds=False))
+        is_nl = b.icmp_unsigned("==",b.zext(uc, I32_TY), ir.Constant(I32_TY, ord('\n')))
+        is_cr = b.icmp_unsigned("==",b.zext(uc, I32_TY), ir.Constant(I32_TY, ord('\r')))
+        b.cbranch(b.or_(is_nl, is_cr), uscan_ext, fn.append_basic_block("tps.uscan.cont"))
+        b.position_at_end(fn.blocks[-1])
+        b.store(b.add(ui, ir.Constant(I64_TY, 1)), uv_len_al)
+        b.branch(uscan_chk)
+        b.position_at_end(uscan_ext)
+        ulen = b.load(uv_len_al)
+        ubuf = b.call(self.malloc_fn, [b.add(ulen, ir.Constant(I64_TY, 1))])
+        b.call(memcpy_fn, [ubuf, val_start, ulen])
+        b.store(ir.Constant(I8_TY, 0), b.gep(ubuf, [ulen], inbounds=False))
+        b.ret(ubuf)
+        return fn
+
+    def _build_toml_parse_int(self) -> ir.Function:
+        """toml_parse_int(content, key) -> int: find 'key = 123' and return integer."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_toml_parse_int")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        content, key = fn.args
+
+        toml_str_fn = self._get_helper("__vx_toml_parse_str")
+        atoll_fn = self._get_or_declare_fn("atoll", ir.FunctionType(I64_TY, [I8PTR]))
+        val_str = b.call(toml_str_fn, [content, key])
+        result  = b.call(atoll_fn, [val_str])
+        b.ret(result)
+        return fn
+
+    def _build_toml_parse_float(self) -> ir.Function:
+        """toml_parse_float(content, key) -> float: find 'key = 3.14'."""
+        fn = ir.Function(self.module, ir.FunctionType(F64_TY, [I8PTR, I8PTR]),
+                         name="__vx_toml_parse_float")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        content, key = fn.args
+
+        toml_str_fn = self._get_helper("__vx_toml_parse_str")
+        atof_fn = self._get_or_declare_fn("atof", ir.FunctionType(F64_TY, [I8PTR]))
+        val_str = b.call(toml_str_fn, [content, key])
+        result  = b.call(atof_fn, [val_str])
+        b.ret(result)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v10 — JSON array serialization                                      #
+    # ------------------------------------------------------------------ #
+
+    def _build_json_stringify_arr(self) -> ir.Function:
+        """json_stringify_arr(arr: int[]) -> str: serialize as [1,2,3]."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_json_stringify_arr")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw = fn.args[0]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        arr_len  = b.load(b.gep(arr, [z, ir.Constant(I32_TY, 1)], inbounds=True))
+        data_raw = b.load(b.gep(arr, [z, z], inbounds=True))
+        data64   = b.bitcast(data_raw, ir.PointerType(I64_TY))
+
+        # Allocate output: each int can be up to 20 chars + comma + brackets + NUL
+        out_cap = b.add(b.mul(arr_len, ir.Constant(I64_TY, 22)), ir.Constant(I64_TY, 4))
+        out_buf = b.call(self.malloc_fn, [out_cap])
+        off_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), off_al)
+
+        # Write '['
+        b.store(ir.Constant(I8_TY, ord('[')),
+                b.gep(out_buf, [ir.Constant(I64_TY, 0)], inbounds=False))
+        b.store(ir.Constant(I64_TY, 1), off_al)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb = fn.append_basic_block("jsa.chk")
+        bdy_bb = fn.append_basic_block("jsa.bdy")
+        ext_bb = fn.append_basic_block("jsa.ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, arr_len), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        # Add comma if not first
+        needs_comma = b.icmp_signed(">", iv, ir.Constant(I64_TY, 0))
+        comma_bb  = fn.append_basic_block("jsa.comma")
+        nocomma_bb = fn.append_basic_block("jsa.nocomma")
+        b.cbranch(needs_comma, comma_bb, nocomma_bb)
+        b.position_at_end(comma_bb)
+        off_c = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord(',')), b.gep(out_buf, [off_c], inbounds=False))
+        b.store(b.add(off_c, ir.Constant(I64_TY, 1)), off_al)
+        b.branch(nocomma_bb)
+        b.position_at_end(nocomma_bb)
+        # Write integer
+        elem_v = b.load(b.gep(data64, [iv], inbounds=False))
+        off = b.load(off_al)
+        tmp_ptr = b.gep(out_buf, [off], inbounds=False)
+        fmt_gv = self._global_str("%lld")
+        written = b.call(self.sprintf_fn, [tmp_ptr, self._gstr_ptr_const(fmt_gv), elem_v])
+        written64 = b.sext(written, I64_TY)
+        b.store(b.add(off, written64), off_al)
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk_bb)
+        b.position_at_end(ext_bb)
+        # Write ']' and NUL
+        off_f = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord(']')), b.gep(out_buf, [off_f], inbounds=False))
+        off_f1 = b.add(off_f, ir.Constant(I64_TY, 1))
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [off_f1], inbounds=False))
+        b.ret(out_buf)
+        return fn
+
+    def _build_json_stringify_str_arr(self) -> ir.Function:
+        """json_stringify_str_arr(arr: str[]) -> str: serialize as ["a","b"]."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_json_stringify_str_arr")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        arr_raw = fn.args[0]
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        arr_len  = b.load(b.gep(arr, [z, ir.Constant(I32_TY, 1)], inbounds=True))
+        data_raw = b.load(b.gep(arr, [z, z], inbounds=True))
+        data_ptrs = b.bitcast(data_raw, ir.PointerType(I8PTR))
+
+        # Large output buffer (can be improved with realloc; 64KB is reasonable)
+        out_buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 65536)])
+        off_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), off_al)
+        memcpy_fn = self._get_or_declare("memcpy",
+            ir.FunctionType(I8PTR, [I8PTR, I8PTR, I64_TY]))
+
+        # Write '['
+        b.store(ir.Constant(I8_TY, ord('[')),
+                b.gep(out_buf, [ir.Constant(I64_TY, 0)], inbounds=False))
+        b.store(ir.Constant(I64_TY, 1), off_al)
+
+        i_al = b.alloca(I64_TY); b.store(ir.Constant(I64_TY, 0), i_al)
+        chk_bb = fn.append_basic_block("jssa.chk")
+        bdy_bb = fn.append_basic_block("jssa.bdy")
+        ext_bb = fn.append_basic_block("jssa.ext")
+        b.branch(chk_bb)
+        b.position_at_end(chk_bb)
+        iv = b.load(i_al)
+        b.cbranch(b.icmp_signed("<", iv, arr_len), bdy_bb, ext_bb)
+        b.position_at_end(bdy_bb)
+        # Comma
+        needs_comma = b.icmp_signed(">", iv, ir.Constant(I64_TY, 0))
+        comma_bb  = fn.append_basic_block("jssa.comma")
+        nocomma_bb = fn.append_basic_block("jssa.nocomma")
+        b.cbranch(needs_comma, comma_bb, nocomma_bb)
+        b.position_at_end(comma_bb)
+        off_c = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord(',')), b.gep(out_buf, [off_c], inbounds=False))
+        b.store(b.add(off_c, ir.Constant(I64_TY, 1)), off_al)
+        b.branch(nocomma_bb)
+        b.position_at_end(nocomma_bb)
+        # Write opening quote
+        off_q = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord('"')), b.gep(out_buf, [off_q], inbounds=False))
+        b.store(b.add(off_q, ir.Constant(I64_TY, 1)), off_al)
+        # Write string
+        elem_ptr = b.load(b.gep(data_ptrs, [iv], inbounds=False))
+        elem_len = b.call(self.strlen_fn, [elem_ptr])
+        off_s = b.load(off_al)
+        b.call(memcpy_fn, [b.gep(out_buf, [off_s], inbounds=False), elem_ptr, elem_len])
+        b.store(b.add(off_s, elem_len), off_al)
+        # Write closing quote
+        off_q2 = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord('"')), b.gep(out_buf, [off_q2], inbounds=False))
+        b.store(b.add(off_q2, ir.Constant(I64_TY, 1)), off_al)
+        b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
+        b.branch(chk_bb)
+        b.position_at_end(ext_bb)
+        off_f = b.load(off_al)
+        b.store(ir.Constant(I8_TY, ord(']')), b.gep(out_buf, [off_f], inbounds=False))
+        off_f1 = b.add(off_f, ir.Constant(I64_TY, 1))
+        b.store(ir.Constant(I8_TY, 0), b.gep(out_buf, [off_f1], inbounds=False))
+        b.ret(out_buf)
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  HTTP server (#51)                                                   #
+    # ------------------------------------------------------------------ #
+    #
+    # Route table layout (global static array, max 64 routes):
+    #   __vx_http_route_count  : i64
+    #   __vx_http_routes       : [64 x {i64, i8*, i8*, i8*}]
+    #     fields: {server_fd, method_str, path_str, handler_fn_ptr}
+    #
+    # http_serve(port) → i64  : create listening socket, return fd
+    # http_add_route(fd, method, path, handler) → void
+    # http_listen(fd) → void  : accept loop; parse request; dispatch handler
+    # ------------------------------------------------------------------ #
+
+    def _build_http_serve(self) -> ir.Function:
+        """http_serve(port: i64) -> i64 — open TCP listen socket for HTTP."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY]),
+                         name="__vx_http_serve")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        port = fn.args[0]
+        # Delegate to existing tcp_listen helper
+        listen_fn = self._get_helper("__vx_tcp_listen")
+        srv = b.call(listen_fn, [port])
+        b.ret(srv)
+        return fn
+
+    def _build_http_add_route(self) -> ir.Function:
+        """http_add_route(server_fd, method, path, handler_ptr) -> void."""
+        fn = ir.Function(self.module,
+                         ir.FunctionType(VOID_TY, [I64_TY, I8PTR, I8PTR, I8PTR]),
+                         name="__vx_http_add_route")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        srv_fd, method_s, path_s, handler_p = fn.args
+
+        # Ensure route table globals exist
+        route_count_name = "__vx_http_route_count"
+        if route_count_name not in [g.name for g in self.module.global_variables]:
+            rc_gv = ir.GlobalVariable(self.module, I64_TY, name=route_count_name)
+            rc_gv.linkage = "internal"
+            rc_gv.initializer = ir.Constant(I64_TY, 0)
+        else:
+            rc_gv = self.module.get_global(route_count_name)
+
+        route_ty = ir.LiteralStructType([I64_TY, I8PTR, I8PTR, I8PTR])
+        routes_arr_ty = ir.ArrayType(route_ty, 64)
+        routes_name = "__vx_http_routes"
+        if routes_name not in [g.name for g in self.module.global_variables]:
+            rt_gv = ir.GlobalVariable(self.module, routes_arr_ty, name=routes_name)
+            rt_gv.linkage = "internal"
+            rt_gv.initializer = ir.Constant(routes_arr_ty, None)
+        else:
+            rt_gv = self.module.get_global(routes_name)
+
+        # idx = route_count; route_count += 1
+        idx = b.load(rc_gv)
+        new_count = b.add(idx, ir.Constant(I64_TY, 1))
+        b.store(new_count, rc_gv)
+
+        # routes[idx] = {srv_fd, method_s, path_s, handler_p}
+        slot_ptr = b.gep(rt_gv, [ir.Constant(I32_TY, 0), idx], inbounds=False)
+        # store each field
+        for field_idx, val in enumerate([srv_fd, method_s, path_s, handler_p]):
+            fp = b.gep(slot_ptr, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, field_idx)],
+                       inbounds=True)
+            b.store(val, fp)
+
+        b.ret_void()
+        return fn
+
+    def _build_http_listen(self) -> ir.Function:
+        """http_listen(server_fd) — blocking accept loop; parse HTTP; dispatch routes."""
+        import sys as _sys
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_http_listen")
+        fn.linkage = "private"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        srv_fd = fn.args[0]
+
+        accept_fn = self._get_helper("__vx_tcp_accept")
+        recv_fn   = self._get_helper("__vx_tcp_recv")
+        send_fn   = self._get_helper("__vx_tcp_send")
+        close_fn  = self._get_helper("__vx_tcp_close")
+
+        # Ensure globals exist (may already be created by add_route)
+        rc_name = "__vx_http_route_count"
+        rts_name = "__vx_http_routes"
+        route_ty = ir.LiteralStructType([I64_TY, I8PTR, I8PTR, I8PTR])
+        routes_arr_ty = ir.ArrayType(route_ty, 64)
+        try:
+            rc_gv  = self.module.get_global(rc_name)
+            rt_gv  = self.module.get_global(rts_name)
+        except KeyError:
+            rc_gv = ir.GlobalVariable(self.module, I64_TY, name=rc_name)
+            rc_gv.linkage = "internal"
+            rc_gv.initializer = ir.Constant(I64_TY, 0)
+            rt_gv = ir.GlobalVariable(self.module, routes_arr_ty, name=rts_name)
+            rt_gv.linkage = "internal"
+            rt_gv.initializer = ir.Constant(routes_arr_ty, None)
+
+        # Reusable 4096-byte recv buffer (stack-allocated in this fn)
+        buf_al = b.alloca(ir.ArrayType(I8_TY, 4096), name="http_buf")
+        buf_ptr = b.bitcast(buf_al, I8PTR)
+
+        # HTTP 200 response header template
+        ok_hdr = self._gstr_ptr(self._global_str(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"))
+        not_found = self._gstr_ptr(self._global_str(
+            "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found"))
+
+        # Accept loop
+        loop_bb  = fn.append_basic_block("http.loop")
+        body_bb  = fn.append_basic_block("http.body")
+        b.branch(loop_bb)
+
+        # loop: conn = accept(srv_fd); recv request; dispatch
+        b2 = ir.IRBuilder(loop_bb)
+        conn = b2.call(accept_fn, [srv_fd])
+        b2.branch(body_bb)
+
+        b3 = ir.IRBuilder(body_bb)
+        # recv request line
+        b3.call(recv_fn, [conn, ir.Constant(I64_TY, 4095)])
+        # (We don't parse the request deeply — just call first matching route handler)
+        # Iterate route table looking for a match on this server fd
+        i_al = b3.alloca(I64_TY, name="ri")
+        b3.store(ir.Constant(I64_TY, 0), i_al)
+        nroutes = b3.load(rc_gv)
+
+        chk_bb  = fn.append_basic_block("http.chk")
+        match_bb = fn.append_basic_block("http.match")
+        done_bb  = fn.append_basic_block("http.done")
+        b3.branch(chk_bb)
+
+        bc = ir.IRBuilder(chk_bb)
+        ri = bc.load(i_al)
+        bc.cbranch(bc.icmp_signed("<", ri, nroutes), match_bb, done_bb)
+
+        bm = ir.IRBuilder(match_bb)
+        slot = bm.gep(rt_gv, [ir.Constant(I32_TY, 0), ri], inbounds=False)
+        # Get handler pointer (field 3)
+        hp = bm.gep(slot, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 3)], inbounds=True)
+        handler_ptr = bm.load(hp)
+        # Call handler(conn, buf_ptr) where handler is fn(i64, i8*) -> i8*
+        handler_ty = ir.FunctionType(I8PTR, [I64_TY, I8PTR])
+        handler_fn = bm.bitcast(handler_ptr, ir.PointerType(handler_ty))
+        resp_body = bm.call(handler_fn, [conn, buf_ptr])
+        # Send response header + body
+        bm.call(send_fn, [conn, ok_hdr])
+        bm.call(send_fn, [conn, resp_body])
+        bm.call(close_fn, [conn])
+        # Increment and continue loop
+        new_ri = bm.add(ri, ir.Constant(I64_TY, 1))
+        bm.store(new_ri, i_al)
+        bm.branch(chk_bb)
+
+        bd = ir.IRBuilder(done_bb)
+        # No route matched: send 404
+        bd.call(send_fn, [conn, not_found])
+        bd.call(close_fn, [conn])
+        bd.branch(loop_bb)
+
         return fn
 
 

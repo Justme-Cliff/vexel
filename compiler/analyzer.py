@@ -262,6 +262,19 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "sha256_real":       (["str"],                VX_STR),
     # v9 — select/multiplex (#70)
     "chan_select":       (["int[]"],              VX_INT),
+    # v10 — hashing extras
+    "sha512":            (["str"],                VX_STR),
+    "hmac_sha256":       (["str", "str"],         VX_STR),
+    # v10 — TOML parsing
+    "toml_parse_str":    (["str", "str"],         VX_STR),
+    "toml_parse_int":    (["str", "str"],         VX_INT),
+    "toml_parse_float":  (["str", "str"],         VX_FLOAT),
+    # v10 — JSON array serialization
+    "json_stringify_arr":     (["int[]"],         VX_STR),
+    "json_stringify_str_arr": (["str[]"],         VX_STR),
+    # v10 — HTTP server (#51)
+    "http_serve":             (["int"],           VX_INT),
+    "http_listen":            (["int"],           VX_VOID),
 }
 
 
@@ -338,6 +351,13 @@ class Analyzer:
                     key = f"{decl.name}.{variant}"
                     self._global_types[key] = VX_INT
                     self._scopes[0][key]    = VX_INT
+                # Register enum methods (#13)
+                for m in getattr(decl, 'methods', []):
+                    mn = f"{decl.name}__{m.name}"
+                    self._fn_sigs[mn] = FnSig(
+                        [(p.name, p.type_name) for p in m.params],
+                        m.return_type or VX_VOID,
+                    )
             elif isinstance(decl, TypeAlias):
                 self._type_aliases[decl.name] = decl.target
             elif isinstance(decl, NamespaceHint):
@@ -392,6 +412,20 @@ class Analyzer:
                     self._scopes[0][vkey] = decl.name
                     if variant.fields:
                         self._struct_fields[variant.name] = [(f.name, f.type_name) for f in variant.fields]
+                # Register enum methods (#13)
+                for m in getattr(decl, 'methods', []):
+                    mn = f"{decl.name}__{m.name}"
+                    self._fn_sigs[mn] = FnSig(
+                        [(p.name, p.type_name) for p in m.params],
+                        m.return_type or VX_VOID,
+                    )
+            elif isinstance(decl, ErrorDecl):
+                # Register error type as a struct (#29)
+                fields = [("__code", VX_INT)] + [(f.name, f.type_name) for f in decl.fields]
+                self._struct_fields[decl.name] = fields
+                # Register constructor function: ErrorName(fields...) -> ErrorName
+                params = [(f.name, f.type_name) for f in decl.fields]
+                self._fn_sigs[decl.name] = FnSig(params, decl.name)
 
         # Pass 2 — analyze function bodies
         for decl in program.declarations:
