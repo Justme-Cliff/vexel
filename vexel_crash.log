@@ -1,0 +1,6 @@
+=== Vexel Crash Report ===
+Version: Vexel v12
+Error: index out of bounds
+Function: __vx_bounds_check
+Platform: windows
+---

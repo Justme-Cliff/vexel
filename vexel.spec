@@ -5,7 +5,11 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('vexel-vscode/vexel-1.1.0.vsix', 'vexel-vscode'),
+        ('compiler', 'compiler'),
+        ('stdlib', 'stdlib'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

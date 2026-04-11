@@ -2,8 +2,9 @@
   "name": "vexel",
   "displayName": "Vexel",
   "description": "Syntax highlighting for the Vexel programming language (.vx files)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "vexel",
+  "icon": "images/logo.png",
   "engines": { "vscode": "^1.60.0" },
   "categories": ["Programming Languages"],
   "contributes": {

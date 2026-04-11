@@ -36,6 +36,52 @@ from compiler.ast_nodes import (
 
 
 # ------------------------------------------------------------------ #
+#  VS Code extension auto-install                                     #
+# ------------------------------------------------------------------ #
+
+def _try_install_vscode_ext() -> None:
+    """On first run, silently install the bundled VS Code extension."""
+    import shutil, platform
+
+    if platform.system() == "Windows":
+        marker_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "vexel")
+    else:
+        marker_dir = os.path.expanduser("~/.vexel")
+
+    marker = os.path.join(marker_dir, ".vscode_ext_installed")
+    if os.path.exists(marker):
+        return
+
+    # Locate the bundled VSIX (works both from source and PyInstaller exe)
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+
+    vsix = os.path.join(base, "vexel-vscode", "vexel-1.1.0.vsix")
+    if not os.path.exists(vsix):
+        return
+
+    code_cmd = shutil.which("code")
+    if not code_cmd:
+        return
+
+    try:
+        result = subprocess.run(
+            [code_cmd, "--install-extension", vsix, "--force"],
+            capture_output=True, timeout=60
+        )
+        os.makedirs(marker_dir, exist_ok=True)
+        status = "installed" if result.returncode == 0 else "failed"
+        with open(marker, "w") as f:
+            f.write(status)
+        if result.returncode == 0:
+            print("[vexel] VS Code extension installed automatically.")
+    except Exception:
+        pass  # silently fail — VS Code may not be installed or code not in PATH
+
+
+# ------------------------------------------------------------------ #
 #  Helpers                                                             #
 # ------------------------------------------------------------------ #
 
@@ -639,6 +685,7 @@ _NO_FILE_CMDS = {"repl", "build"}
 
 
 def main() -> None:
+    _try_install_vscode_ext()
     parser = argparse.ArgumentParser(prog="vexel", description="The Vexel compiler")
     parser.add_argument("command", choices=list(_COMMANDS), help="Action to perform")
     parser.add_argument("file", nargs="?", default=None, help="Vexel source file (.vx)")
