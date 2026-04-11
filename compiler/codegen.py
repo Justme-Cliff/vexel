@@ -8316,8 +8316,8 @@ class Compiler:
         return fn
 
     def _get_or_create_global(self, name: str, ll_ty, init) -> ir.GlobalVariable:
-        for gv in self.module.global_variables:
-            if gv.name == name:
+        for gv in self.module.global_values:
+            if isinstance(gv, ir.GlobalVariable) and gv.name == name:
                 return gv
         gv = ir.GlobalVariable(self.module, ll_ty, name=name)
         gv.linkage = "common"
