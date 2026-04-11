@@ -309,6 +309,15 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     # v11 — stack trace (#76)
     "stack_trace":            ([],               VX_STR),
     "panic_with_trace":       (["str"],           VX_VOID),
+    # v12 — Result/Option helpers (#9)
+    "Ok":                     (["any"],           VX_STR),   # returns Result[T]
+    "Err":                    (["any"],           VX_STR),   # returns Err[T]
+    "Some":                   (["any"],           VX_STR),   # returns Option[T]
+    "None_":                  ([],               VX_STR),   # returns Option[void]
+    "is_ok":                  (["any"],           VX_BOOL),
+    "is_err":                 (["any"],           VX_BOOL),
+    "unwrap":                 (["any"],           VX_STR),   # returns inner Ok value
+    "unwrap_err":             (["any"],           VX_STR),   # returns inner Err value
 }
 
 
@@ -949,15 +958,30 @@ class Analyzer:
                 if node.args:
                     at = self._infer_expr(node.args[0])
                     return VX_FLOAT if at == VX_FLOAT else VX_INT
-            # For generic functions, substitute T
+            # For generic functions, substitute T and check bounds (#8)
             if sig.type_params and node.args:
                 at = self._infer_expr(node.args[0])
+                inferred_t = at[:-2] if at.endswith("[]") else at
+                # #8 Generic bounds: verify concrete type satisfies interface constraint
+                fn_decl = self._generic_fns.get(node.func)
+                if fn_decl and getattr(fn_decl, 'type_bounds', {}):
+                    for tp, iface_name in fn_decl.type_bounds.items():
+                        # Find which arg index corresponds to this type param
+                        # (simplified: check first type param against first arg)
+                        concrete = inferred_t
+                        if iface_name in self._interfaces:
+                            iface = self._interfaces[iface_name]
+                            impl_key = (concrete, iface_name)
+                            if impl_key not in self._impls:
+                                self._err(
+                                    f"Type '{concrete}' does not implement '{iface_name}' "
+                                    f"(required by generic bound on '{node.func}')",
+                                    node,
+                                )
                 # Infer return type by substituting type param
                 ret = sig.return_type
                 if sig.type_params:
                     tp = sig.type_params[0]
-                    # Infer T from first arg
-                    inferred_t = at[:-2] if at.endswith("[]") else at
                     ret = ret.replace(tp, inferred_t) if tp in ret else ret
                 return ret
             for a in node.args: self._infer_expr(a)

@@ -119,8 +119,12 @@ class Compiler:
         # Schedule of vtable slots to fill: [(vtable_gv, vtable_ll, [fn,...])]
         self._vtable_init_list: list = []
 
+        # #9 Result/Option: whether result boxing is initialized
+        self._result_type_defined: bool = False
+
         self._define_array_type()
         self._define_dict_type()
+        self._define_result_type()
         self._declare_externs()
 
     # ------------------------------------------------------------------ #
@@ -142,6 +146,67 @@ class Compiler:
             # vals_ptr → array of i64  (type-erased values)
             self.dict_type.set_body(I8PTR, I8PTR, I64_TY, I64_TY)
         self.dict_ptr_type = ir.PointerType(self.dict_type)
+
+    def _define_result_type(self):
+        """#9 Result/Option: {i64 ok, i8* val} — 16-byte heap-allocated tagged union.
+        ok=1 means Ok/Some (val points to value), ok=0 means Err/None (val is error)."""
+        self.result_type = self.module.context.get_identified_type("vx_result")
+        if self.result_type.is_opaque:
+            self.result_type.set_body(I64_TY, I8PTR)
+        self.result_ptr_type = ir.PointerType(self.result_type)
+
+    def _build_result_box(self, ok: int, val: ir.Value) -> ir.Value:
+        """Allocate a vx_result{ok, val} on the heap and return i8* to it.
+        For integer/bool values, store the integer reinterpreted as i8* (no heap cell needed).
+        For pointer values, store the pointer directly."""
+        sz = ir.Constant(I64_TY, 16)
+        ptr = self.builder.call(self.malloc_fn, [sz])
+        typed = self.builder.bitcast(ptr, self.result_ptr_type)
+        # Store ok flag
+        ok_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)], inbounds=True)
+        self.builder.store(ir.Constant(I64_TY, ok), ok_slot)
+        # Store value: integers are reinterpret-cast to i8* (no indirection needed)
+        if isinstance(val.type, ir.PointerType):
+            val_as_i8 = self.builder.bitcast(val, I8PTR)
+        elif isinstance(val.type, ir.IntType):
+            # Extend to i64 then inttoptr — recoverable later with ptrtoint
+            val64 = self.builder.sext(val, I64_TY) if val.type.width < 64 else val
+            val_as_i8 = self.builder.inttoptr(val64, I8PTR)
+        elif isinstance(val.type, ir.DoubleType):
+            # Bit-cast float to i64 then inttoptr
+            as_int = self.builder.bitcast(val, I64_TY)
+            val_as_i8 = self.builder.inttoptr(as_int, I8PTR)
+        else:
+            val_as_i8 = ir.Constant(I8PTR, None)
+        val_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)], inbounds=True)
+        self.builder.store(val_as_i8, val_slot)
+        return ptr  # return i8* to the result struct
+
+    def _build_result_unwrap(self, result_ptr: ir.Value, vx_type: str) -> ir.Value:
+        """Unwrap the .val from a vx_result*, return typed value.
+        Reverses the encoding used in _build_result_box."""
+        typed = self.builder.bitcast(result_ptr, self.result_ptr_type)
+        val_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)], inbounds=True)
+        val_i8 = self.builder.load(val_slot)
+        ll_ty = self._vx_to_llvm(vx_type)
+        if isinstance(ll_ty, ir.PointerType):
+            return self.builder.bitcast(val_i8, ll_ty)
+        elif isinstance(ll_ty, ir.IntType):
+            # Reverse inttoptr: ptrtoint back to i64 then trunc if needed
+            as_int = self.builder.ptrtoint(val_i8, I64_TY)
+            return self.builder.trunc(as_int, ll_ty) if ll_ty.width < 64 else as_int
+        elif isinstance(ll_ty, ir.DoubleType):
+            as_int = self.builder.ptrtoint(val_i8, I64_TY)
+            return self.builder.bitcast(as_int, F64_TY)
+        else:
+            return self.builder.ptrtoint(val_i8, I64_TY)
+
+    def _build_result_is_ok(self, result_ptr: ir.Value) -> ir.Value:
+        """Return i1: true if result is Ok/Some."""
+        typed = self.builder.bitcast(result_ptr, self.result_ptr_type)
+        ok_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)], inbounds=True)
+        ok_val = self.builder.load(ok_slot)
+        return self.builder.icmp_signed("!=", ok_val, ir.Constant(I64_TY, 0))
 
     # ------------------------------------------------------------------ #
     #  External declarations                                               #
@@ -223,6 +288,12 @@ class Compiler:
         self.popen_fn   = _fn(I8PTR,  I8PTR, I8PTR,        name="popen")
         self.pclose_fn  = _fn(I32_TY, I8PTR,               name="pclose")
 
+        # fprintf for crash reporter (#110)
+        self.fprintf_fn = _fn(I32_TY, I8PTR, I8PTR, name="fprintf", vararg=True)
+        # strcat/strcpy for string building
+        self.strcat_fn  = _fn(I8PTR,  I8PTR, I8PTR, name="strcat")
+        self.strcpy_fn  = _fn(I8PTR,  I8PTR, I8PTR, name="strcpy")
+
         # v4 error state (global buffer defined in this module)
         arr_ty = ir.ArrayType(I8_TY, 512)
         self._vx_error_buf = ir.GlobalVariable(self.module, arr_ty,
@@ -294,8 +365,11 @@ class Compiler:
         # Nullable types: T? → i8* (opaque pointer; null means null, non-null is boxed value)
         if vx.endswith("?"):
             return I8PTR
-        # Function type: fn(int)->float → i8* (opaque fn pointer)
-        if vx.startswith("fn("):
+        # Function type: fn(int)->float → i8* (opaque fn/closure pointer)
+        if vx.startswith("fn(") or vx.startswith("closure:fn("):
+            return I8PTR
+        # Result/Option types are i8* pointers to vx_result struct
+        if vx.startswith("Result[") or vx.startswith("Err[") or vx.startswith("Option["):
             return I8PTR
         if vx in self._structs:
             return ir.PointerType(self._structs[vx]["llvm_type"])
@@ -464,9 +538,10 @@ class Compiler:
             self._overload_table[base_name] = table_entries
 
         for d in program.declarations:
+            is_pub = isinstance(d, PubDecl)
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
             if isinstance(_d, FnDecl) and not _d.type_params:
-                self._declare_fn(_d)
+                self._declare_fn(_d, is_pub=is_pub)
             elif isinstance(_d, ExternFnDecl):
                 self._compile_extern_fn(_d)
 
@@ -534,16 +609,23 @@ class Compiler:
     # ------------------------------------------------------------------ #
 
     def _emit_panic(self, msg: str, line: int = 0):
-        """Emit printf + exit(1) + unreachable for an unconditional panic.
-        Includes source line info in debug mode for stack trace (#76)."""
+        """Emit printf + crash dump + exit(1) + unreachable (#76, #110).
+        In debug mode includes source location; always writes vexel_crash.log."""
         if self.debug_mode and line:
             loc = f" (line {line})"
         elif self.debug_mode and self.current_fn:
             loc = f" (in {self.current_fn.name})"
         else:
             loc = ""
-        fmt = self._gstr_ptr(self._global_str(f"vexel panic: {msg}{loc}\n"))
+        full_msg = f"vexel panic: {msg}{loc}"
+        fmt = self._gstr_ptr(self._global_str(full_msg + "\n"))
         self.builder.call(self.printf, [fmt])
+        # #110 Crash reporter: write vexel_crash.log
+        crash_fn_h = self._get_helper("__vx_write_crash_log")
+        msg_ptr = self._gstr_ptr(self._global_str(full_msg))
+        fn_name_ptr = self._gstr_ptr(self._global_str(
+            self.current_fn.name if self.current_fn else "unknown"))
+        self.builder.call(crash_fn_h, [msg_ptr, fn_name_ptr])
         self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
         self.builder.unreachable()
 
@@ -883,30 +965,54 @@ class Compiler:
     # ------------------------------------------------------------------ #
 
     def _compile_error_prop(self, node: 'ErrorPropExpr') -> tuple[ir.Value, str]:
-        """Compile expr? — if value is null/0, return early from current function."""
+        """Compile expr? — early return if Err/None or null/0 (#10/#9).
+        If the value is a vx_result (returned from Ok/Err), check the .ok tag.
+        Otherwise fall back to null/0 check."""
         val, vt = self._compile_expr(node.expr)
-        # Determine if the value is a pointer or integer
         ret_ty = self.current_fn.ftype.return_type
         ok_bb   = self.current_fn.append_basic_block("prop.ok")
         fail_bb = self.current_fn.append_basic_block("prop.null")
-        if isinstance(val.type, ir.PointerType):
-            as_int  = self.builder.ptrtoint(val, I64_TY)
-            is_null = self.builder.icmp_unsigned("==", as_int, ir.Constant(I64_TY, 0))
+
+        is_result = vt.startswith("Result[") or vt.startswith("Err[") or vt.startswith("Option[")
+        if is_result and isinstance(val.type, ir.PointerType):
+            # Result/Option: check the .ok tag field
+            is_ok_bit = self._build_result_is_ok(val)
+            self.builder.cbranch(is_ok_bit, ok_bb, fail_bb)
+            # On fail: return the error result as-is (propagate it)
+            self.builder.position_at_end(fail_bb)
+            self._emit_defers()
+            if ret_ty == VOID_TY:
+                self.builder.ret_void()
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(self.builder.bitcast(val, ret_ty))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+            # On ok: unwrap the inner value
+            self.builder.position_at_end(ok_bb)
+            inner_vt = vt[7:-1] if vt.startswith("Result[") and vt.endswith("]") else "str"
+            try:
+                unwrapped = self._build_result_unwrap(val, inner_vt)
+                return unwrapped, inner_vt
+            except Exception:
+                return val, vt
         else:
-            is_null = self.builder.icmp_signed("==", val, ir.Constant(val.type, 0))
-        self.builder.cbranch(is_null, fail_bb, ok_bb)
-        # Null branch: emit defers and return zero/null
-        self.builder.position_at_end(fail_bb)
-        self._emit_defers()
-        if ret_ty == VOID_TY:
-            self.builder.ret_void()
-        elif isinstance(ret_ty, ir.PointerType):
-            self.builder.ret(ir.Constant(ret_ty, None))
-        else:
-            self.builder.ret(ir.Constant(ret_ty, 0))
-        # OK branch: continue with the value
-        self.builder.position_at_end(ok_bb)
-        return val, vt
+            # Fallback: null/0 check (for raw pointers and ints)
+            if isinstance(val.type, ir.PointerType):
+                as_int  = self.builder.ptrtoint(val, I64_TY)
+                is_null = self.builder.icmp_unsigned("==", as_int, ir.Constant(I64_TY, 0))
+            else:
+                is_null = self.builder.icmp_signed("==", val, ir.Constant(val.type, 0))
+            self.builder.cbranch(is_null, fail_bb, ok_bb)
+            self.builder.position_at_end(fail_bb)
+            self._emit_defers()
+            if ret_ty == VOID_TY:
+                self.builder.ret_void()
+            elif isinstance(ret_ty, ir.PointerType):
+                self.builder.ret(ir.Constant(ret_ty, None))
+            else:
+                self.builder.ret(ir.Constant(ret_ty, 0))
+            self.builder.position_at_end(ok_bb)
+            return val, vt
 
     # ------------------------------------------------------------------ #
     #  Generic struct monomorphization (#6)                               #
@@ -994,13 +1100,17 @@ class Compiler:
     #  Functions                                                           #
     # ------------------------------------------------------------------ #
 
-    def _declare_fn(self, d: FnDecl):
+    def _declare_fn(self, d: FnDecl, is_pub: bool = False):
         sig        = self.analysis.fn_sigs[d.name]
         param_tys  = [self._vx_to_llvm(t) for _, t in sig.params]
         ret_ty     = I32_TY if d.name == "main" and sig.return_type == "void" \
                      else self._vx_to_llvm(sig.return_type)
         fn_ty      = ir.FunctionType(ret_ty, param_tys)
         fn         = ir.Function(self.module, fn_ty, name=d.name)
+        # #90 Dead code elimination: non-public, non-main functions use internal linkage
+        # so LLVM can eliminate them if unreachable.
+        if d.name != "main" and not is_pub:
+            fn.linkage = "internal"
         for i, (pname, _) in enumerate(sig.params):
             fn.args[i].name = pname
         self._functions[d.name] = {"fn": fn, "sig": sig}
@@ -1086,10 +1196,18 @@ class Compiler:
             "fat_ll":       fat_ty,
         }
 
+    # Built-in operator interface names — not real interfaces, just sugar for method registration
+    _OP_INTERFACES = frozenset({"Add","Sub","Mul","Div","Mod","Eq","Ne","Lt","Le","Gt","Ge","Neg","Not"})
+
     def _declare_impl(self, decl: 'ImplDecl'):
         """Forward-declare impl method functions and create zero-initialised vtable global."""
         iface_info = self._interfaces.get(decl.interface_name)
         if iface_info is None:
+            # #12 Operator overloading: impl Add/Sub/... for Struct — register directly
+            if decl.interface_name in self._OP_INTERFACES:
+                for m in decl.methods:
+                    self._declare_struct_method(decl.struct_name, m)
+                return
             raise CodegenError(f"Unknown interface '{decl.interface_name}'")
 
         vtable_ll = iface_info["vtable_ll"]
@@ -1165,6 +1283,11 @@ class Compiler:
 
     def _compile_impl(self, decl: 'ImplDecl'):
         """Compile the body of each impl method."""
+        # #12 Operator overloading: compile methods registered via _declare_struct_method
+        if decl.interface_name in self._OP_INTERFACES:
+            for m in decl.methods:
+                self._compile_struct_method(decl.struct_name, m)
+            return
         iface_info  = self._interfaces[decl.interface_name]
         struct_info = self._structs.get(decl.struct_name)
         if struct_info is None:
@@ -1568,7 +1691,8 @@ class Compiler:
         elif vt == "bool":
             t = self._gstr_ptr(self._global_str("true"))
             f = self._gstr_ptr(self._global_str("false"))
-            s = self.builder.select(val, t, f)
+            cond_i1 = self.builder.trunc(val, I1_TY) if val.type != I1_TY else val
+            s = self.builder.select(cond_i1, t, f)
             fmt = self._gstr_ptr(self._global_str("%s"))
             self.builder.call(self.printf, [fmt, s])
         elif vt.endswith("?"):
@@ -1622,6 +1746,13 @@ class Compiler:
     def _compile_if(self, node: IfStmt):
         cond, _ = self._compile_expr(node.condition)
         fn      = self.current_fn
+        # Normalize condition to i1
+        if cond.type != I1_TY:
+            if isinstance(cond.type, ir.IntType):
+                cond = self.builder.trunc(cond, I1_TY) if cond.type.width > 1 else cond
+            elif isinstance(cond.type, ir.PointerType):
+                as_int = self.builder.ptrtoint(cond, I64_TY)
+                cond   = self.builder.icmp_unsigned("!=", as_int, ir.Constant(I64_TY, 0))
 
         then_b  = fn.append_basic_block("if.then")
         else_b  = fn.append_basic_block("if.else")
@@ -1692,6 +1823,76 @@ class Compiler:
             if not self.builder.block.is_terminated:
                 self.builder.branch(merge_b)
 
+            self.builder.position_at_end(merge_b)
+            return
+
+        # #9 Result/Option pattern matching: Ok(x), Err(e), Some(x), None
+        is_result_vt = (vt.startswith("Result[") or vt.startswith("Err[")
+                        or vt.startswith("Option["))
+        has_result_pattern = any(
+            isinstance(case, MatchCaseADT) and case.variant_name in ("Ok", "Err", "Some", "None")
+            for case in node.cases
+        )
+        if (is_result_vt or has_result_pattern) and isinstance(val.type, ir.PointerType):
+            merge_b = fn.append_basic_block("match.merge")
+            for case in node.cases:
+                if not isinstance(case, MatchCaseADT):
+                    continue
+                vname = case.variant_name
+                next_b = fn.append_basic_block("match.next")
+                if vname in ("Ok", "Some"):
+                    is_ok_bit = self._build_result_is_ok(val)
+                    case_b = fn.append_basic_block("match.ok.body")
+                    self.builder.cbranch(is_ok_bit, case_b, next_b)
+                    self.builder.position_at_end(case_b)
+                    self._push_scope()
+                    if case.bindings:
+                        inner_vt = "str"
+                        if vt.startswith("Result[") and vt.endswith("]"):
+                            inner_vt = vt[7:-1]
+                        try:
+                            inner_val = self._build_result_unwrap(val, inner_vt)
+                            inner_al  = self.builder.alloca(inner_val.type, name=case.bindings[0])
+                            self.builder.store(inner_val, inner_al)
+                            self._declare(case.bindings[0], inner_al, inner_vt)
+                        except Exception:
+                            pass
+                    for s in case.body:
+                        if self.builder.block.is_terminated: break
+                        self._compile_stmt(s)
+                    self._pop_scope()
+                    if not self.builder.block.is_terminated:
+                        self.builder.branch(merge_b)
+                elif vname in ("Err", "None"):
+                    is_ok_bit = self._build_result_is_ok(val)
+                    not_ok = self.builder.not_(is_ok_bit)
+                    case_b = fn.append_basic_block("match.err.body")
+                    self.builder.cbranch(not_ok, case_b, next_b)
+                    self.builder.position_at_end(case_b)
+                    self._push_scope()
+                    if case.bindings and vname == "Err":
+                        try:
+                            inner_val = self._build_result_unwrap(val, "str")
+                            inner_al  = self.builder.alloca(inner_val.type, name=case.bindings[0])
+                            self.builder.store(inner_val, inner_al)
+                            self._declare(case.bindings[0], inner_al, "str")
+                        except Exception:
+                            pass
+                    for s in case.body:
+                        if self.builder.block.is_terminated: break
+                        self._compile_stmt(s)
+                    self._pop_scope()
+                    if not self.builder.block.is_terminated:
+                        self.builder.branch(merge_b)
+                self.builder.position_at_end(next_b)
+            if node.default_body:
+                self._push_scope()
+                for s in node.default_body:
+                    if self.builder.block.is_terminated: break
+                    self._compile_stmt(s)
+                self._pop_scope()
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_b)
             self.builder.position_at_end(merge_b)
             return
 
@@ -2849,6 +3050,26 @@ class Compiler:
             result = self.builder.call(fn, compiled_args)
             return result, sig.return_type
 
+        # Impl method dispatch on concrete types (#8 generic bounds):
+        # When a generic fn is monomorphized with T=Dog and calls x.to_str(),
+        # obj_t is "Dog" — look for Dog__to_str__impl_<Iface>.
+        impl_prefix = f"{obj_t}__{method}__impl_"
+        for fn_key, fi in self._functions.items():
+            if fn_key.startswith(impl_prefix):
+                sig = fi["sig"]
+                fn  = fi["fn"]
+                # self arg: cast obj to i8*
+                self_arg = self.builder.bitcast(obj_v, I8PTR) if isinstance(obj_v.type, ir.PointerType) else obj_v
+                compiled_args = [self_arg]
+                non_self_params = [(n, t) for n, t in sig.params if n != "self"]
+                for arg_node, (_, pt) in zip(node.args, non_self_params):
+                    av, at = self._compile_expr(arg_node)
+                    if pt == "float" and at == "int":
+                        av = self.builder.sitofp(av, F64_TY)
+                    compiled_args.append(av)
+                result = self.builder.call(fn, compiled_args)
+                return result, sig.return_type
+
         # HTTP server methods (#51): server.get(path, handler), server.listen()
         if obj_t == "int" and method == "listen":
             # http server fd: call __vx_http_listen(fd)
@@ -3247,6 +3468,8 @@ class Compiler:
             "__vx_tls_close":            self._build_tls_close,
             # v11 — stack trace (#76)
             "__vx_stack_trace":          self._build_stack_trace,
+            # v12 — crash reporter (#110)
+            "__vx_write_crash_log":      self._build_write_crash_log,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -4073,17 +4296,25 @@ class Compiler:
             return self.builder.icmp_signed(op, lv, rv), "bool"
 
         # #12 Operator overloading: check for __op__ method on struct type
-        _op_method_map = {
+        # #12 Operator overloading: check for struct method matching op.
+        # Two naming conventions: __add__ (Dunder style) and plain 'add' (impl Add style).
+        _op_dunder_map = {
             "+":  "__add__", "-":  "__sub__", "*":  "__mul__", "/":  "__div__",
             "%":  "__mod__", "==": "__eq__",  "!=": "__ne__",
             "<":  "__lt__",  ">":  "__gt__",  "<=": "__le__", ">=": "__ge__",
         }
-        if op in _op_method_map and lt in self._structs:
-            method_key = f"{lt}__{_op_method_map[op]}"
-            fi = self._functions.get(method_key)
-            if fi is not None:
-                result = self.builder.call(fi["fn"], [lv, rv])
-                return result, fi["sig"].return_type
+        _op_plain_map = {
+            "+": "add", "-": "sub", "*": "mul", "/": "div",
+            "%": "mod", "==": "eq", "!=": "ne",
+            "<": "lt",  ">": "gt", "<=": "le", ">=": "ge",
+        }
+        if op in _op_dunder_map and lt in self._structs:
+            for method_name in (_op_dunder_map[op], _op_plain_map[op]):
+                method_key = f"{lt}__{method_name}"
+                fi = self._functions.get(method_key)
+                if fi is not None:
+                    result = self.builder.call(fi["fn"], [lv, rv])
+                    return result, fi["sig"].return_type
 
         arith = {
             "+": (self.builder.fadd, self.builder.add),
@@ -4985,18 +5216,82 @@ class Compiler:
             fn_h = self._get_helper("__vx_str_char_at_utf8")
             return self.builder.call(fn_h, [s_v, i_v]), "int"
 
-        # --- Result/Option type helpers (#14) ---
+        # --- Result/Option type helpers (#9) ---
         if name in ("Ok", "Some"):
-            # Ok(val) — return the value directly (no boxing in this impl)
+            # Ok(val) / Some(val) → vx_result{ok=1, val=boxed(val)}
             val_v, vt = self._compile_expr(node.args[0])
-            return val_v, vt
+            boxed = self._build_result_box(1, val_v)
+            return boxed, f"Result[{vt}]"
 
-        if name in ("Err", "None_"):
-            # Err(msg) — return null/zero as error sentinel
+        if name == "Err":
+            # Err(msg) → vx_result{ok=0, val=boxed(msg)}
             if node.args:
                 val_v, vt = self._compile_expr(node.args[0])
-                return val_v, vt
-            return ir.Constant(I64_TY, 0), "null"
+                boxed = self._build_result_box(0, val_v)
+                return boxed, f"Err[{vt}]"
+            # Err() with no args → vx_result{ok=0, null}
+            null_str = self._gstr_ptr(self._global_str("error"))
+            boxed = self._build_result_box(0, null_str)
+            return boxed, "Err[str]"
+
+        if name == "None_":
+            # None_() → vx_result{ok=0, null}
+            null_ptr = ir.Constant(I8PTR, None)
+            sz = ir.Constant(I64_TY, 16)
+            ptr = self.builder.call(self.malloc_fn, [sz])
+            typed = self.builder.bitcast(ptr, self.result_ptr_type)
+            ok_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 0)], inbounds=True)
+            self.builder.store(ir.Constant(I64_TY, 0), ok_slot)
+            val_slot = self.builder.gep(typed, [ir.Constant(I32_TY, 0), ir.Constant(I32_TY, 1)], inbounds=True)
+            self.builder.store(null_ptr, val_slot)
+            return ptr, "Option[void]"
+
+        if name == "is_ok":
+            # is_ok(result) → bool
+            val_v, _ = self._compile_expr(node.args[0])
+            val_as_ptr = self.builder.bitcast(val_v, I8PTR) if not isinstance(val_v.type, ir.PointerType) else val_v
+            is_ok_bit = self._build_result_is_ok(val_as_ptr)
+            return self.builder.zext(is_ok_bit, I64_TY), "bool"
+
+        if name == "is_err":
+            # is_err(result) → bool
+            val_v, _ = self._compile_expr(node.args[0])
+            val_as_ptr = self.builder.bitcast(val_v, I8PTR) if not isinstance(val_v.type, ir.PointerType) else val_v
+            is_ok_bit = self._build_result_is_ok(val_as_ptr)
+            not_ok = self.builder.not_(is_ok_bit)
+            return self.builder.zext(not_ok, I64_TY), "bool"
+
+        if name == "unwrap":
+            # unwrap(result) → inner Ok value (panics if Err/None)
+            val_v, vt = self._compile_expr(node.args[0])
+            val_as_ptr = self.builder.bitcast(val_v, I8PTR) if not isinstance(val_v.type, ir.PointerType) else val_v
+            is_ok_bit = self._build_result_is_ok(val_as_ptr)
+            ok_bb   = self.current_fn.append_basic_block("unwrap.ok")
+            fail_bb = self.current_fn.append_basic_block("unwrap.fail")
+            self.builder.cbranch(is_ok_bit, ok_bb, fail_bb)
+            self.builder.position_at_end(fail_bb)
+            self._emit_panic("unwrap() called on Err/None")
+            self.builder.position_at_end(ok_bb)
+            inner_vt = "str"
+            if vt.startswith("Result[") and vt.endswith("]"):
+                inner_vt = vt[7:-1]
+            return self._build_result_unwrap(val_as_ptr, inner_vt), inner_vt
+
+        if name == "unwrap_err":
+            # unwrap_err(result) → inner Err value (panics if Ok/Some)
+            val_v, vt = self._compile_expr(node.args[0])
+            val_as_ptr = self.builder.bitcast(val_v, I8PTR) if not isinstance(val_v.type, ir.PointerType) else val_v
+            is_ok_bit = self._build_result_is_ok(val_as_ptr)
+            err_bb  = self.current_fn.append_basic_block("unwrap_err.ok")
+            fail_bb = self.current_fn.append_basic_block("unwrap_err.fail")
+            self.builder.cbranch(is_ok_bit, fail_bb, err_bb)
+            self.builder.position_at_end(fail_bb)
+            self._emit_panic("unwrap_err() called on Ok/Some")
+            self.builder.position_at_end(err_bb)
+            inner_vt = "str"
+            if vt.startswith("Err[") and vt.endswith("]"):
+                inner_vt = vt[4:-1]
+            return self._build_result_unwrap(val_as_ptr, inner_vt), inner_vt
 
         # --- v8 New builtins ---
 
@@ -5737,35 +6032,61 @@ class Compiler:
         return result, sig.return_type
 
     def _is_fn_type(self, vx_type: str) -> bool:
-        return vx_type.startswith("fn(")
+        return vx_type.startswith("fn(") or vx_type.startswith("closure:fn(")
 
     def _compile_indirect_call(self, info: dict, args) -> tuple[ir.Value, str]:
-        """Call through a function pointer variable."""
-        fn_type_str = info["vx_type"]  # "fn(int,float)->str"
+        """Call through a function pointer variable.
+        #7: if vx_type starts with 'closure:', the stored value is a {fn_ptr, env_ptr}
+        struct. Extract fn_ptr from slot 0 and env_ptr from slot 8, then call
+        fn_ptr(args..., env_ptr).  Otherwise call as a bare function pointer."""
+        fn_type_str = info["vx_type"]
         ptr_val = self.builder.load(info["ptr"])
 
+        # Determine if this is a closure struct or a bare fn ptr
+        is_closure = fn_type_str.startswith("closure:")
+        bare_type_str = fn_type_str[8:] if is_closure else fn_type_str
+
         # Parse fn type string: fn(T1,T2,...)->R
-        assert fn_type_str.startswith("fn(")
-        arrow_idx = fn_type_str.rindex("->")
-        params_str = fn_type_str[3:fn_type_str.index(")")]
-        ret_str    = fn_type_str[arrow_idx+2:]
+        if not bare_type_str.startswith("fn("):
+            # Not a function type — treat as raw call
+            return self.builder.call(self.builder.bitcast(ptr_val,
+                ir.PointerType(ir.FunctionType(VOID_TY, []))), []), "void"
+
+        arrow_idx = bare_type_str.rindex("->")
+        params_str = bare_type_str[3:bare_type_str.index(")")]
+        ret_str    = bare_type_str[arrow_idx+2:]
         param_types = [t.strip() for t in params_str.split(",") if t.strip()]
         ret_type   = ret_str.strip()
 
-        ll_params = [self._vx_to_llvm(pt) for pt in param_types]
-        ll_ret    = self._vx_to_llvm(ret_type)
-        fn_ty     = ir.FunctionType(ll_ret, ll_params)
-        fn_ptr_ty = ir.PointerType(fn_ty)
-
-        # Cast i8* → fn_ptr_ty and call
-        typed_fn = self.builder.bitcast(ptr_val, fn_ptr_ty)
         compiled_args = []
-        for arg_node, pt in zip(args, param_types):
+        for i, arg_node in enumerate(args):
             av, at = self._compile_expr(arg_node)
+            pt = param_types[i] if i < len(param_types) else "any"
             if pt == "float" and at == "int":
                 av = self.builder.sitofp(av, F64_TY)
             compiled_args.append(av)
-        result = self.builder.call(typed_fn, compiled_args)
+
+        if is_closure:
+            # Extract fn_ptr from slot 0 and env_ptr from slot 8
+            fn_slot_ptr = self.builder.bitcast(ptr_val, ir.PointerType(I8PTR))
+            fn_ptr_raw  = self.builder.load(fn_slot_ptr)
+            env_slot_raw = self.builder.gep(ptr_val, [ir.Constant(I64_TY, 8)], inbounds=False)
+            env_slot_ptr = self.builder.bitcast(env_slot_raw, ir.PointerType(I8PTR))
+            env_ptr      = self.builder.load(env_slot_ptr)
+            # Build fn type with env as last param: ret(T1, T2, ..., i8*)
+            ll_params = [self._vx_to_llvm(pt) for pt in param_types] + [I8PTR]
+            ll_ret    = self._vx_to_llvm(ret_type)
+            fn_ty     = ir.FunctionType(ll_ret, ll_params)
+            typed_fn  = self.builder.bitcast(fn_ptr_raw, ir.PointerType(fn_ty))
+            result = self.builder.call(typed_fn, compiled_args + [env_ptr])
+        else:
+            ll_params = [self._vx_to_llvm(pt) for pt in param_types]
+            ll_ret    = self._vx_to_llvm(ret_type)
+            fn_ty     = ir.FunctionType(ll_ret, ll_params)
+            fn_ptr_ty = ir.PointerType(fn_ty)
+            typed_fn  = self.builder.bitcast(ptr_val, fn_ptr_ty)
+            result = self.builder.call(typed_fn, compiled_args)
+
         return result, ret_type
 
     def _dispatch_overload(self, name: str, node: 'Call') -> tuple[ir.Value, str]:
@@ -5917,20 +6238,18 @@ class Compiler:
         env_fields = [(vx_t, ll_t) for (_, vx_t, _, ll_t) in captures]
 
         # --- Allocate closure env on the heap ---
+        # #7 Mutable closure captures: store the alloca POINTER in the env (not the value).
+        # This lets the lambda write back to the outer variable's storage cell.
         if captures:
-            total_sz = sum(8 for _ in captures)   # fixed 8 bytes per slot (simplification)
+            total_sz = len(captures) * 8  # one i8* (pointer) per captured var
             env_ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, total_sz)])
-            # Store captured values into env
             for i, (name, vx_t, src_al, ll_t) in enumerate(captures):
-                val = self.builder.load(src_al)
-                # Store as i64/i8* for uniform size
+                # Store the alloca pointer itself (cast to i8*) so reads/writes go
+                # through the outer variable's stack slot — mutations write back.
                 slot_ptr = self.builder.gep(env_ptr, [ir.Constant(I64_TY, i * 8)], inbounds=False)
-                typed_ptr = self.builder.bitcast(slot_ptr, ir.PointerType(ll_t))
-                if ll_t.width < 64 if isinstance(ll_t, ir.IntType) else False:
-                    val = self.builder.sext(val, I64_TY)
-                    self.builder.store(val, self.builder.bitcast(slot_ptr, ir.PointerType(I64_TY)))
-                else:
-                    self.builder.store(val, typed_ptr)
+                ptr_slot = self.builder.bitcast(slot_ptr, ir.PointerType(I8PTR))
+                src_as_i8 = self.builder.bitcast(src_al, I8PTR)
+                self.builder.store(src_as_i8, ptr_slot)
         else:
             env_ptr = ir.Constant(I8PTR, None)
 
@@ -5968,16 +6287,20 @@ class Compiler:
             al = self.builder.alloca(self._vx_to_llvm(p.type_name), name=p.name)
             self.builder.store(fn_ir.args[i], al)
             self._declare(p.name, al, p.type_name)
-        # Unpack captured vars from env arg (last param)
+        # Unpack captured vars from env arg (last param).
+        # #7 Mutable captures: env holds i8* pointers to outer allocas.
+        # We load the pointer and use it directly as our alloca for this var,
+        # so writes inside the lambda write through to the outer scope.
         if captures:
             env_arg = fn_ir.args[-1]
             for i, (name, vx_t, _src_al, ll_t) in enumerate(captures):
                 slot_ptr = self.builder.gep(env_arg, [ir.Constant(I64_TY, i * 8)], inbounds=False)
-                typed_ptr = self.builder.bitcast(slot_ptr, ir.PointerType(ll_t))
-                cap_al = self.builder.alloca(ll_t, name=f"cap_{name}")
-                val = self.builder.load(typed_ptr)
-                self.builder.store(val, cap_al)
-                self._declare(name, cap_al, vx_t)
+                # Load the i8* pointer stored for this capture
+                ptr_slot = self.builder.bitcast(slot_ptr, ir.PointerType(I8PTR))
+                outer_ptr_i8 = self.builder.load(ptr_slot)
+                # Cast back to the correct typed pointer and use as alloca
+                outer_al = self.builder.bitcast(outer_ptr_i8, ir.PointerType(ll_t))
+                self._declare(name, outer_al, vx_t)
         # Compile body
         for stmt in node.body:
             if self.builder.block.is_terminated: break
@@ -5995,23 +6318,18 @@ class Compiler:
         self.current_fn   = saved_fn
         self._scope_stack = saved_scopes
 
-        # --- Build a closure struct: {fn_ptr: i8*, env: i8*} on the heap ---
-        # For now, just return the fn_ptr cast to i8* and store env separately
-        # Since we can't easily pass env through the fn(int)->int type signature,
-        # we use a trampoline approach: when no captures, return fn directly.
+        # --- Always build a closure struct: {fn_ptr: i8*, env: i8*} ---
+        # This uniform representation lets the call site always use the same
+        # dispatch: load fn_ptr from [0], env_ptr from [8], call fn_ptr(args, env_ptr).
+        # #7: env_ptr is null for non-capturing lambdas.
         fn_ptr = self.builder.bitcast(fn_ir, I8PTR)
-
-        if captures:
-            # Store closure = {fn_ptr, env_ptr} in a 16-byte heap struct
-            closure_ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
-            fn_slot = self.builder.bitcast(closure_ptr, ir.PointerType(I8PTR))
-            self.builder.store(fn_ptr, fn_slot)
-            env_slot_raw = self.builder.gep(closure_ptr, [ir.Constant(I64_TY, 8)], inbounds=False)
-            env_slot = self.builder.bitcast(env_slot_raw, ir.PointerType(I8PTR))
-            self.builder.store(env_ptr, env_slot)
-            return closure_ptr, fn_type_str
-
-        return fn_ptr, fn_type_str
+        closure_ptr = self.builder.call(self.malloc_fn, [ir.Constant(I64_TY, 16)])
+        fn_slot = self.builder.bitcast(closure_ptr, ir.PointerType(I8PTR))
+        self.builder.store(fn_ptr, fn_slot)
+        env_slot_raw = self.builder.gep(closure_ptr, [ir.Constant(I64_TY, 8)], inbounds=False)
+        env_slot = self.builder.bitcast(env_slot_raw, ir.PointerType(I8PTR))
+        self.builder.store(env_ptr, env_slot)
+        return closure_ptr, "closure:" + fn_type_str
 
     def _find_free_vars(self, body: list, param_names: set) -> list:
         """
@@ -8117,7 +8435,8 @@ class Compiler:
         elif vt == "bool":
             t = self._gstr_ptr(self._global_str("true"))
             f = self._gstr_ptr(self._global_str("false"))
-            s = self.builder.select(val, t, f)
+            cond_i1 = self.builder.trunc(val, I1_TY) if val.type != I1_TY else val
+            s = self.builder.select(cond_i1, t, f)
             fmt = self._gstr_ptr(self._global_str("%s"))
             self.builder.call(self.sprintf_fn, [buf, fmt, s])
         else:
@@ -10047,6 +10366,11 @@ class Compiler:
         b.position_at_end(fail_bb)
         fmt_gv = self._global_str("vexel: index out of bounds (index=%lld, len=%lld)\n")
         b.call(self.printf, [self._gstr_ptr_const(fmt_gv), idx, length])
+        # #110 Crash reporter: write crash log for bounds violations too
+        crash_fn_h = self._get_helper("__vx_write_crash_log")
+        msg_ptr  = self._gstr_ptr_b(b, "index out of bounds")
+        fn_ptr   = self._gstr_ptr_b(b, "__vx_bounds_check")
+        b.call(crash_fn_h, [msg_ptr, fn_ptr])
         b.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
         b.unreachable()
         b.position_at_end(ok_bb)
@@ -12343,6 +12667,51 @@ class Compiler:
         else:
             stub = self._gstr_ptr(self._global_str("\n  [stack trace: build with -g for symbols]\n"))
             b.ret(stub)
+        return fn
+
+    def _build_write_crash_log(self) -> ir.Function:
+        """__vx_write_crash_log(msg: i8*, fn_name: i8*) — write crash dump to vexel_crash.log (#110)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR, I8PTR]),
+                         name="__vx_write_crash_log")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        msg_arg    = fn.args[0]
+        fn_name_arg = fn.args[1]
+        # Open crash log file
+        log_path = self._gstr_ptr_b(b, "vexel_crash.log")
+        mode_w   = self._gstr_ptr_b(b, "w")
+        fp = b.call(self.fopen_fn, [log_path, mode_w])
+        # Check fp != null
+        ok_bb  = fn.append_basic_block("log.ok")
+        end_bb = fn.append_basic_block("log.end")
+        fp_int = b.ptrtoint(fp, I64_TY)
+        is_null = b.icmp_unsigned("==", fp_int, ir.Constant(I64_TY, 0))
+        b.cbranch(is_null, end_bb, ok_bb)
+        b.position_at_end(ok_bb)
+        # Write header: "=== Vexel Crash Report ===\n"
+        hdr = self._gstr_ptr_b(b, "=== Vexel Crash Report ===\n")
+        b.call(self.fprintf_fn, [fp, hdr])
+        # Write version
+        ver = self._gstr_ptr_b(b, "Version: Vexel v12\n")
+        b.call(self.fprintf_fn, [fp, ver])
+        # Write message
+        msg_fmt = self._gstr_ptr_b(b, "Error: %s\n")
+        b.call(self.fprintf_fn, [fp, msg_fmt, msg_arg])
+        # Write function name
+        fn_fmt = self._gstr_ptr_b(b, "Function: %s\n")
+        b.call(self.fprintf_fn, [fp, fn_fmt, fn_name_arg])
+        # Write platform
+        import sys as _sys
+        platform_str = "windows" if _sys.platform == "win32" else _sys.platform
+        plat = self._gstr_ptr_b(b, f"Platform: {platform_str}\n")
+        b.call(self.fprintf_fn, [fp, plat])
+        # Write footer
+        ftr = self._gstr_ptr_b(b, "---\n")
+        b.call(self.fprintf_fn, [fp, ftr])
+        b.call(self.fclose_fn, [fp])
+        b.branch(end_bb)
+        b.position_at_end(end_bb)
+        b.ret_void()
         return fn
 
 

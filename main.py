@@ -31,6 +31,7 @@ from compiler.analyzer import Analyzer, FnSig
 from compiler.ast_nodes import (
     Program, ImportStmt, FnDecl, StructDecl,
     GlobalLet, GlobalConst, EnumDecl, NamespaceHint,
+    PubDecl, PrivDecl,
 )
 
 
@@ -51,7 +52,16 @@ def read_source(path: str) -> str:
 
 
 def _prefix_decl(decl, prefix: str):
-    """Return a deep copy of *decl* with its name prepended by *prefix*__."""
+    """Return a deep copy of *decl* with its name prepended by *prefix*__.
+    #33 pub/priv: PrivDecl from imported files are dropped (not exported).
+    PubDecl inner is unwrapped and exported. Bare decls default to exported.
+    """
+    # Priv declarations are private to the defining file — don't export them
+    if isinstance(decl, PrivDecl):
+        return None
+    # Pub declarations are explicitly exported — unwrap and prefix the inner
+    if isinstance(decl, PubDecl):
+        return _prefix_decl(decl.inner, prefix)
     d = copy.deepcopy(decl)
     if isinstance(d, (FnDecl, StructDecl, GlobalLet, GlobalConst, EnumDecl)):
         d.name = f"{prefix}__{d.name}"
@@ -108,7 +118,16 @@ def resolve_imports(program: Program, base_dir: str) -> Program:
             else:
                 if isinstance(decl, FnDecl) and decl.name == "main" and cur_dir != base_dir:
                     continue
-                merged.append(_prefix_decl(decl, alias) if alias else decl)
+                # Also skip main inside PubDecl/PrivDecl wrappers from imported files
+                inner = decl.inner if isinstance(decl, (PubDecl, PrivDecl)) else decl
+                if isinstance(inner, FnDecl) and inner.name == "main" and cur_dir != base_dir:
+                    continue
+                if alias:
+                    result = _prefix_decl(decl, alias)
+                    if result is not None:
+                        merged.append(result)
+                else:
+                    merged.append(decl)
 
     process(program, base_dir)
     return Program(merged)

@@ -119,12 +119,18 @@ class Parser:
         self._expect(TT.FN)
         name = self._expect(TT.IDENT).value
 
-        # Generic type params: fn name[T, U](...)
+        # Generic type params: fn name[T, U](...)  or  fn name[T: Interface](...)
         type_params = []
+        type_bounds = {}  # #8 {T: "Interface"}
         if self._match(TT.LBRACKET):
             self._advance()
             while not self._match(TT.RBRACKET):
-                type_params.append(self._expect(TT.IDENT).value)
+                tp = self._expect(TT.IDENT).value
+                type_params.append(tp)
+                if self._match(TT.COLON):   # T: Interface bound
+                    self._advance()
+                    bound = self._parse_type()
+                    type_bounds[tp] = bound
                 if self._match(TT.COMMA):
                     self._advance()
             self._expect(TT.RBRACKET)
@@ -171,7 +177,7 @@ class Parser:
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         body = self._parse_block()
-        node = FnDecl(name, params, ret, body, type_params, named_returns)
+        node = FnDecl(name, params, ret, body, type_params, named_returns, type_bounds)
         node.line = start_line
         return node
 

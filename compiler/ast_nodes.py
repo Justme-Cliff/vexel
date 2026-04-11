@@ -216,6 +216,7 @@ class FnDecl(Node):
     body:         List[Node]
     type_params:  List[str] = field(default_factory=list)  # [T, U, ...]
     named_returns: List[tuple] = field(default_factory=list)  # [(name, type), ...]
+    type_bounds:  dict = field(default_factory=dict)  # #8 {T: "Interface", U: "Printable"}
 
 @dataclass
 class StructField(Node):
