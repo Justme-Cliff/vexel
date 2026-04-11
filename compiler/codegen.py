@@ -2591,6 +2591,11 @@ class Compiler:
                 return ir.Constant(F64_TY, math.nan), "float"
             info = self._lookup(node.name)
             if info is None:
+                # Allow using a function name as a raw function pointer value
+                # (used by signal_handle and similar builtins that take fn pointers)
+                if node.name in self._functions:
+                    fn_ir = self._functions[node.name]["fn"]
+                    return self.builder.bitcast(fn_ir, I8PTR), "fn_ptr"
                 raise CodegenError(f"Undefined variable '{node.name}'")
             vx_t = self._resolve_type(info["vx_type"])
             return self.builder.load(info["ptr"], name=node.name), vx_t
