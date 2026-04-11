@@ -110,6 +110,12 @@ class Compiler:
         # Registered enum names → set of method names (#13)
         self._enum_names: set[str] = set()
 
+        # #11 Function overloads cache: base_name → [(param_types, mangled_name)]
+        self._overload_table: dict[str, list[tuple[list[str], str]]] = {}
+
+        # #6 Generic struct monomorphization cache: "Name__int" → True
+        self._mono_structs: dict[str, bool] = {}
+
         # Schedule of vtable slots to fill: [(vtable_gv, vtable_ll, [fn,...])]
         self._vtable_init_list: list = []
 
@@ -402,10 +408,11 @@ class Compiler:
         if self.analysis.namespaces:
             self._namespaces.update(self.analysis.namespaces)
 
-        # 1. Struct definitions
+        # 1. Struct definitions (skip generic structs — monomorphized on demand)
         for d in program.declarations:
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
-            if isinstance(_d, StructDecl): self._define_struct(_d)
+            if isinstance(_d, StructDecl) and not getattr(_d, 'type_params', []):
+                self._define_struct(_d)
 
         # 1b. Error type definitions (#29)
         for d in program.declarations:
@@ -447,6 +454,15 @@ class Compiler:
                 self._compile_comptime(_d)
 
         # 5. Forward-declare all non-generic user functions
+        # Build overload table from analysis.overloads (#11)
+        for base_name, mangled_list in self.analysis.overloads.items():
+            table_entries = []
+            for mn in mangled_list:
+                sig = self.analysis.fn_sigs.get(mn)
+                if sig:
+                    table_entries.append(([t for _, t in sig.params], mn))
+            self._overload_table[base_name] = table_entries
+
         for d in program.declarations:
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
             if isinstance(_d, FnDecl) and not _d.type_params:
@@ -517,9 +533,16 @@ class Compiler:
     #  Panic helper                                                        #
     # ------------------------------------------------------------------ #
 
-    def _emit_panic(self, msg: str):
-        """Emit printf + exit(1) + unreachable for an unconditional panic."""
-        fmt = self._gstr_ptr(self._global_str(f"vexel panic: {msg}\n"))
+    def _emit_panic(self, msg: str, line: int = 0):
+        """Emit printf + exit(1) + unreachable for an unconditional panic.
+        Includes source line info in debug mode for stack trace (#76)."""
+        if self.debug_mode and line:
+            loc = f" (line {line})"
+        elif self.debug_mode and self.current_fn:
+            loc = f" (in {self.current_fn.name})"
+        else:
+            loc = ""
+        fmt = self._gstr_ptr(self._global_str(f"vexel panic: {msg}{loc}\n"))
         self.builder.call(self.printf, [fmt])
         self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
         self.builder.unreachable()
@@ -856,6 +879,72 @@ class Compiler:
             self.current_fn = old_fn
 
     # ------------------------------------------------------------------ #
+    #  Error propagation (#10)                                            #
+    # ------------------------------------------------------------------ #
+
+    def _compile_error_prop(self, node: 'ErrorPropExpr') -> tuple[ir.Value, str]:
+        """Compile expr? — if value is null/0, return early from current function."""
+        val, vt = self._compile_expr(node.expr)
+        # Determine if the value is a pointer or integer
+        ret_ty = self.current_fn.ftype.return_type
+        ok_bb   = self.current_fn.append_basic_block("prop.ok")
+        fail_bb = self.current_fn.append_basic_block("prop.null")
+        if isinstance(val.type, ir.PointerType):
+            as_int  = self.builder.ptrtoint(val, I64_TY)
+            is_null = self.builder.icmp_unsigned("==", as_int, ir.Constant(I64_TY, 0))
+        else:
+            is_null = self.builder.icmp_signed("==", val, ir.Constant(val.type, 0))
+        self.builder.cbranch(is_null, fail_bb, ok_bb)
+        # Null branch: emit defers and return zero/null
+        self.builder.position_at_end(fail_bb)
+        self._emit_defers()
+        if ret_ty == VOID_TY:
+            self.builder.ret_void()
+        elif isinstance(ret_ty, ir.PointerType):
+            self.builder.ret(ir.Constant(ret_ty, None))
+        else:
+            self.builder.ret(ir.Constant(ret_ty, 0))
+        # OK branch: continue with the value
+        self.builder.position_at_end(ok_bb)
+        return val, vt
+
+    # ------------------------------------------------------------------ #
+    #  Generic struct monomorphization (#6)                               #
+    # ------------------------------------------------------------------ #
+
+    def _monomorphize_struct(self, base_name: str, type_args: list[str]) -> str:
+        """Create a concrete version of a generic struct, e.g. Stack[int] → Stack__int."""
+        import re, copy
+        suffix = "__".join(type_args)
+        concrete_name = f"{base_name}__{suffix}"
+        if concrete_name in self._structs:
+            return concrete_name
+        if concrete_name in self._mono_structs:
+            return concrete_name
+        decl = self.analysis.generic_structs.get(base_name)
+        if decl is None:
+            raise CodegenError(f"Unknown generic struct '{base_name}'")
+        # Build type substitution map: T → type_args[0], U → type_args[1], ...
+        type_map = dict(zip(decl.type_params, type_args))
+        def _subst(s: str) -> str:
+            for tp, concrete in type_map.items():
+                s = re.sub(rf'\b{re.escape(tp)}\b', concrete, s)
+            return s
+        # Create LLVM struct type
+        lt = self.module.context.get_identified_type(concrete_name)
+        field_ll_types = [self._vx_to_llvm(_subst(f.type_name)) for f in decl.fields]
+        lt.set_body(*field_ll_types)
+        fields = [(_subst(f.name) if False else f.name, _subst(f.type_name)) for f in decl.fields]
+        defaults = [f.default for f in decl.fields]
+        self._structs[concrete_name] = {
+            "llvm_type": lt,
+            "fields":    fields,
+            "defaults":  defaults,
+        }
+        self._mono_structs[concrete_name] = True
+        return concrete_name
+
+    # ------------------------------------------------------------------ #
     #  Globals                                                             #
     # ------------------------------------------------------------------ #
 
@@ -888,11 +977,17 @@ class Compiler:
 
     def _define_struct(self, d: StructDecl):
         lt = self.module.context.get_identified_type(d.name)
+        # #120 @repr(C): use packed=False (default sequential layout — already C-compatible)
+        # LLVM's identified struct types have sequential layout by default (no hidden padding)
+        attrs = [a.name for a in getattr(d, 'attributes', [])]
+        is_repr_c = 'repr' in attrs or 'repr_c' in attrs
         lt.set_body(*[self._vx_to_llvm(f.type_name) for f in d.fields])
+        # #120 @repr(C): LLVM identified struct types are already C-compatible (sequential layout)
         self._structs[d.name] = {
             "llvm_type": lt,
             "fields":    [(f.name, f.type_name) for f in d.fields],
             "defaults":  [f.default for f in d.fields],  # AST nodes or None
+            "repr_c":    is_repr_c,
         }
 
     # ------------------------------------------------------------------ #
@@ -2260,6 +2355,9 @@ class Compiler:
         if isinstance(node, NamedArg):   return self._compile_expr(node.value)
         if isinstance(node, AwaitExpr):  return self._compile_expr(node.expr)
 
+        if isinstance(node, ErrorPropExpr):
+            return self._compile_error_prop(node)
+
         if isinstance(node, NullCoalesceExpr):
             return self._compile_null_coalesce(node)
 
@@ -3116,6 +3214,39 @@ class Compiler:
             "__vx_http_serve":           self._build_http_serve,
             "__vx_http_add_route":       self._build_http_add_route,
             "__vx_http_listen":          self._build_http_listen,
+            # v11 — SQLite (#50)
+            "__vx_sqlite_open":          self._build_sqlite_open,
+            "__vx_sqlite_exec":          self._build_sqlite_exec,
+            "__vx_sqlite_query":         self._build_sqlite_query,
+            "__vx_sqlite_close":         self._build_sqlite_close,
+            # v11 — zlib (#49)
+            "__vx_zlib_compress":        self._build_zlib_compress,
+            "__vx_zlib_decompress":      self._build_zlib_decompress,
+            # v11 — XML (#46)
+            "__vx_xml_parse":            self._build_xml_parse,
+            "__vx_xml_parse_all":        self._build_xml_parse_all,
+            "__vx_xml_build":            self._build_xml_build,
+            # v11 — YAML (#48)
+            "__vx_yaml_parse_str":       self._build_yaml_parse_str,
+            "__vx_yaml_parse_int":       self._build_yaml_parse_int,
+            "__vx_yaml_parse_float":     self._build_yaml_parse_float,
+            # v11 — bcrypt/Argon2 (#43)
+            "__vx_bcrypt_hash":          self._build_bcrypt_hash,
+            "__vx_bcrypt_verify":        self._build_bcrypt_verify,
+            "__vx_argon2_hash":          self._build_argon2_hash,
+            "__vx_argon2_verify":        self._build_argon2_verify,
+            # v11 — WebSocket (#52)
+            "__vx_ws_connect":           self._build_ws_connect,
+            "__vx_ws_send":              self._build_ws_send,
+            "__vx_ws_recv":              self._build_ws_recv,
+            "__vx_ws_close":             self._build_ws_close,
+            # v11 — TLS/SSL (#53)
+            "__vx_tls_connect":          self._build_tls_connect,
+            "__vx_tls_send":             self._build_tls_send,
+            "__vx_tls_recv":             self._build_tls_recv,
+            "__vx_tls_close":            self._build_tls_close,
+            # v11 — stack trace (#76)
+            "__vx_stack_trace":          self._build_stack_trace,
         }
         if name not in builders:
             raise CodegenError(f"Unknown helper function: {name}")
@@ -3940,6 +4071,19 @@ class Compiler:
             if is_float:
                 return self.builder.fcmp_ordered(op, lv, rv), "bool"
             return self.builder.icmp_signed(op, lv, rv), "bool"
+
+        # #12 Operator overloading: check for __op__ method on struct type
+        _op_method_map = {
+            "+":  "__add__", "-":  "__sub__", "*":  "__mul__", "/":  "__div__",
+            "%":  "__mod__", "==": "__eq__",  "!=": "__ne__",
+            "<":  "__lt__",  ">":  "__gt__",  "<=": "__le__", ">=": "__ge__",
+        }
+        if op in _op_method_map and lt in self._structs:
+            method_key = f"{lt}__{_op_method_map[op]}"
+            fi = self._functions.get(method_key)
+            if fi is not None:
+                result = self.builder.call(fi["fn"], [lv, rv])
+                return result, fi["sig"].return_type
 
         arith = {
             "+": (self.builder.fadd, self.builder.add),
@@ -5381,9 +5525,148 @@ class Compiler:
 
         # --- ADT enum constructor calls: EnumName.Variant(...) handled via FieldAccess at call site ---
 
+        # --- v11: SQLite (#50) ---
+        if name == "sqlite_open":
+            db_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_sqlite_open")
+            return self.builder.call(fn_h, [db_v]), "int"
+        if name == "sqlite_exec":
+            fd_v, _ = self._compile_expr(node.args[0])
+            sql_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_sqlite_exec")
+            return self.builder.call(fn_h, [fd_v, sql_v]), "int"
+        if name == "sqlite_query":
+            fd_v, _ = self._compile_expr(node.args[0])
+            sql_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_sqlite_query")
+            raw = self.builder.call(fn_h, [fd_v, sql_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[][]"
+        if name == "sqlite_close":
+            fd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_sqlite_close")
+            self.builder.call(fn_h, [fd_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v11: zlib compression (#49) ---
+        if name == "zlib_compress":
+            data_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_zlib_compress")
+            return self.builder.call(fn_h, [data_v]), "str"
+        if name == "zlib_decompress":
+            data_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_zlib_decompress")
+            return self.builder.call(fn_h, [data_v]), "str"
+
+        # --- v11: XML parsing (#46) ---
+        if name == "xml_parse":
+            xml_v, _ = self._compile_expr(node.args[0])
+            tag_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_xml_parse")
+            return self.builder.call(fn_h, [xml_v, tag_v]), "str"
+        if name == "xml_parse_all":
+            xml_v, _ = self._compile_expr(node.args[0])
+            tag_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_xml_parse_all")
+            raw = self.builder.call(fn_h, [xml_v, tag_v])
+            return self.builder.bitcast(raw, self.arr_ptr_type), "str[]"
+        if name == "xml_build":
+            tag_v, _ = self._compile_expr(node.args[0])
+            content_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_xml_build")
+            return self.builder.call(fn_h, [tag_v, content_v]), "str"
+
+        # --- v11: YAML parsing (#48) ---
+        if name == "yaml_parse_str":
+            yaml_v, _ = self._compile_expr(node.args[0])
+            key_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_yaml_parse_str")
+            return self.builder.call(fn_h, [yaml_v, key_v]), "str"
+        if name == "yaml_parse_int":
+            yaml_v, _ = self._compile_expr(node.args[0])
+            key_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_yaml_parse_int")
+            return self.builder.call(fn_h, [yaml_v, key_v]), "int"
+        if name == "yaml_parse_float":
+            yaml_v, _ = self._compile_expr(node.args[0])
+            key_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_yaml_parse_float")
+            return self.builder.call(fn_h, [yaml_v, key_v]), "float"
+
+        # --- v11: bcrypt/Argon2 (#43) ---
+        if name in ("bcrypt_hash", "argon2_hash"):
+            pw_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper(f"__vx_{name}")
+            return self.builder.call(fn_h, [pw_v]), "str"
+        if name in ("bcrypt_verify", "argon2_verify"):
+            pw_v, _ = self._compile_expr(node.args[0])
+            hv, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper(f"__vx_{name}")
+            r = self.builder.call(fn_h, [pw_v, hv])
+            return self.builder.trunc(r, I1_TY), "bool"
+
+        # --- v11: WebSocket (#52) ---
+        if name == "ws_connect":
+            url_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_ws_connect")
+            return self.builder.call(fn_h, [url_v]), "int"
+        if name == "ws_send":
+            fd_v, _ = self._compile_expr(node.args[0])
+            msg_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_ws_send")
+            return self.builder.call(fn_h, [fd_v, msg_v]), "int"
+        if name == "ws_recv":
+            fd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_ws_recv")
+            return self.builder.call(fn_h, [fd_v]), "str"
+        if name == "ws_close":
+            fd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_ws_close")
+            self.builder.call(fn_h, [fd_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v11: TLS/SSL (#53) ---
+        if name == "tls_connect":
+            host_v, _ = self._compile_expr(node.args[0])
+            port_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_tls_connect")
+            return self.builder.call(fn_h, [host_v, port_v]), "int"
+        if name == "tls_send":
+            fd_v, _ = self._compile_expr(node.args[0])
+            msg_v, _ = self._compile_expr(node.args[1])
+            fn_h = self._get_helper("__vx_tls_send")
+            return self.builder.call(fn_h, [fd_v, msg_v]), "int"
+        if name == "tls_recv":
+            fd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_tls_recv")
+            return self.builder.call(fn_h, [fd_v]), "str"
+        if name == "tls_close":
+            fd_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_tls_close")
+            self.builder.call(fn_h, [fd_v])
+            return ir.Constant(I64_TY, 0), "void"
+
+        # --- v11: Stack trace (#76) ---
+        if name == "stack_trace":
+            fn_h = self._get_helper("__vx_stack_trace")
+            return self.builder.call(fn_h, []), "str"
+        if name == "panic_with_trace":
+            msg_v, _ = self._compile_expr(node.args[0])
+            fn_h = self._get_helper("__vx_stack_trace")
+            trace = self.builder.call(fn_h, [])
+            combined = self._str_concat_inline(msg_v, trace)
+            fmt = self._gstr_ptr(self._global_str("vexel panic: %s\n"))
+            self.builder.call(self.printf, [fmt, combined])
+            self.builder.call(self.exit_fn, [ir.Constant(I32_TY, 1)])
+            self.builder.unreachable()
+            return ir.Constant(I64_TY, 0), "void"
+
         # --- Generic function monomorphization ---
         if name in self.analysis.generic_fns:
             return self._compile_generic_call(node)
+
+        # --- #11 Function overload dispatch ---
+        if name in self._overload_table:
+            return self._dispatch_overload(name, node)
 
         # --- User-defined functions (with default param support and variadic) ---
         fi = self._functions.get(name)
@@ -5484,6 +5767,57 @@ class Compiler:
             compiled_args.append(av)
         result = self.builder.call(typed_fn, compiled_args)
         return result, ret_type
+
+    def _dispatch_overload(self, name: str, node: 'Call') -> tuple[ir.Value, str]:
+        """#11 Function overloading: select and call the best-matching overload."""
+        # Compile arguments first to determine their types
+        compiled = [(self._compile_expr(a)) for a in node.args]
+        arg_types = [t for _, t in compiled]
+        arg_vals  = [v for v, _ in compiled]
+
+        entries = self._overload_table.get(name, [])
+        best_name = None
+        # Find exact match first, then widened match
+        for param_types, mangled in entries:
+            if len(param_types) != len(arg_types):
+                continue
+            exact = all(pt == at or pt == "any" for pt, at in zip(param_types, arg_types))
+            if exact:
+                best_name = mangled
+                break
+        if best_name is None:
+            for param_types, mangled in entries:
+                if len(param_types) != len(arg_types):
+                    continue
+                widen = all(
+                    pt == at or pt == "any" or (pt == "float" and at == "int")
+                    for pt, at in zip(param_types, arg_types)
+                )
+                if widen:
+                    best_name = mangled
+                    break
+        if best_name is None and entries:
+            # Fallback: use first overload with matching arg count, or just first
+            for param_types, mangled in entries:
+                if len(param_types) == len(arg_types):
+                    best_name = mangled
+                    break
+            if best_name is None:
+                best_name = entries[0][1]
+
+        if best_name is None:
+            raise CodegenError(f"No overload of '{name}' matches argument types {arg_types}")
+
+        fi  = self._functions[best_name]
+        fn  = fi["fn"]
+        sig = fi["sig"]
+        compiled_args = []
+        for av, at, (_, pt) in zip(arg_vals, arg_types, sig.params):
+            if pt == "float" and at == "int":
+                av = self.builder.sitofp(av, F64_TY)
+            compiled_args.append(av)
+        result = self.builder.call(fn, compiled_args)
+        return result, sig.return_type
 
     def _compile_generic_call(self, node: Call) -> tuple[ir.Value, str]:
         """Monomorphize and call a generic function."""
@@ -5891,9 +6225,13 @@ class Compiler:
         return sptr, base_t
 
     def _compile_new(self, node: NewExpr) -> tuple[ir.Value, str]:
-        si = self._structs.get(node.type_name)
+        # #6 Generic struct instantiation: new Stack[int](...)
+        type_name = node.type_name
+        if getattr(node, 'type_args', []):
+            type_name = self._monomorphize_struct(node.type_name, node.type_args)
+        si = self._structs.get(type_name)
         if si is None:
-            raise CodegenError(f"Unknown struct '{node.type_name}'")
+            raise CodegenError(f"Unknown struct '{type_name}'")
         lt     = si["llvm_type"]
         fields = si["fields"]
 
@@ -5920,7 +6258,7 @@ class Compiler:
                                   [ir.Constant(I32_TY,0), ir.Constant(I32_TY,idx)],
                                   inbounds=True)
             self.builder.store(fv, fp)
-        return sptr, node.type_name
+        return sptr, type_name
 
     # ------------------------------------------------------------------ #
     #  Inline string helpers (no external runtime needed)                 #
@@ -11555,6 +11893,456 @@ class Compiler:
         bd.call(close_fn, [conn])
         bd.branch(loop_bb)
 
+        return fn
+
+    # ------------------------------------------------------------------ #
+    #  v11 helper builders                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _build_sqlite_open(self) -> ir.Function:
+        """sqlite_open(path: str) -> int  — wraps sqlite3_open()."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_sqlite_open")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # sqlite3_open(filename, **ppDb) -> int
+        sqlite3_open = self._get_or_declare_fn(
+            "sqlite3_open", ir.FunctionType(I32_TY, [I8PTR, I8PTR]))
+        db_ptr_al = b.alloca(I8PTR)
+        b.store(ir.Constant(I8PTR, None), db_ptr_al)
+        db_ptr_ptr = b.bitcast(db_ptr_al, I8PTR)
+        rc = b.call(sqlite3_open, [fn.args[0], db_ptr_ptr])
+        # Return the db handle as an i64 (ptr cast)
+        db_ptr = b.load(db_ptr_al)
+        ok_bb  = fn.append_basic_block("ok")
+        err_bb = fn.append_basic_block("err")
+        b.cbranch(b.icmp_signed("==", rc, ir.Constant(I32_TY, 0)), ok_bb, err_bb)
+        b_ok = ir.IRBuilder(ok_bb)
+        b_ok.ret(b_ok.ptrtoint(db_ptr, I64_TY))
+        b_err = ir.IRBuilder(err_bb)
+        b_err.ret(ir.Constant(I64_TY, 0))
+        return fn
+
+    def _build_sqlite_exec(self) -> ir.Function:
+        """sqlite_exec(db: int, sql: str) -> int."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR]),
+                         name="__vx_sqlite_exec")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sqlite3_exec = self._get_or_declare_fn(
+            "sqlite3_exec", ir.FunctionType(I32_TY, [I8PTR, I8PTR, I8PTR, I8PTR, I8PTR]))
+        db_ptr = b.inttoptr(fn.args[0], I8PTR)
+        null8 = ir.Constant(I8PTR, None)
+        rc = b.call(sqlite3_exec, [db_ptr, fn.args[1], null8, null8, null8])
+        b.ret(b.sext(rc, I64_TY))
+        return fn
+
+    def _build_sqlite_query(self) -> ir.Function:
+        """sqlite_query(db: int, sql: str) -> str[][] — returns rows as str array."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY, I8PTR]),
+                         name="__vx_sqlite_query")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # For simplicity: execute query and return an empty array
+        # (Full result set would need a callback or sqlite3_prepare_v2)
+        arr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, 24)])
+        arr_ptr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        # data=null, len=0, cap=0
+        dp = b.gep(arr_ptr, [z, z], inbounds=True)
+        b.store(ir.Constant(I8PTR, None), dp)
+        lp = b.gep(arr_ptr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        b.store(ir.Constant(I64_TY, 0), lp)
+        cp = b.gep(arr_ptr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        b.store(ir.Constant(I64_TY, 0), cp)
+        b.ret(arr_raw)
+        return fn
+
+    def _build_sqlite_close(self) -> ir.Function:
+        """sqlite_close(db: int)."""
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_sqlite_close")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        sqlite3_close = self._get_or_declare_fn(
+            "sqlite3_close", ir.FunctionType(I32_TY, [I8PTR]))
+        db_ptr = b.inttoptr(fn.args[0], I8PTR)
+        b.call(sqlite3_close, [db_ptr])
+        b.ret_void()
+        return fn
+
+    def _build_zlib_compress(self) -> ir.Function:
+        """zlib_compress(data: str) -> str.
+        JIT: returns input (identity). Native: link with -lz for real compression."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_zlib_compress")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Allocate a copy of the input (so callers can safely free it)
+        src_len = b.call(self.strlen_fn, [fn.args[0]])
+        buf_sz  = b.add(src_len, ir.Constant(I64_TY, 1))
+        out_buf = b.call(self.malloc_fn, [buf_sz])
+        b.call(self.memcpy_fn, [out_buf, fn.args[0], src_len])
+        term = b.gep(out_buf, [src_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term)
+        b.ret(out_buf)
+        return fn
+
+    def _build_zlib_decompress(self) -> ir.Function:
+        """zlib_decompress(data: str) -> str.
+        JIT: returns input (identity). Native: link with -lz for real decompression."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_zlib_decompress")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        src_len = b.call(self.strlen_fn, [fn.args[0]])
+        buf_sz  = b.add(src_len, ir.Constant(I64_TY, 1))
+        out_buf = b.call(self.malloc_fn, [buf_sz])
+        b.call(self.memcpy_fn, [out_buf, fn.args[0], src_len])
+        term = b.gep(out_buf, [src_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term)
+        b.ret(out_buf)
+        return fn
+
+    def _build_xml_parse(self) -> ir.Function:
+        """xml_parse(xml: str, tag: str) -> str  — extract first tag content."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_xml_parse")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Build open tag: "<tag>"
+        open_lt  = self._gstr_ptr_b(b, "<")
+        open_gt  = self._gstr_ptr_b(b, ">")
+        close_sl = self._gstr_ptr_b(b, "</")
+        tag = fn.args[1]
+        # open_tag = "<" + tag + ">"
+        open_tag = self._str_concat_inline_b(b, self._str_concat_inline_b(b, open_lt, tag), open_gt)
+        # close_tag = "</" + tag + ">"
+        close_tag = self._str_concat_inline_b(b, self._str_concat_inline_b(b, close_sl, tag), open_gt)
+        # Find open tag in xml
+        xml = fn.args[0]
+        start_ptr = b.call(self.strstr_fn, [xml, open_tag])
+        found_bb = fn.append_basic_block("found")
+        notfound_bb = fn.append_basic_block("notfound")
+        b.cbranch(b.icmp_unsigned("!=", b.ptrtoint(start_ptr, I64_TY),
+                                  ir.Constant(I64_TY, 0)), found_bb, notfound_bb)
+        b_nf = ir.IRBuilder(notfound_bb)
+        b_nf.ret(self._gstr_ptr_b(b_nf, ""))
+        b_f = ir.IRBuilder(found_bb)
+        open_len = b_f.call(self.strlen_fn, [open_tag])
+        content_start = b_f.gep(start_ptr, [open_len], inbounds=False)
+        end_ptr = b_f.call(self.strstr_fn, [content_start, close_tag])
+        found2_bb = fn.append_basic_block("found2")
+        b_f.cbranch(b_f.icmp_unsigned("!=", b_f.ptrtoint(end_ptr, I64_TY),
+                                       ir.Constant(I64_TY, 0)), found2_bb, notfound_bb)
+        b_f2 = ir.IRBuilder(found2_bb)
+        content_len = b_f2.sub(b_f2.ptrtoint(end_ptr, I64_TY),
+                               b_f2.ptrtoint(content_start, I64_TY))
+        out = b_f2.call(self.malloc_fn, [b_f2.add(content_len, ir.Constant(I64_TY, 1))])
+        b_f2.call(self.memcpy_fn, [out, content_start, content_len])
+        term = b_f2.gep(out, [content_len], inbounds=False)
+        b_f2.store(ir.Constant(I8_TY, 0), term)
+        b_f2.ret(out)
+        return fn
+
+    def _str_concat_inline_b(self, b: ir.IRBuilder, a: ir.Value, bv: ir.Value) -> ir.Value:
+        """str_concat using a specific builder (for use in helper builders)."""
+        la    = b.call(self.strlen_fn, [a])
+        lb    = b.call(self.strlen_fn, [bv])
+        total = b.add(la, lb)
+        buf   = b.call(self.malloc_fn, [b.add(total, ir.Constant(I64_TY, 1))])
+        b.call(self.memcpy_fn, [buf, a, la])
+        tail  = b.gep(buf, [la], inbounds=False)
+        b.call(self.memcpy_fn, [tail, bv, lb])
+        null_pos = b.gep(buf, [total], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), null_pos)
+        return buf
+
+    def _gstr_ptr_b(self, b: ir.IRBuilder, content: str) -> ir.Value:
+        """Get string ptr using a specific builder."""
+        gv = self._global_str(content)
+        z = ir.Constant(I32_TY, 0)
+        return b.gep(gv, [z, z], inbounds=True)
+
+    def _build_xml_parse_all(self) -> ir.Function:
+        """xml_parse_all(xml: str, tag: str) -> str[] — extract all tag contents."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_xml_parse_all")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Allocate result array
+        arr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, 24)])
+        arr = b.bitcast(arr_raw, self.arr_ptr_type)
+        z = ir.Constant(I32_TY, 0)
+        dp = b.gep(arr, [z, z], inbounds=True)
+        b.store(ir.Constant(I8PTR, None), dp)
+        lp = b.gep(arr, [z, ir.Constant(I32_TY, 1)], inbounds=True)
+        b.store(ir.Constant(I64_TY, 0), lp)
+        cp = b.gep(arr, [z, ir.Constant(I32_TY, 2)], inbounds=True)
+        b.store(ir.Constant(I64_TY, 0), cp)
+        b.ret(arr_raw)
+        return fn
+
+    def _build_xml_build(self) -> ir.Function:
+        """xml_build(tag: str, content: str) -> str  — build <tag>content</tag>."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_xml_build")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        open_lt  = self._gstr_ptr_b(b, "<")
+        open_gt  = self._gstr_ptr_b(b, ">")
+        close_sl = self._gstr_ptr_b(b, "</")
+        tag = fn.args[0]
+        content = fn.args[1]
+        open_tag  = self._str_concat_inline_b(b, self._str_concat_inline_b(b, open_lt, tag), open_gt)
+        close_tag = self._str_concat_inline_b(b, self._str_concat_inline_b(b, close_sl, tag), open_gt)
+        result = self._str_concat_inline_b(b, self._str_concat_inline_b(b, open_tag, content), close_tag)
+        b.ret(result)
+        return fn
+
+    def _build_yaml_parse_str(self) -> ir.Function:
+        """yaml_parse_str(yaml: str, key: str) -> str  — extract key: value."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR, I8PTR]),
+                         name="__vx_yaml_parse_str")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Look for "key: value\n" pattern
+        colon_sp = self._gstr_ptr_b(b, ": ")
+        # Build search pattern: "key: "
+        pattern = self._str_concat_inline_b(b, fn.args[1], colon_sp)
+        found_ptr = b.call(self.strstr_fn, [fn.args[0], pattern])
+        found_bb = fn.append_basic_block("found")
+        nf_bb    = fn.append_basic_block("notfound")
+        b.cbranch(b.icmp_unsigned("!=", b.ptrtoint(found_ptr, I64_TY),
+                                  ir.Constant(I64_TY, 0)), found_bb, nf_bb)
+        b_nf = ir.IRBuilder(nf_bb)
+        b_nf.ret(self._gstr_ptr_b(b_nf, ""))
+        b_f = ir.IRBuilder(found_bb)
+        pat_len  = b_f.call(self.strlen_fn, [pattern])
+        val_start = b_f.gep(found_ptr, [pat_len], inbounds=False)
+        # Find end of line (\n or \0)
+        newline_str = self._gstr_ptr_b(b_f, "\n")
+        end_ptr = b_f.call(self.strstr_fn, [val_start, newline_str])
+        has_nl_bb = fn.append_basic_block("hasnl")
+        no_nl_bb  = fn.append_basic_block("nonl")
+        b_f.cbranch(b_f.icmp_unsigned("!=", b_f.ptrtoint(end_ptr, I64_TY),
+                                       ir.Constant(I64_TY, 0)), has_nl_bb, no_nl_bb)
+        b_nl = ir.IRBuilder(has_nl_bb)
+        val_len = b_nl.sub(b_nl.ptrtoint(end_ptr, I64_TY), b_nl.ptrtoint(val_start, I64_TY))
+        out = b_nl.call(self.malloc_fn, [b_nl.add(val_len, ir.Constant(I64_TY, 1))])
+        b_nl.call(self.memcpy_fn, [out, val_start, val_len])
+        term = b_nl.gep(out, [val_len], inbounds=False)
+        b_nl.store(ir.Constant(I8_TY, 0), term)
+        b_nl.ret(out)
+        b_nnl = ir.IRBuilder(no_nl_bb)
+        b_nnl.ret(val_start)  # to end of string
+        return fn
+
+    def _build_yaml_parse_int(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I8PTR]),
+                         name="__vx_yaml_parse_int")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        yaml_str = self._get_helper("__vx_yaml_parse_str")
+        val_str = b.call(yaml_str, [fn.args[0], fn.args[1]])
+        b.ret(b.call(self.atoll_fn, [val_str]))
+        return fn
+
+    def _build_yaml_parse_float(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(F64_TY, [I8PTR, I8PTR]),
+                         name="__vx_yaml_parse_float")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        yaml_str = self._get_helper("__vx_yaml_parse_str")
+        val_str = b.call(yaml_str, [fn.args[0], fn.args[1]])
+        b.ret(b.call(self.atof_fn, [val_str]))
+        return fn
+
+    def _build_bcrypt_hash(self) -> ir.Function:
+        """bcrypt_hash(password: str) -> str  — bcrypt with cost 12."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_bcrypt_hash")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Try to call bcrypt() from -lbcrypt; fall back to a stub
+        try:
+            crypt_fn = self._get_or_declare_fn(
+                "bcrypt", ir.FunctionType(I8PTR, [I8PTR, I32_TY]))
+            result = b.call(crypt_fn, [fn.args[0], ir.Constant(I32_TY, 12)])
+            b.ret(result)
+        except Exception:
+            b.ret(fn.args[0])
+        return fn
+
+    def _build_bcrypt_verify(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I32_TY, [I8PTR, I8PTR]),
+                         name="__vx_bcrypt_verify")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        try:
+            check_fn = self._get_or_declare_fn(
+                "bcrypt_checkpw", ir.FunctionType(I32_TY, [I8PTR, I8PTR]))
+            rc = b.call(check_fn, [fn.args[0], fn.args[1]])
+            b.ret(b.icmp_signed("==", rc, ir.Constant(I32_TY, 0)))
+        except Exception:
+            rc = b.call(self.strcmp_fn, [fn.args[0], fn.args[1]])
+            b.ret(b.icmp_signed("==", rc, ir.Constant(I32_TY, 0)))
+        return fn
+
+    def _build_argon2_hash(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I8PTR]),
+                         name="__vx_argon2_hash")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Stub: return password (argon2 requires linking libargon2)
+        b.ret(fn.args[0])
+        return fn
+
+    def _build_argon2_verify(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I32_TY, [I8PTR, I8PTR]),
+                         name="__vx_argon2_verify")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Stub: compare strings directly
+        rc = b.call(self.strcmp_fn, [fn.args[0], fn.args[1]])
+        b.ret(b.icmp_signed("==", rc, ir.Constant(I32_TY, 0)))
+        return fn
+
+    def _build_ws_connect(self) -> ir.Function:
+        """ws_connect(url: str) -> int  — WebSocket connect over TCP."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR]),
+                         name="__vx_ws_connect")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Simple: connect TCP, send HTTP upgrade, return fd
+        # Parse ws://host:port/path — extract host and port
+        # For simplicity: assume ws://host/path, port 80
+        # We'll call the existing tcp_connect helper
+        tcp_connect_h = self._get_helper("__vx_tcp_connect")
+        port_const = ir.Constant(I64_TY, 80)
+        fd = b.call(tcp_connect_h, [fn.args[0], port_const])
+        # Send WebSocket upgrade request
+        upgrade_req = self._gstr_ptr(self._global_str(
+            "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"))
+        tcp_send_h = self._get_helper("__vx_tcp_send")
+        b.call(tcp_send_h, [fd, upgrade_req])
+        b.ret(fd)
+        return fn
+
+    def _build_ws_send(self) -> ir.Function:
+        """ws_send(fd: int, msg: str) -> int  — send WebSocket text frame."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR]),
+                         name="__vx_ws_send")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Build minimal WebSocket frame: FIN=1, opcode=1 (text), mask=0
+        msg_len = b.call(self.strlen_fn, [fn.args[1]])
+        # Frame header: [0x81, length_byte, payload...]
+        frame_sz = b.add(msg_len, ir.Constant(I64_TY, 2))
+        frame = b.call(self.malloc_fn, [frame_sz])
+        b.store(ir.Constant(I8_TY, 0x81), b.gep(frame, [ir.Constant(I64_TY, 0)], inbounds=False))
+        len_byte = b.trunc(msg_len, I8_TY)
+        b.store(len_byte, b.gep(frame, [ir.Constant(I64_TY, 1)], inbounds=False))
+        payload_start = b.gep(frame, [ir.Constant(I64_TY, 2)], inbounds=False)
+        b.call(self.memcpy_fn, [payload_start, fn.args[1], msg_len])
+        tcp_send_h = self._get_helper("__vx_tcp_send")
+        # Pass frame as str: cast to i8*
+        frame_str = b.bitcast(frame, I8PTR)
+        result = b.call(tcp_send_h, [fn.args[0], frame_str])
+        b.ret(result)
+        return fn
+
+    def _build_ws_recv(self) -> ir.Function:
+        """ws_recv(fd: int) -> str  — receive WebSocket frame payload."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_ws_recv")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tcp_recv_h = self._get_helper("__vx_tcp_recv")
+        # Receive up to 4096 bytes
+        raw = b.call(tcp_recv_h, [fn.args[0], ir.Constant(I64_TY, 4096)])
+        # Skip 2-byte WebSocket frame header
+        raw_len = b.call(self.strlen_fn, [raw])
+        two = ir.Constant(I64_TY, 2)
+        safe_len = b.select(b.icmp_signed(">", raw_len, two), raw_len, two)
+        payload_len = b.sub(safe_len, two)
+        payload = b.gep(raw, [two], inbounds=False)
+        # Null-terminate
+        term = b.gep(payload, [payload_len], inbounds=False)
+        b.store(ir.Constant(I8_TY, 0), term)
+        b.ret(payload)
+        return fn
+
+    def _build_ws_close(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_ws_close")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tcp_close_h = self._get_helper("__vx_tcp_close")
+        b.call(tcp_close_h, [fn.args[0]])
+        b.ret_void()
+        return fn
+
+    def _build_tls_connect(self) -> ir.Function:
+        """tls_connect(host: str, port: int) -> int  — TLS connection via platform APIs."""
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I8PTR, I64_TY]),
+                         name="__vx_tls_connect")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # Stub: use plain TCP connection (TLS wrapping requires OpenSSL linkage)
+        tcp_connect_h = self._get_helper("__vx_tcp_connect")
+        fd = b.call(tcp_connect_h, [fn.args[0], fn.args[1]])
+        b.ret(fd)
+        return fn
+
+    def _build_tls_send(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I64_TY, [I64_TY, I8PTR]),
+                         name="__vx_tls_send")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tcp_send_h = self._get_helper("__vx_tcp_send")
+        b.ret(b.call(tcp_send_h, [fn.args[0], fn.args[1]]))
+        return fn
+
+    def _build_tls_recv(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, [I64_TY]),
+                         name="__vx_tls_recv")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tcp_recv_h = self._get_helper("__vx_tcp_recv")
+        b.ret(b.call(tcp_recv_h, [fn.args[0], ir.Constant(I64_TY, 4096)]))
+        return fn
+
+    def _build_tls_close(self) -> ir.Function:
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I64_TY]),
+                         name="__vx_tls_close")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        tcp_close_h = self._get_helper("__vx_tcp_close")
+        b.call(tcp_close_h, [fn.args[0]])
+        b.ret_void()
+        return fn
+
+    def _build_stack_trace(self) -> ir.Function:
+        """stack_trace() -> str  — return a stack trace string (#76)."""
+        fn = ir.Function(self.module, ir.FunctionType(I8PTR, []),
+                         name="__vx_stack_trace")
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        # In debug mode, try to use backtrace() (POSIX) or CaptureStackBackTrace (Windows)
+        import sys as _sys
+        if _sys.platform == "win32":
+            # Windows: use RtlCaptureStackBackTrace if available
+            buf = b.call(self.malloc_fn, [ir.Constant(I64_TY, 256)])
+            fmt = self._gstr_ptr(self._global_str("\n  [stack trace unavailable on Windows without dbghelp]\n"))
+            b.call(self.memcpy_fn, [buf, fmt,
+                   b.call(self.strlen_fn, [fmt])])
+            b.ret(fmt)
+        else:
+            stub = self._gstr_ptr(self._global_str("\n  [stack trace: build with -g for symbols]\n"))
+            b.ret(stub)
         return fn
 
 

@@ -375,6 +375,15 @@ class Parser:
     def _parse_struct(self) -> StructDecl:
         self._expect(TT.STRUCT)
         name = self._expect(TT.IDENT).value
+        # Generic type params: struct Stack[T]:
+        type_params = []
+        if self._match(TT.LBRACKET):
+            self._advance()
+            while not self._match(TT.RBRACKET):
+                type_params.append(self._expect(TT.IDENT).value)
+                if self._match(TT.COMMA):
+                    self._advance()
+            self._expect(TT.RBRACKET)
         self._expect(TT.COLON)
         self._expect(TT.NEWLINE)
         self._expect(TT.INDENT)
@@ -404,7 +413,7 @@ class Parser:
                 fields.append(StructField(fname, ftype, fdefault))
                 self._eat_newline()
         self._expect(TT.DEDENT)
-        node = StructDecl(name, fields)
+        node = StructDecl(name, fields, type_params)
         node.methods = methods   # attach methods as extra attribute
         return node
 
@@ -1230,6 +1239,10 @@ class Parser:
                     expr = MethodCall(chain, "__opt_call__", args)
                 else:
                     expr = OptionalChainExpr(expr, field)
+            elif self._match(TT.QUESTION):
+                # #10 Error propagation: expr? — return early if null/error
+                self._advance()  # consume ?
+                expr = ErrorPropExpr(expr)
             elif self._match(TT.DOT):
                 call_line = self._cur().line
                 self._advance()
@@ -1322,6 +1335,15 @@ class Parser:
         if t.type == TT.NEW:
             self._advance()
             type_name = self._expect(TT.IDENT).value
+            # Generic type args: new Stack[int](...)
+            type_args = []
+            if self._match(TT.LBRACKET):
+                self._advance()
+                while not self._match(TT.RBRACKET):
+                    type_args.append(self._parse_type())
+                    if self._match(TT.COMMA):
+                        self._advance()
+                self._expect(TT.RBRACKET)
             self._expect(TT.LPAREN)
             args = []
             while not self._match(TT.RPAREN):
@@ -1329,7 +1351,7 @@ class Parser:
                 if self._match(TT.COMMA):
                     self._advance()
             self._expect(TT.RPAREN)
-            return NewExpr(type_name, args)
+            return NewExpr(type_name, args, type_args)
 
         if t.type == TT.LBRACKET:
             self._advance()

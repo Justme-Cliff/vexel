@@ -96,6 +96,7 @@ class FieldAccess(Node):
 class NewExpr(Node):
     type_name: str
     args: List[Node]
+    type_args: List[str] = field(default_factory=list)  # e.g. ["int"] for new Stack[int](...)
 
 @dataclass
 class IndexExpr(Node):
@@ -226,6 +227,7 @@ class StructField(Node):
 class StructDecl(Node):
     name: str
     fields: List[StructField]
+    type_params: List[str] = field(default_factory=list)  # e.g. ["T"] for struct Stack[T]:
 
 @dataclass
 class StructUpdateExpr(Node):
@@ -541,3 +543,13 @@ class ErrorDecl(Node):
     """error IOError(path: str) — named error type with payload fields (#29)."""
     name:   str
     fields: List['StructField']  # may be empty for simple errors
+
+
+# ============================================================
+# v11 — Error propagation, generic structs, operator overloading
+# ============================================================
+
+@dataclass
+class ErrorPropExpr(Node):
+    """expr? — propagate error: if null/0, return early from current function (#10)."""
+    expr: Node

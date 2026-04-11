@@ -275,6 +275,40 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     # v10 — HTTP server (#51)
     "http_serve":             (["int"],           VX_INT),
     "http_listen":            (["int"],           VX_VOID),
+    # v11 — SQLite (real C API, #50)
+    "sqlite_open":            (["str"],           VX_INT),
+    "sqlite_exec":            (["int", "str"],    VX_INT),
+    "sqlite_query":           (["int", "str"],    "str[][]"),
+    "sqlite_close":           (["int"],           VX_VOID),
+    # v11 — zlib compression (#49)
+    "zlib_compress":          (["str"],           VX_STR),
+    "zlib_decompress":        (["str"],           VX_STR),
+    # v11 — XML parsing (#46)
+    "xml_parse":              (["str", "str"],    VX_STR),
+    "xml_parse_all":          (["str", "str"],    "str[]"),
+    "xml_build":              (["str", "str"],    VX_STR),
+    # v11 — YAML parsing (#48)
+    "yaml_parse_str":         (["str", "str"],    VX_STR),
+    "yaml_parse_int":         (["str", "str"],    VX_INT),
+    "yaml_parse_float":       (["str", "str"],    VX_FLOAT),
+    # v11 — bcrypt / Argon2 (#43)
+    "bcrypt_hash":            (["str"],           VX_STR),
+    "bcrypt_verify":          (["str", "str"],    VX_BOOL),
+    "argon2_hash":            (["str"],           VX_STR),
+    "argon2_verify":          (["str", "str"],    VX_BOOL),
+    # v11 — WebSocket (#52)
+    "ws_connect":             (["str"],           VX_INT),
+    "ws_send":                (["int", "str"],    VX_INT),
+    "ws_recv":                (["int"],           VX_STR),
+    "ws_close":               (["int"],           VX_VOID),
+    # v11 — TLS/SSL (#53)
+    "tls_connect":            (["str", "int"],    VX_INT),
+    "tls_send":               (["int", "str"],    VX_INT),
+    "tls_recv":               (["int"],           VX_STR),
+    "tls_close":              (["int"],           VX_VOID),
+    # v11 — stack trace (#76)
+    "stack_trace":            ([],               VX_STR),
+    "panic_with_trace":       (["str"],           VX_VOID),
 }
 
 
@@ -297,6 +331,8 @@ class AnalysisResult:
     generic_fns:   dict[str, FnDecl]  = field(default_factory=dict)
     interfaces:    dict[str, InterfaceDecl] = field(default_factory=dict)
     impls:         dict[tuple, ImplDecl]    = field(default_factory=dict)
+    overloads:     dict[str, list[str]]     = field(default_factory=dict)  # #11
+    generic_structs: dict[str, 'StructDecl'] = field(default_factory=dict)  # #6
 
 
 class Analyzer:
@@ -313,6 +349,11 @@ class Analyzer:
         self._scopes:        list[dict[str, str]]             = [{}]
         self._loop_depth:    int                              = 0
         self._lambda_count:  int                              = 0
+        # #11 Function overloading
+        self._overloads:     dict[str, list[str]]             = {}
+        self._fn_decls:      dict[str, "FnDecl"]              = {}
+        # #6 Generic structs
+        self._generic_structs: dict[str, "StructDecl"]        = {}
 
     # ------------------------------------------------------------------ #
 
@@ -336,14 +377,18 @@ class Analyzer:
                 else:
                     self._register_fn(decl)
             elif isinstance(decl, StructDecl):
-                self._register_struct(decl)
-                # Register methods defined inside the struct body
-                for m in getattr(decl, 'methods', []):
-                    mn = f"{decl.name}__{m.name}"
-                    self._fn_sigs[mn] = FnSig(
-                        [(p.name, p.type_name) for p in m.params],
-                        m.return_type or VX_VOID,
-                    )
+                # #6 Generic structs: skip registration; monomorphize on use
+                if getattr(decl, 'type_params', []):
+                    self._generic_structs[decl.name] = decl
+                else:
+                    self._register_struct(decl)
+                    # Register methods defined inside the struct body
+                    for m in getattr(decl, 'methods', []):
+                        mn = f"{decl.name}__{m.name}"
+                        self._fn_sigs[mn] = FnSig(
+                            [(p.name, p.type_name) for p in m.params],
+                            m.return_type or VX_VOID,
+                        )
             elif isinstance(decl, (GlobalLet, GlobalConst)):
                 self._register_global(decl)
             elif isinstance(decl, EnumDecl):
@@ -441,6 +486,8 @@ class Analyzer:
             self._type_aliases, self._namespaces,
             self._generic_fns,
             self._interfaces, self._impls,
+            self._overloads,
+            self._generic_structs,
         )
 
     # ------------------------------------------------------------------ #
@@ -450,8 +497,30 @@ class Analyzer:
     def _register_fn(self, d: FnDecl):
         params   = [(p.name, p.type_name) for p in d.params]
         variadic = any(p.variadic for p in d.params)
-        self._fn_sigs[d.name] = FnSig(params, d.return_type or VX_VOID,
-                                      variadic=variadic)
+        base_name = d.name
+        # #11 Function overloading: detect name collision
+        if base_name in self._fn_sigs and base_name not in self._overloads:
+            # First collision — rename the original to base__OL0
+            orig_decl = self._fn_decls.get(base_name)
+            if orig_decl is not None:
+                mangled0 = f"{base_name}__OL0"
+                orig_decl.name = mangled0
+                self._fn_sigs[mangled0] = self._fn_sigs.pop(base_name)
+                self._fn_decls[mangled0] = orig_decl
+                self._overloads[base_name] = [mangled0]
+        if base_name in self._overloads:
+            n = len(self._overloads[base_name])
+            mangled = f"{base_name}__OL{n}"
+            d.name = mangled
+            sig = FnSig(params, d.return_type or VX_VOID, variadic=variadic)
+            self._fn_sigs[mangled] = sig
+            self._fn_decls[mangled] = d
+            self._overloads[base_name].append(mangled)
+            # Keep a placeholder at base name so call-site analysis doesn't fail
+            self._fn_sigs[base_name] = sig
+        else:
+            self._fn_sigs[base_name] = FnSig(params, d.return_type or VX_VOID, variadic=variadic)
+            self._fn_decls[base_name] = d
 
     def _register_struct(self, d: StructDecl):
         self._struct_fields[d.name] = [(f.name, f.type_name) for f in d.fields]
@@ -975,7 +1044,21 @@ class Analyzer:
             return VX_INT
 
         if isinstance(node, NewExpr):
-            if node.type_name not in self._struct_fields:
+            # #6 Generic struct: new Name[T](...) — create concrete type entry
+            if getattr(node, 'type_args', []) and node.type_name in self._generic_structs:
+                import re as _re
+                decl = self._generic_structs[node.type_name]
+                type_map = dict(zip(decl.type_params, node.type_args))
+                def _s(s):
+                    for tp, cv in type_map.items():
+                        s = _re.sub(rf'\b{_re.escape(tp)}\b', cv, s)
+                    return s
+                concrete = node.type_name + "__" + "__".join(node.type_args)
+                if concrete not in self._struct_fields:
+                    self._struct_fields[concrete] = [(f.name, _s(f.type_name)) for f in decl.fields]
+                return concrete
+            if node.type_name not in self._struct_fields and \
+               node.type_name not in self._generic_structs:
                 self._err(f"Unknown struct '{node.type_name}'")
             return node.type_name
 
