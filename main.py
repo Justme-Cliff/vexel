@@ -9,10 +9,12 @@ Commands:
   vexel run      <file.vx>            JIT-compile and run
   vexel compile  <file.vx> [-o out]   Compile to native binary
                             [--sdl2]  Link with SDL2
+                            [--raylib] Link with Raylib 5.5
 
 Flags:
   -o <output>   Output binary name (default: stem of the input file)
   --sdl2        Enable SDL2 built-ins and link SDL2
+  --raylib      Link with Raylib (3D graphics, audio, input)
 """
 
 from __future__ import annotations
@@ -197,7 +199,7 @@ def pipeline_parse(tokens):
         die(str(e))
 
 
-def pipeline_analyze(program: Program, sdl2: bool = False):
+def pipeline_analyze(program: Program, sdl2: bool = False, raylib: bool = False):
     from compiler.sdl2_builtins import SDL2_BUILTINS
 
     analyzer = Analyzer()
@@ -205,6 +207,9 @@ def pipeline_analyze(program: Program, sdl2: bool = False):
         for vx_name, (param_types, ret_type) in SDL2_BUILTINS.items():
             sig = FnSig([(f"a{i}", t) for i, t in enumerate(param_types)], ret_type)
             analyzer._fn_sigs[vx_name] = sig
+
+    # Raylib: all extern fn declarations are handled by ExternFnDecl in the source,
+    # so no extra builtins needed — the analyzer picks them up automatically.
 
     result = analyzer.analyze(program)
     if result.errors:
@@ -214,7 +219,7 @@ def pipeline_analyze(program: Program, sdl2: bool = False):
     return result
 
 
-def pipeline_codegen(program: Program, analysis, sdl2: bool = False,
+def pipeline_codegen(program: Program, analysis, sdl2: bool = False, raylib: bool = False,
                      target_triple: str | None = None,
                      debug_mode: bool = False) -> str:
     from compiler.codegen import Compiler
@@ -236,14 +241,14 @@ def pipeline_codegen(program: Program, analysis, sdl2: bool = False,
     return compiler.compile(program)
 
 
-def pipeline_full(args, sdl2: bool = False):
+def pipeline_full(args, sdl2: bool = False, raylib: bool = False):
     """Run lex → parse → import resolution → analyze and return (program, analysis)."""
     base_dir = os.path.dirname(os.path.abspath(args.file))
     source   = read_source(args.file)
     tokens   = pipeline_lex(source)
     program  = pipeline_parse(tokens)
     program  = resolve_imports(program, base_dir)
-    analysis = pipeline_analyze(program, sdl2=sdl2)
+    analysis = pipeline_analyze(program, sdl2=sdl2, raylib=raylib)
     return program, analysis
 
 
@@ -518,9 +523,10 @@ def cmd_compile_ex(args) -> None:
     GCC = r"C:\Strawberry\c\bin\gcc.exe" if os.path.exists(r"C:\Strawberry\c\bin\gcc.exe") else "gcc"
 
     target_triple = args.target or None
+    use_raylib    = getattr(args, "raylib", False)
 
-    program, analysis = pipeline_full(args, sdl2=args.sdl2)
-    llvm_ir = pipeline_codegen(program, analysis, sdl2=args.sdl2,
+    program, analysis = pipeline_full(args, sdl2=args.sdl2, raylib=use_raylib)
+    llvm_ir = pipeline_codegen(program, analysis, sdl2=args.sdl2, raylib=use_raylib,
                                 target_triple=target_triple)
 
     stem   = os.path.splitext(os.path.basename(args.file))[0]
@@ -550,23 +556,48 @@ def cmd_compile_ex(args) -> None:
             f.write(tm.emit_object(mod))
             obj_path = f.name
 
+        sqlite3_lib_path = os.path.join(os.path.dirname(__file__), "stdlib", "libsqlite3.a")
+
         link_cmd = [GCC, obj_path]
         if runtime_obj: link_cmd.append(runtime_obj)
         if sdl2_obj:    link_cmd.append(sdl2_obj)
+        if os.path.exists(sqlite3_lib_path):
+            link_cmd.append(sqlite3_lib_path)
         link_cmd += ["-o", output, "-lm"]
 
         if args.sdl2:
             sdl2_lib = os.path.join(os.path.dirname(__file__), "stdlib", "sdl2", "lib")
             link_cmd += [f"-L{sdl2_lib}", "-lSDL2", "-lSDL2main"]
 
+        if use_raylib:
+            # Raylib 5.5 static library + required Windows system libs
+            raylib_lib = os.path.join(os.path.dirname(__file__), "stdlib", "raylib", "lib")
+            link_cmd += [
+                f"-L{raylib_lib}",
+                "-lraylib",       # Raylib static lib
+                "-lopengl32",     # OpenGL
+                "-lgdi32",        # GDI (window/drawing)
+                "-lwinmm",        # Windows multimedia (audio timing)
+                "-lmsvcrt",       # MSVC runtime
+            ]
+            # After build, copy raylib.dll next to the output exe so it can run
+            raylib_dll_src = os.path.join(os.path.dirname(__file__), "stdlib", "raylib", "lib", "raylib.dll")
+            raylib_dll_dst = os.path.join(os.path.dirname(os.path.abspath(output if output else stem)), "raylib.dll")
+            if os.path.exists(raylib_dll_src) and not os.path.exists(raylib_dll_dst):
+                import shutil
+                shutil.copy2(raylib_dll_src, raylib_dll_dst)
+
         if target_triple:
-            # Cross-compiling: user may need to supply their own sysroot/gcc
             print(f"[cross] Target: {triple}")
 
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             die(f"Link error:\n{result.stderr}")
         print(f"Compiled: {output}")
+
+        # If using Raylib, remind user the DLL must be next to the exe
+        if use_raylib:
+            print(f"[raylib] raylib.dll copied next to {output} — keep them together.")
 
     finally:
         for path in filter(None, [obj_path, runtime_obj, sdl2_obj]):
@@ -609,10 +640,21 @@ def cmd_build(args) -> None:
     output    = project.get("name", os.path.splitext(main_file)[0])
     print(f"Building {project.get('name', output)} v{project.get('version', '?')}")
 
+    build_cfg  = cfg.get("build", {})
+    link_cfg   = cfg.get("link", {})
+    libs_raw   = link_cfg.get("libs", "")
+    libs_list  = [l.strip().strip('"').strip("'") for l in libs_raw.strip("[]").split(",") if l.strip()]
+    use_raylib = "raylib" in libs_list
+
+    _output = output
+    _main_file = main_file
+    _use_raylib = use_raylib
+
     class _FakeArgs:
-        file   = main_file
-        output = output
+        file   = _main_file
+        output = _output
         sdl2   = False
+        raylib = _use_raylib
         target = None
         debug  = False
 
@@ -690,7 +732,8 @@ def main() -> None:
     parser.add_argument("command", choices=list(_COMMANDS), help="Action to perform")
     parser.add_argument("file", nargs="?", default=None, help="Vexel source file (.vx)")
     parser.add_argument("-o", "--output", default=None, help="Output path")
-    parser.add_argument("--sdl2",   action="store_true", help="Enable SDL2 built-ins")
+    parser.add_argument("--sdl2",    action="store_true", help="Enable SDL2 built-ins")
+    parser.add_argument("--raylib", action="store_true", help="Link with Raylib 5.5 (3D graphics)")
     parser.add_argument("--watch",  action="store_true", help="Recompile on file change (run only)")
     parser.add_argument("--target", default=None,        help="Cross-compile target triple (compile only)")
     parser.add_argument("--debug",  action="store_true", help="Enable debug mode (bounds checks etc.)")

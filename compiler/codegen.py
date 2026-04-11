@@ -119,6 +119,11 @@ class Compiler:
         # Schedule of vtable slots to fill: [(vtable_gv, vtable_ll, [fn,...])]
         self._vtable_init_list: list = []
 
+        # Global lets with non-literal initializers: [(name, ast_node, vx_type, gv)]
+        # These are evaluated at the start of main() because LLVM globals must be
+        # compile-time constants but Vexel allows function-call initializers.
+        self._deferred_global_inits: list = []
+
         # #9 Result/Option: whether result boxing is initialized
         self._result_type_defined: bool = False
 
@@ -576,7 +581,10 @@ class Compiler:
         for d in program.declarations:
             _d = d.inner if isinstance(d, (PubDecl, PrivDecl)) else d
             if isinstance(_d, FnDecl) and not _d.type_params:
-                self._compile_fn(_d)
+                try:
+                    self._compile_fn(_d)
+                except Exception as _e:
+                    raise type(_e)(f"[in fn '{_d.name}'] {_e}") from _e
             elif isinstance(_d, TestDecl):
                 self._compile_test_decl(_d)
 
@@ -1070,7 +1078,17 @@ class Compiler:
             init = ir.Constant(I8PTR, None)
             ll_type = I8PTR
         else:
-            init = ir.Constant(ll_type, 0)
+            # Pointer types (arrays, structs, strings) must use null, not 0
+            if isinstance(ll_type, ir.PointerType):
+                init = ir.Constant(ll_type, None)
+            else:
+                init = ir.Constant(ll_type, 0)
+            # Non-literal initializers (function calls, dict/array literals, etc.)
+            # cannot be evaluated at LLVM global init time. Defer them to main().
+            # Exception: empty array [] stays as null — push handles null allocation.
+            is_empty_array = isinstance(d.value, ArrayLiteral) and not d.value.elements
+            if not isinstance(d.value, NullLiteral) and not is_empty_array:
+                self._deferred_global_inits.append((name, d.value, vx_type))
 
         gv          = ir.GlobalVariable(self.module, ll_type, name=name)
         gv.linkage  = "internal"
@@ -1130,6 +1148,37 @@ class Compiler:
         # Inject vtable initializer at the start of main
         if d.name == "main" and "__vx_vtable_init" in self._helper_fns:
             self.builder.call(self._helper_fns["__vx_vtable_init"], [])
+
+        # Initialize globals whose values require runtime code (not LLVM compile-time constants)
+        if d.name == "main" and self._deferred_global_inits:
+            memset_ty = ir.FunctionType(I8PTR, [I8PTR, I32_TY, I64_TY])
+            memset_h = self._get_or_declare_fn("memset", memset_ty)
+            for (gname, init_expr, gvx_type) in self._deferred_global_inits:
+                ginfo = self._globals.get(gname)
+                if ginfo is None:
+                    continue
+                gll_type = self._vx_to_llvm(gvx_type)
+
+                if gvx_type in self._structs:
+                    # Struct globals: malloc + zero — do NOT call the constructor here
+                    # because other globals (e.g., item_defs) may not yet be initialized.
+                    # The game's own init functions (game_init etc.) will overwrite this
+                    # with the real value at the appropriate time.
+                    struct_lt = self._structs[gvx_type]["llvm_type"]
+                    # sizeof(struct) via GEP null+1 trick
+                    null_ptr = ir.Constant(ir.PointerType(struct_lt), None)
+                    sz_ptr = self.builder.gep(null_ptr, [ir.Constant(I32_TY, 1)], inbounds=False)
+                    sz = self.builder.ptrtoint(sz_ptr, I64_TY)
+                    raw = self.builder.call(self.malloc_fn, [sz])
+                    self.builder.call(memset_h, [raw, ir.Constant(I32_TY, 0), sz])
+                    typed_ptr = self.builder.bitcast(raw, ir.PointerType(struct_lt))
+                    self.builder.store(typed_ptr, ginfo["ptr"])
+                else:
+                    # Dict literals, other expressions: compile and store
+                    val, vt = self._compile_expr(init_expr)
+                    if gvx_type == "float" and vt == "int":
+                        val = self.builder.sitofp(val, F64_TY)
+                    self.builder.store(val, ginfo["ptr"])
 
         for arg, param in zip(fn.args, d.params):
             resolved = self._resolve_type(param.type_name)
@@ -2865,9 +2914,10 @@ class Compiler:
         map_al  = self.builder.alloca(elem_lt)
         self.builder.store(map_val, map_al)
         map_raw = self.builder.bitcast(map_al, I8PTR)
-        res_raw = self.builder.bitcast(result_arr, I8PTR)
+        res_slot = self.builder.alloca(I8PTR)
+        self.builder.store(self.builder.bitcast(result_arr, I8PTR), res_slot)
         fn_h = self._get_helper("__vx_array_push")
-        self.builder.call(fn_h, [res_raw, map_raw, esz])
+        self.builder.call(fn_h, [res_slot, map_raw, esz])
         self.builder.branch(skip_b)
 
         self.builder.position_at_end(skip_b)
@@ -2941,8 +2991,10 @@ class Compiler:
         map_al = self.builder.alloca(self._vx_to_llvm(map_vt))
         self.builder.store(map_val, map_al)
         map_raw = self.builder.bitcast(map_al, I8PTR)
+        res_slot2 = self.builder.alloca(I8PTR)
+        self.builder.store(result_arr_raw, res_slot2)
         fn_h = self._get_helper("__vx_array_push")
-        self.builder.call(fn_h, [result_arr_raw, map_raw, esz])
+        self.builder.call(fn_h, [res_slot2, map_raw, esz])
         self.builder.branch(skip_b)
 
         self.builder.position_at_end(skip_b)
@@ -3007,7 +3059,22 @@ class Compiler:
 
         if obj_t.endswith("[]"):
             elem_vt = obj_t[:-2]
-            return self._compile_arr_method(obj_v, obj_t, elem_vt, method, node.args)
+            # For push, pass the actual storage address (i8**) so __vx_array_push can
+            # write-back a newly allocated header when the array pointer is null.
+            self._arr_ptr_storage = None
+            if method == "push":
+                if isinstance(node.obj, Identifier):
+                    info = self._lookup(node.obj.name)
+                    if info is not None:
+                        self._arr_ptr_storage = info["ptr"]
+                elif isinstance(node.obj, FieldAccess):
+                    try:
+                        self._arr_ptr_storage = self._field_ptr(node.obj)
+                    except Exception:
+                        pass
+            result = self._compile_arr_method(obj_v, obj_t, elem_vt, method, node.args)
+            self._arr_ptr_storage = None
+            return result
 
         # Struct own-methods (#13): StructName__method(self_ptr, args...)
         struct_method_key = f"{obj_t}__{method}"
@@ -3182,9 +3249,17 @@ class Compiler:
             elem_al = self.builder.alloca(elem_lt)
             self.builder.store(elem_v, elem_al)
             elem_raw = self.builder.bitcast(elem_al, I8PTR)
-            arr_raw  = self.builder.bitcast(arr_v, I8PTR)
+            # arr_pp must be the actual storage pointer (i8**) so push can write-back
+            # If caller passed arr_ptr_storage via _arr_ptr_storage, use it; else temp slot
+            if hasattr(self, '_arr_ptr_storage') and self._arr_ptr_storage is not None:
+                arr_pp = self.builder.bitcast(self._arr_ptr_storage, ir.PointerType(I8PTR))
+                self._arr_ptr_storage = None
+            else:
+                tmp_slot = self.builder.alloca(self.arr_ptr_type)
+                self.builder.store(arr_v, tmp_slot)
+                arr_pp = self.builder.bitcast(tmp_slot, ir.PointerType(I8PTR))
             fn_h = self._get_helper("__vx_array_push")
-            self.builder.call(fn_h, [arr_raw, elem_raw, esz])
+            self.builder.call(fn_h, [arr_pp, elem_raw, esz])
             return ir.Constant(I64_TY, 0), "void"
 
         if method == "pop":
@@ -3841,23 +3916,50 @@ class Compiler:
         return fn
 
     def _build_array_push(self) -> ir.Function:
-        """Push an element into a dynamic array. arr is i8* (vx_array*), elem is i8*, esz is i64."""
-        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTR, I8PTR, I64_TY]),
+        """Push an element into a dynamic array.
+        arr_pp is i8** (pointer to vx_array* global/local), elem is i8*, esz is i64.
+        If *arr_pp is null, a new empty array header is allocated and stored back."""
+        I8PTRPTR = ir.PointerType(I8PTR)
+        fn = ir.Function(self.module, ir.FunctionType(VOID_TY, [I8PTRPTR, I8PTR, I64_TY]),
                          name="__vx_array_push")
         fn.linkage = "private"
         b = ir.IRBuilder(fn.append_basic_block("entry"))
-        arr_raw, elem_raw, esz = fn.args[0], fn.args[1], fn.args[2]
+        arr_pp, elem_raw, esz = fn.args[0], fn.args[1], fn.args[2]
 
-        arr = b.bitcast(arr_raw, self.arr_ptr_type)
-        len_ptr  = b.gep(arr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
-        cap_ptr  = b.gep(arr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,2)], inbounds=True)
+        # Load current array pointer; allocate header if null
+        arr_raw = b.load(arr_pp)
+        arr_int = b.ptrtoint(arr_raw, I64_TY)
+        is_null = b.icmp_unsigned("==", arr_int, ir.Constant(I64_TY, 0))
+        alloc_b = fn.append_basic_block("push.alloc")
+        do_b    = fn.append_basic_block("push.do")
+        b.cbranch(is_null, alloc_b, do_b)
+
+        # Allocate a new zeroed array header (data=null, len=0, cap=0)
+        b.position_at_end(alloc_b)
+        new_hdr_raw = b.call(self.malloc_fn, [ir.Constant(I64_TY, _ARRAY_HEADER_SIZE)])
+        new_hdr = b.bitcast(new_hdr_raw, self.arr_ptr_type)
+        dp_init  = b.gep(new_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,0)], inbounds=True)
+        len_init = b.gep(new_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+        cap_init = b.gep(new_hdr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,2)], inbounds=True)
+        b.store(ir.Constant(I8PTR, None), dp_init)
+        b.store(ir.Constant(I64_TY, 0), len_init)
+        b.store(ir.Constant(I64_TY, 0), cap_init)
+        b.store(new_hdr_raw, arr_pp)
+        b.branch(do_b)
+
+        # Main push logic — reload arr pointer (may have changed)
+        b.position_at_end(do_b)
+        arr_raw2 = b.load(arr_pp)
+        arr = b.bitcast(arr_raw2, self.arr_ptr_type)
+        len_ptr       = b.gep(arr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,1)], inbounds=True)
+        cap_ptr       = b.gep(arr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,2)], inbounds=True)
         data_ptr_field = b.gep(arr, [ir.Constant(I32_TY,0), ir.Constant(I32_TY,0)], inbounds=True)
 
         ln  = b.load(len_ptr)
         cap = b.load(cap_ptr)
 
         need_grow = b.icmp_signed(">=", ln, cap)
-        grow_b   = fn.append_basic_block("push.grow")
+        grow_b    = fn.append_basic_block("push.grow")
         no_grow_b = fn.append_basic_block("push.store")
         b.cbranch(need_grow, grow_b, no_grow_b)
 
@@ -4464,6 +4566,7 @@ class Compiler:
             val, vt = self._compile_expr(node.args[0])
             if vt == "float":  return self.builder.fptosi(val, I64_TY), "int"
             if vt == "bool":   return self.builder.zext(val, I64_TY),   "int"
+            if vt == "str":    return self.builder.call(self.atoll_fn, [val]), "int"
             return val, "int"
 
         if name == "float":
@@ -6027,9 +6130,27 @@ class Compiler:
                 at = pt_resolved
             elif pt_resolved == "float" and at == "int":
                 av = self.builder.sitofp(av, F64_TY)
+            elif pt_resolved == "f32" and at in ("float", "int"):
+                if at == "int":
+                    av = self.builder.sitofp(av, F64_TY)
+                av = self.builder.fptrunc(av, ir.FloatType())
+            elif pt_resolved in ("i32", "u32") and at == "int":
+                av = self.builder.trunc(av, ir.IntType(32))
+            elif pt_resolved in ("i8", "u8") and at == "int":
+                av = self.builder.trunc(av, ir.IntType(8))
+            elif pt_resolved in ("i16", "u16") and at == "int":
+                av = self.builder.trunc(av, ir.IntType(16))
             compiled_args.append(av)
         result = self.builder.call(fn, compiled_args)
-        return result, sig.return_type
+        # Widen narrow int/float return types to Vexel's native int/float
+        ret = sig.return_type
+        if ret in ("i32", "u32", "i16", "u16", "i8", "u8"):
+            result = self.builder.sext(result, I64_TY)
+            ret = "int"
+        elif ret == "f32":
+            result = self.builder.fpext(result, F64_TY)
+            ret = "float"
+        return result, ret
 
     def _is_fn_type(self, vx_type: str) -> bool:
         return vx_type.startswith("fn(") or vx_type.startswith("closure:fn(")
@@ -6560,6 +6681,7 @@ class Compiler:
         raw      = self.builder.call(self.malloc_fn, [sz])
         sptr     = self.builder.bitcast(raw, ir.PointerType(lt))
 
+        _narrow_int_types = {"i8", "u8", "i16", "u16", "i32", "u32", "char"}
         defaults = si.get("defaults", [None] * len(fields))
         for idx, (fname, ftype) in enumerate(fields):
             fv = ir.Constant(self._vx_to_llvm(ftype), 0)
@@ -6567,11 +6689,27 @@ class Compiler:
                 fv, fvt = self._compile_expr(node.args[idx])
                 if ftype == "float" and fvt == "int":
                     fv = self.builder.sitofp(fv, F64_TY)
+                elif ftype == "f32" and fvt in ("float", "int"):
+                    if fvt == "int":
+                        fv = self.builder.sitofp(fv, F64_TY)
+                    fv = self.builder.fptrunc(fv, ir.FloatType())
+                elif ftype in _narrow_int_types and fvt in ("int", "bool"):
+                    target_ll = self._vx_to_llvm(ftype)
+                    if fv.type != target_ll:
+                        fv = self.builder.trunc(fv, target_ll)
             elif idx < len(defaults) and defaults[idx] is not None:
                 # Use default field value from struct declaration
                 fv, fvt = self._compile_expr(defaults[idx])
                 if ftype == "float" and fvt == "int":
                     fv = self.builder.sitofp(fv, F64_TY)
+                elif ftype == "f32" and fvt in ("float", "int"):
+                    if fvt == "int":
+                        fv = self.builder.sitofp(fv, F64_TY)
+                    fv = self.builder.fptrunc(fv, ir.FloatType())
+                elif ftype in _narrow_int_types and fvt in ("int", "bool"):
+                    target_ll = self._vx_to_llvm(ftype)
+                    if fv.type != target_ll:
+                        fv = self.builder.trunc(fv, target_ll)
             fp = self.builder.gep(sptr,
                                   [ir.Constant(I32_TY,0), ir.Constant(I32_TY,idx)],
                                   inbounds=True)
@@ -7731,7 +7869,9 @@ class Compiler:
         v_al = b.alloca(I64_TY)
         b.store(v, v_al)
         v_raw = b.bitcast(v_al, I8PTR)
-        b.call(push_h, [hdr_raw, v_raw, ir.Constant(I64_TY, 8)])
+        hdr_slot = b.alloca(I8PTR)
+        b.store(hdr_raw, hdr_slot)
+        b.call(push_h, [hdr_slot, v_raw, ir.Constant(I64_TY, 8)])
         b.branch(skip_b)
         b.position_at_end(skip_b)
         b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
@@ -8288,7 +8428,9 @@ class Compiler:
         row_raw = b.call(split_h, [line, cm_p])
         row_al = b.alloca(I8PTR)
         b.store(row_raw, row_al)
-        b.call(push_h, [hdr_raw, b.bitcast(row_al, I8PTR), ir.Constant(I64_TY, 8)])
+        hdr_slot2 = b.alloca(I8PTR)
+        b.store(hdr_raw, hdr_slot2)
+        b.call(push_h, [hdr_slot2, b.bitcast(row_al, I8PTR), ir.Constant(I64_TY, 8)])
         b.store(b.add(iv, ir.Constant(I64_TY,1)), i_al)
         b.branch(chk)
         b.position_at_end(ext)
@@ -9094,7 +9236,9 @@ class Compiler:
         b.call(self.sprintf_fn, [pair_buf, self._gstr_ptr_const(fmt_gv), key, val])
         pair_al = b.alloca(I8PTR)
         b.store(pair_buf, pair_al)
-        b.call(push_h, [arr_raw, b.bitcast(pair_al, I8PTR), ir.Constant(I64_TY, 8)])
+        arr_slot = b.alloca(I8PTR)
+        b.store(arr_raw, arr_slot)
+        b.call(push_h, [arr_slot, b.bitcast(pair_al, I8PTR), ir.Constant(I64_TY, 8)])
         b.store(b.add(iv, ir.Constant(I64_TY, 1)), i_al)
         b.branch(chk)
         b.position_at_end(ext)
