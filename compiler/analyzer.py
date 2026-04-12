@@ -908,11 +908,17 @@ class Analyzer:
             # Built-in constants
             if node.name in ("PI", "TAU", "E", "INF", "NAN"):
                 return VX_FLOAT
+            # Built-in signal constants used as values (not calls)
+            if node.name in ("SIGINT", "SIGTERM"):
+                return VX_INT
             # Namespace name used as value? Return special marker
             if node.name in self._namespaces:
                 return f"__namespace__{node.name}"
             t = self._lookup(node.name)
             if t is None:
+                # Allow function names used as function pointer values
+                if node.name in self._fn_sigs:
+                    return VX_INT
                 # Collect all visible names for suggestion
                 all_names: list[str] = []
                 for scope in self._scopes:

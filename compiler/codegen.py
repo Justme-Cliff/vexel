@@ -2589,6 +2589,10 @@ class Compiler:
             if node.name == "NAN":
                 import math
                 return ir.Constant(F64_TY, math.nan), "float"
+            if node.name == "SIGINT":
+                return ir.Constant(I64_TY, 2), "int"
+            if node.name == "SIGTERM":
+                return ir.Constant(I64_TY, 15), "int"
             info = self._lookup(node.name)
             if info is None:
                 # Allow using a function name as a raw function pointer value
